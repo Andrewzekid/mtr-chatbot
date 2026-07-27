@@ -82,7 +82,8 @@ class LocalLLM:
             "Do not say objects are 'concentrated at (0.01, 0.01)' or any other made-up coordinate.\n\n"
             "Image links:\n"
             "- The database context may include markdown image links such as ![description](/inspection/images/<filename.jpg>).\n"
-            "- Always preserve these links in your text response so the UI can display the object frames to the user.\n"
+            "- It may also include annotated image links from the annotate_image tool, e.g. ![annotated image](/annotated/images/<filename.png>).\n"
+            "- Always preserve these links in your text response so the UI can display the object frames or annotated result to the user.\n"
             "- Do not describe the image filename or URL in words; the UI handles the image.\n\n"
             "Speech and readability:\n"
             "- Your response is also spoken aloud, so avoid heavy punctuation, markdown syntax, or lists that are hard to speak.\n"
@@ -142,7 +143,7 @@ class LocalLLM:
         tool_router_raw: dict[str, object] | None = None
         if self.db_client is not None:
             try:
-                db_context = self.db_client.lookup(prompt)
+                db_context = await self.db_client.lookup(prompt)
                 if db_context:
                     logger.info("Injecting inspection DB context for prompt: %r", prompt)
                 tool_results = [
@@ -150,6 +151,13 @@ class LocalLLM:
                     for r in self.db_client.last_tool_results
                 ]
                 report_needed = any(call.get("name") == "get_report_summary" for call in self.db_client.last_tool_calls)
+                annotated_image_called = any(call.get("name") == "annotate_image" for call in self.db_client.last_tool_calls)
+                if annotated_image_called and db_context:
+                    db_context = (
+                        "The user asked to annotate/highlight an image. "
+                        "Include the annotated image markdown link shown below in your answer so the UI can display it.\n\n"
+                        + db_context
+                    )
                 if self.db_client.router is not None:
                     tool_router_raw = self.db_client.router.last_raw_response
             except Exception as exc:

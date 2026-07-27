@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import re
 import sqlite3
@@ -7,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.config import Settings
 from app.services.tool_router import ToolRouter
+from app.services.vision_service import VisionAnnotator
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +69,21 @@ class InspectionDBClient:
                 return canonical
         return name.strip()
 
-    def __init__(self, db_path: str | Path, router: ToolRouter | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        router: ToolRouter | None = None,
+        settings: Settings | None = None,
+        vision_annotator: VisionAnnotator | None = None,
+    ) -> None:
         self.db_path = Path(db_path)
         self.router = router
+        self.settings = settings or (router.settings if router else None)
+        self.vision_annotator = vision_annotator
         self._conn: sqlite3.Connection | None = None
         self._last_tool_calls: list[dict[str, Any]] = []
         self._last_tool_results: list[dict[str, Any]] = []
+        self._last_query: str = ""
 
     @staticmethod
     def _format_timestamp(ns: int | None) -> str:
@@ -865,9 +878,10 @@ class InspectionDBClient:
     # Natural language routing
     # ------------------------------------------------------------------
 
-    def lookup(self, query: str) -> str | None:
+    async def lookup(self, query: str) -> str | None:
         """Return a text summary for DB-related queries, or None if unrelated."""
         q = query.lower().strip()
+        self._last_query = query
         if not q:
             return None
 
@@ -911,7 +925,7 @@ class InspectionDBClient:
                     results: list[str] = []
                     tool_results: list[dict[str, Any]] = []
                     for tool_name, args in tool_calls:
-                        result = self._execute_tool(tool_name, args)
+                        result = await self._execute_tool(tool_name, args)
                         tool_results.append({"name": tool_name, "args": args, "output": result})
                         if result:
                             results.append(result)
@@ -927,10 +941,19 @@ class InspectionDBClient:
         temporal_keywords = ("when", "timeline", "story", "history", "duration", "first seen", "last seen", "seen", "timestamp", "timestamps", "time", "times")
 
         try:
+            annotation_keywords = ("highlight", "circle", "draw", "mark", "annotate", "outline", "point out")
+            wants_annotation = any(kw in q for kw in annotation_keywords)
+
             # Specific track / object ID
             track_match = re.search(r"(?:track|object|id)\s*#?\s*(\d+)", q)
             if track_match:
                 track_id = int(track_match.group(1))
+                if wants_annotation:
+                    result = await self.annotate_image(
+                        track_id=track_id,
+                        question=self._last_query,
+                    )
+                    return self._format_annotate_image(result)
                 if any(kw in q for kw in image_keywords):
                     return self._format_object_images(track_id)
                 if any(kw in q for kw in temporal_keywords):
@@ -982,6 +1005,12 @@ class InspectionDBClient:
             # Category lookup
             for alias, canonical in self._CATEGORY_ALIASES.items():
                 if alias in q:
+                    if wants_annotation:
+                        result = await self.annotate_image(
+                            category=canonical,
+                            question=self._last_query,
+                        )
+                        return self._format_annotate_image(result)
                     return self._format_category(canonical)
 
             # Generic summary / count
@@ -998,9 +1027,17 @@ class InspectionDBClient:
 
         return None
 
-    def _execute_tool(self, tool_name: str, args: dict[str, Any]) -> str | None:
+    async def _execute_tool(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Execute a tool selected by the LLM router and return its formatted result."""
         try:
+            if tool_name == "annotate_image":
+                result = await self.annotate_image(
+                    image_url=args.get("image_url"),
+                    track_id=int(args["track_id"]) if args.get("track_id") is not None else None,
+                    category=self._canonical_category(args["category"]) if args.get("category") else None,
+                    question=args.get("question") or self._last_query,
+                )
+                return self._format_annotate_image(result)
             if tool_name == "get_summary":
                 return self._format_summary()
             if tool_name == "get_categories":
@@ -1120,6 +1157,120 @@ class InspectionDBClient:
         except Exception as exc:
             logger.warning("Tool execution failed for %s with args %s: %s", tool_name, args, exc)
         return None
+
+    # ------------------------------------------------------------------
+    # Image annotation
+    # ------------------------------------------------------------------
+
+    async def annotate_image(
+        self,
+        image_url: str | None = None,
+        track_id: int | None = None,
+        category: str | None = None,
+        question: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Run vision annotation on an inspection image and cache the result.
+
+        Resolves *image_url*, *track_id*, or *category* into a local image path,
+        asks the vision model to mark anomalies, and saves the annotated PNG
+        to the configured cache directory so the frontend can request it.
+        """
+        if not self.vision_annotator:
+            return {"error": "Vision annotator is not configured."}
+
+        image_path: Path | None = None
+        if image_url:
+            image_path = self._resolve_image_path(image_url)
+        if image_path is None and track_id is not None:
+            paths = self.get_object_image_paths(track_id)
+            if paths:
+                image_path = self._resolve_image_path(paths[0])
+        if image_path is None and category:
+            paths = self.get_category_sample_images(category, limit=1)
+            if paths:
+                image_path = self._resolve_image_path(paths[0])
+
+        if image_path is None or not image_path.exists():
+            return {"error": f"Could not locate image for annotation from image_url={image_url}, track_id={track_id}, category={category}"}
+
+        image_bytes = image_path.read_bytes()
+        q = question or "What anomalies are in this image?"
+
+        try:
+            result = await self.vision_annotator.annotate(image_bytes, q)
+        except Exception as exc:
+            logger.warning("Vision annotation failed for %s: %s", image_path, exc)
+            return {"error": f"Vision annotation failed: {exc}"}
+
+        annotated_bytes = base64.b64decode(result["annotated_image_base64"])
+        cache_dir = self._annotated_image_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{hashlib.sha256(annotated_bytes).hexdigest()[:16]}.png"
+        cache_path = cache_dir / filename
+        cache_path.write_bytes(annotated_bytes)
+
+        return {
+            "description": result.get("description", ""),
+            "annotated_image_url": f"/annotated/images/{filename}",
+            "annotations": result.get("annotations", []),
+        }
+
+    def _resolve_image_path(self, image_url: str | None) -> Path | None:
+        """Map a frontend URL or raw path to a local filesystem path."""
+        if not image_url:
+            return None
+        image_url = str(image_url).strip()
+        if not image_url:
+            return None
+
+        # URL prefixes served by the backend.
+        if image_url.startswith("/inspection/images/"):
+            if not self.settings:
+                return None
+            return Path(self.settings.inspection_image_dir) / Path(image_url).name
+        if image_url.startswith("/reports/images/"):
+            if not self.settings:
+                return None
+            return Path(self.settings.reports_dir) / "extracted_images" / Path(image_url).name
+
+        # Already an absolute local path.
+        raw = Path(image_url)
+        if raw.is_absolute() and raw.exists():
+            return raw
+
+        # Relative path: try the inspection image directory and report extracted images.
+        if self.settings:
+            candidates = [
+                Path(self.settings.inspection_image_dir) / raw,
+                Path(self.settings.reports_dir) / "extracted_images" / raw,
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+        return None
+
+    def _annotated_image_cache_dir(self) -> Path:
+        if self.settings and getattr(self.settings, "annotated_image_cache_dir", None):
+            return Path(self.settings.annotated_image_cache_dir)
+        if self.settings:
+            return Path(self.settings.reports_dir) / "annotated_images"
+        return Path("./annotated_images").resolve()
+
+    def _format_annotate_image(self, result: dict[str, Any] | None) -> str:
+        if result is None:
+            return "Image annotation returned no result."
+        if "error" in result:
+            return f"Image annotation failed: {result['error']}"
+        lines = [
+            "Annotated image:",
+            f"![annotated image]({result['annotated_image_url']})",
+            "",
+            f"Description: {result.get('description', 'No description provided.')}",
+        ]
+        annotations = result.get("annotations", [])
+        if annotations:
+            lines.append(f"Annotations drawn: {len(annotations)}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Formatters

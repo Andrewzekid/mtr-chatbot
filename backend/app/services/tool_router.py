@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -376,6 +377,31 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "annotate_image",
+        "description": "Analyze and draw annotations (boxes, circles, highlights) on an inspection image to mark anomalies or areas of interest. Provide exactly one of image_url, track_id, or category. Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_url": {
+                    "type": "string",
+                    "description": "URL or path to the image, e.g. /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.",
+                },
+                "track_id": {
+                    "type": "integer",
+                    "description": "Numeric track/object ID. The first available frame for this track will be annotated.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Category name. A sample image of this category will be annotated.",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "What to look for or how to annotate. Defaults to the user's original question.",
+                },
+            },
+        },
+    },
+    {
         "name": "get_categories",
         "description": "Return the list of distinct object categories in the database. Use this when you need to know what categories exist before writing a SQL query.",
         "parameters": {"type": "object", "properties": {}},
@@ -727,6 +753,21 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Example: User: "How many distinct tracks have more than 50 observations?" -> run_sql_query(query="SELECT COUNT(*) FROM objects WHERE observation_count > 50")
     - Example: User: "Tell me about all the lights and advertisement boards, their timestamps and coordinates." -> run_sql_query(query="SELECT category, COUNT(*) as object_count, MIN(first_seen_ns) as first_seen, MAX(last_seen_ns) as last_seen, AVG(centroid_x) as avg_x, AVG(centroid_y) as avg_y, AVG(centroid_z) as avg_z, MIN(centroid_x) as min_x, MAX(centroid_x) as max_x, MIN(centroid_y) as min_y, MAX(centroid_y) as max_y, MIN(centroid_z) as min_z, MAX(centroid_z) as max_z FROM objects WHERE category IN ('Lights', 'Advertisement Board') GROUP BY category")
 
+32. annotate_image
+    - Purpose: analyze an inspection image with a vision model and draw annotations (boxes, circles, highlights) around anomalies or areas of interest.
+    - Args: provide exactly one of image_url, track_id, or category. Optionally pass question to guide what to look for.
+    - image_url: a URL or path such as /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.
+    - track_id: use the first available frame for this track.
+    - category: use a random sample image of this category.
+    - Output sample:
+        Annotated image:
+        ![annotated](/annotated/images/a1b2c3d4.png)
+
+        Description: A small crack was highlighted on the left panel of the advertisement board.
+    - Use for: "highlight anomalies in this image", "circle the defect on track 218", "draw on an advertisement board image", "mark what is wrong with this picture".
+    - Example: User: "Circle the anomaly on the image of track 218." -> annotate_image(track_id=218, question="circle the anomaly")
+    - Example: User: "Highlight defects on an advertisement board." -> annotate_image(category="Advertisement Board", question="highlight defects")
+
 ## Multi-tool flow examples
 
 Example A:
@@ -764,6 +805,11 @@ User: "Give me a summary of all the lights and advertisement boards found."
 Plan:
 1. run_sql_query(query="SELECT category, COUNT(*) as object_count, MIN(first_seen_ns) as first_seen, MAX(last_seen_ns) as last_seen, AVG(centroid_x) as avg_x, AVG(centroid_y) as avg_y, AVG(centroid_z) as avg_z, MIN(centroid_x) as min_x, MAX(centroid_x) as max_x, MIN(centroid_y) as min_y, MAX(centroid_y) as max_y, MIN(centroid_z) as min_z, MAX(centroid_z) as max_z FROM objects WHERE category IN ('Lights', 'Advertisement Board') GROUP BY category")
 
+Example G:
+User: "Highlight any anomalies on the image of track 218."
+Plan:
+1. annotate_image(track_id=218, question="highlight any anomalies")
+
 ## Rules
 
 - Call every tool that is needed in a single turn. Do not chain sequentially.
@@ -782,6 +828,53 @@ Plan:
             return []
 
         q = query.lower()
+
+        # Annotation requests take priority when the user asks to draw/highlight/mark an image,
+        # and we can identify which image (URL, track, or category) to annotate.
+        annotation_keywords = (
+            "highlight", "circle", "draw", "mark", "annotate", "outline", "point out",
+        )
+        wants_annotation = any(kw in q for kw in annotation_keywords)
+        if wants_annotation:
+            args: dict[str, Any] = {}
+            track_match = re.search(r"(?:track|object)\s*#?\s*(\d+)", q)
+            if track_match:
+                args["track_id"] = int(track_match.group(1))
+            else:
+                for alias, canonical in {
+                    "advertisement board": "Advertisement Board",
+                    "ad board": "Advertisement Board",
+                    "adboard": "Advertisement Board",
+                    "poster": "Advertisement Board",
+                    "billboard": "Advertisement Board",
+                    "exit sign": "Exit Sign",
+                    "exit": "Exit Sign",
+                    "light": "Lights",
+                    "lights": "Lights",
+                    "map": "Map",
+                    "tv": "TV",
+                    "television": "TV",
+                    "ticket gate": "Ticket Gate",
+                    "gate": "Ticket Gate",
+                }.items():
+                    if alias in q:
+                        args["category"] = canonical
+                        break
+            url_match = re.search(r"(/[^\s]+\.(?:jpg|jpeg|png))", q, re.IGNORECASE)
+            if url_match:
+                args["image_url"] = url_match.group(1)
+            if args:
+                args["question"] = query
+                logger.info("Forcing annotate_image for annotation query: %r args=%s", query, args)
+                self.last_raw_response = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "annotate_image", "arguments": args}}
+                    ],
+                }
+                return [("annotate_image", args)]
+
         anomaly_keywords = (
             "anomaly", "anomalies", "finding", "findings", "issue", "issues",
             "problem", "problems", "wrong", "unusual", "recommendation", "recommendations",

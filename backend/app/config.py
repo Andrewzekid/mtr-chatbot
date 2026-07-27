@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # Source camera images referenced by observations.image_path
     inspection_image_dir: str = "/home/wangyiming/code/object_detection_app/Datasets/MTR/rosbags/2026-06-11_16-50-08_rosbag/camera/right"
 
+    # Cache directory for vision-annotated images served under /annotated/images
+    annotated_image_cache_dir: str = "./annotated_images"
+
     # Piper TTS
     piper_exe_path: str = "./bin/piper/piper/piper.exe"
     piper_voices_dir: str = "./models/piper"
@@ -73,6 +76,7 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         self.sensevoice_model_dir = self._resolve_backend_path(self.sensevoice_model_dir)
         self.reports_dir = self._resolve_backend_path(self.reports_dir)
+        self.annotated_image_cache_dir = self._resolve_backend_path(self.annotated_image_cache_dir)
         self.piper_exe_path = self._resolve_backend_path(self.piper_exe_path)
         self.piper_voices_dir = self._resolve_backend_path(self.piper_voices_dir)
         self.piper_model_path = self._resolve_backend_path(self.piper_model_path)

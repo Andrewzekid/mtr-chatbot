@@ -16,6 +16,7 @@ from app.services.report_service import InspectionReportClient
 from app.services.stt_service import STTResult, SenseVoiceSTT
 from app.services.tool_router import ToolRouter
 from app.services.tts_service import PiperTTS
+from app.services.vision_service import VisionAnnotator
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,13 @@ class VoicePipeline:
             db_path = Path(settings.inspection_db_path)
             if db_path.exists():
                 router = ToolRouter(settings) if settings.tool_router_enabled else None
-                db_client = InspectionDBClient(db_path, router=router)
+                vision_annotator = VisionAnnotator(settings)
+                db_client = InspectionDBClient(
+                    db_path,
+                    router=router,
+                    settings=settings,
+                    vision_annotator=vision_annotator,
+                )
             else:
                 logger.warning("Inspection DB not found at %s; DB lookups disabled", db_path)
 
