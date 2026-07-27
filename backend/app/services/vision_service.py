@@ -273,7 +273,8 @@ class VisionAnnotator:
         for idx, item in enumerate(raw_annotations):
             if not isinstance(item, dict):
                 continue
-            ann_type = (item.get("type") or "box").lower().strip()
+            raw_type = item.get("type") or "box"
+            ann_type = str(raw_type).lower().strip() if not isinstance(raw_type, list) else "box"
             label = str(item.get("label") or f"anomaly-{idx + 1}")
             color = item.get("color")
             if isinstance(color, str):
