@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 import logging
 import random
@@ -9,8 +8,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
 from app.config import Settings
 
@@ -95,14 +95,73 @@ class VisionAnnotator:
             "When in doubt, return a box around the most relevant area instead of skipping the annotation."
         )
 
+    @staticmethod
+    def _retry_prompt(question: str, error: Exception, failed_raw: str) -> str:
+        """Build a stricter prompt that asks the model to fix its previous invalid output."""
+        hint = (
+            f"{question}\n\n"
+            "IMPORTANT: Your previous response could not be parsed and was rejected "
+            f"with this error: {error}. "
+            "Respond again with a SINGLE valid JSON object only — no markdown, no code fences, "
+            "no text before or after the JSON — using the exact structure requested above. "
+            "Make sure every annotation has the required coordinate keys."
+        )
+        if failed_raw.strip():
+            hint += (
+                '\nYour previous (invalid) output was:\n"""\n'
+                f"{failed_raw[:800]}\n"
+                '"""\nFix it and return only the corrected JSON object.'
+            )
+        return hint
+
     async def annotate(self, image_bytes: bytes, question: str) -> dict[str, Any]:
-        """Run vision analysis and return the annotated image plus metadata."""
+        """Run vision analysis and return the annotated image plus metadata.
+
+        If the vision model returns output that cannot be parsed (invalid JSON,
+        no JSON object, empty response, HTTP error), the call is retried up to
+        ``vision_max_retries`` times with a repair hint that shows the model its
+        previous invalid output and asks for strict JSON.
+        """
         logger.info("Vision annotation request: question=%r image_bytes=%d", question, len(image_bytes))
 
-        parsed = await self._analyze_with_ollama(image_bytes, question)
+        max_retries = int(getattr(self.settings, "vision_max_retries", 2))
+        parsed: dict[str, Any] | None = None
+        raw_content = ""
+        last_error: Exception | None = None
+        attempt_question = question
+
+        for attempt in range(max_retries + 1):
+            try:
+                parsed, raw_content = await self._analyze_with_ollama(image_bytes, attempt_question)
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 - retry any vision failure
+                last_error = exc
+                # _analyze_with_ollama stores the raw text it received before parsing failed.
+                failed_raw = getattr(self, "_last_raw_content", "") or ""
+                logger.warning(
+                    "Vision annotation attempt %d/%d failed: %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                )
+                if attempt >= max_retries:
+                    break
+                attempt_question = self._retry_prompt(question, exc, failed_raw)
+
+        if parsed is None:
+            assert last_error is not None
+            raise RuntimeError(
+                f"Vision annotation failed after {max_retries + 1} attempts: {last_error}"
+            ) from last_error
+
         description = parsed.get("description", "")
         raw_annotations = parsed.get("annotations", [])
-        annotations = self._normalize_annotations(raw_annotations)
+        # Decode once to get pixel dimensions so we can normalize any pixel-valued
+        # coordinates the model emits (some models mix normalized x with pixel y).
+        _decoded = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        height, width = _decoded.shape[:2] if _decoded is not None else (0, 0)
+        annotations = self._normalize_annotations(raw_annotations, width=width, height=height)
 
         annotated_image_bytes = self._draw_annotations(image_bytes, annotations)
         annotated_base64 = base64.b64encode(annotated_image_bytes).decode("ascii")
@@ -112,16 +171,19 @@ class VisionAnnotator:
             "annotated_image_base64": annotated_base64,
             "mime_type": "image/png",
             "annotations": [self._annotation_to_dict(a) for a in annotations],
+            "raw_response": raw_content,
         }
 
-    async def _analyze_with_ollama(self, image_bytes: bytes, question: str) -> dict[str, Any]:
+    async def _analyze_with_ollama(self, image_bytes: bytes, question: str) -> tuple[dict[str, Any], str]:
         provider = self.settings.vision_model_provider.lower().strip()
         if provider != "ollama":
             raise RuntimeError(f"Vision provider '{provider}' is not supported yet. Use ollama.")
 
-        # Open the image once to get dimensions so the prompt can explain normalized coordinates.
-        with Image.open(io.BytesIO(image_bytes)) as probe_image:
-            width, height = probe_image.size
+        # Decode the image once to get dimensions so the prompt can explain normalized coordinates.
+        _decoded = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if _decoded is None:
+            raise RuntimeError("Could not decode image for vision analysis")
+        height, width = _decoded.shape[:2]
 
         base_url = self.settings.vision_ollama_base_url.rstrip("/")
         model_name = self.settings.vision_model_name
@@ -175,8 +237,16 @@ class VisionAnnotator:
         if data is None:
             raise RuntimeError("No response received from vision model")
 
+        # Surface Ollama-level errors first.
+        ollama_error = data.get("error")
+        if ollama_error:
+            raise RuntimeError(f"Ollama vision error: {ollama_error}")
+
         message = data.get("message") or {}
         raw_content = message.get("content") or "{}"
+        # Stash the raw text so the retry loop can include it in a repair hint even
+        # when _extract_json raises before this method returns.
+        self._last_raw_content = raw_content
         logger.info("Vision model raw response (first 500 chars): %s", raw_content[:500])
 
         # Some multimodal models may return an Ollama error even with HTTP 200.
@@ -209,7 +279,7 @@ class VisionAnnotator:
                     "The model did not specify a location, so a default reference box was drawn on the image.",
                 )
 
-        return parsed
+        return parsed, raw_content
 
     @staticmethod
     def _extract_json(raw_content: str) -> dict[str, Any]:
@@ -262,9 +332,60 @@ class VisionAnnotator:
         try:
             return json.loads(json_text)
         except json.JSONDecodeError as exc:
+            logger.warning("Vision model returned invalid JSON. Raw content: %r", raw_content[:2000])
             raise RuntimeError(f"Vision model returned invalid JSON: {exc}") from exc
 
-    def _normalize_annotations(self, raw_annotations: list[Any]) -> list[Annotation]:
+    @staticmethod
+    def _repair_box_coords(item: dict[str, Any]) -> dict[str, Any] | None:
+        """Try to convert common malformed box representations into x1/y1/x2/y2.
+
+        Handles:
+        - separate x1/y1/x2/y2 keys (already correct)
+        - a 4-element array under "box" or "bbox"
+        - x/y/width/height keys
+        - x1/y1/width/height keys
+        """
+        # Direct keys.
+        if all(k in item for k in ("x1", "y1", "x2", "y2")):
+            return item
+
+        # Array form: [x1, y1, x2, y2]
+        for key in ("box", "bbox", "coordinates", "coords"):
+            val = item.get(key)
+            if isinstance(val, (list, tuple)) and len(val) == 4:
+                try:
+                    x1, y1, x2, y2 = (float(v) for v in val)
+                    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                except (ValueError, TypeError):
+                    continue
+
+        # x, y, width, height form.
+        if all(k in item for k in ("x", "y", "width", "height")):
+            try:
+                x1 = float(item["x"])
+                y1 = float(item["y"])
+                x2 = x1 + float(item["width"])
+                y2 = y1 + float(item["height"])
+                return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            except (ValueError, TypeError):
+                pass
+
+        # x1, y1, width, height form.
+        if all(k in item for k in ("x1", "y1", "width", "height")):
+            try:
+                x1 = float(item["x1"])
+                y1 = float(item["y1"])
+                x2 = x1 + float(item["width"])
+                y2 = y1 + float(item["height"])
+                return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            except (ValueError, TypeError):
+                pass
+
+        return None
+
+    def _normalize_annotations(
+        self, raw_annotations: list[Any], width: int = 0, height: int = 0
+    ) -> list[Annotation]:
         if not isinstance(raw_annotations, list):
             logger.warning("Vision model annotations field is not a list: %r", raw_annotations)
             return []
@@ -274,7 +395,11 @@ class VisionAnnotator:
             if not isinstance(item, dict):
                 continue
             raw_type = item.get("type") or "box"
-            ann_type = str(raw_type).lower().strip() if not isinstance(raw_type, list) else "box"
+            # Tolerate models that wrap the type in punctuation, e.g. "<box>" or "[box]".
+            if isinstance(raw_type, list):
+                ann_type = "box"
+            else:
+                ann_type = re.sub(r"[^a-z0-9]", "", str(raw_type).lower().strip()) or "box"
             label = str(item.get("label") or f"anomaly-{idx + 1}")
             color = item.get("color")
             if isinstance(color, str):
@@ -282,33 +407,46 @@ class VisionAnnotator:
 
             try:
                 if ann_type == "box":
+                    repaired = self._repair_box_coords(item) or item
+                    # Coordinates may be normalized (0-1) OR raw pixels. Anything > 1.0
+                    # is treated as pixels and divided by the relevant image dimension.
+                    x1 = self._coord_to_normalized(repaired["x1"], width)
+                    y1 = self._coord_to_normalized(repaired["y1"], height)
+                    x2 = self._coord_to_normalized(repaired["x2"], width)
+                    y2 = self._coord_to_normalized(repaired["y2"], height)
+                    # Sort so x1 <= x2 and y1 <= y2.
+                    x1, x2 = sorted((x1, x2))
+                    y1, y2 = sorted((y1, y2))
                     results.append(
                         Annotation(
                             type="box",
                             label=label,
                             color=color,
-                            x1=self._clamp(float(item["x1"])),
-                            y1=self._clamp(float(item["y1"])),
-                            x2=self._clamp(float(item["x2"])),
-                            y2=self._clamp(float(item["y2"])),
+                            x1=x1,
+                            y1=y1,
+                            x2=x2,
+                            y2=y2,
                         )
                     )
                 elif ann_type == "circle":
+                    radius = float(item["radius"])
+                    if max(width, height) and radius > 1.0:
+                        radius = radius / max(width, height)
                     results.append(
                         Annotation(
                             type="circle",
                             label=label,
                             color=color,
-                            cx=self._clamp(float(item["cx"])),
-                            cy=self._clamp(float(item["cy"])),
-                            radius=max(0.0, float(item["radius"])),
+                            cx=self._coord_to_normalized(item["cx"], width),
+                            cy=self._coord_to_normalized(item["cy"], height),
+                            radius=max(0.0, radius),
                         )
                     )
                 elif ann_type == "highlight":
                     points = item.get("points")
                     if isinstance(points, list) and points:
                         normalized_points = [
-                            [self._clamp(float(p[0])), self._clamp(float(p[1]))]
+                            [self._coord_to_normalized(p[0], width), self._coord_to_normalized(p[1], height)]
                             for p in points
                             if isinstance(p, (list, tuple)) and len(p) >= 2
                         ]
@@ -333,95 +471,115 @@ class VisionAnnotator:
     def _clamp(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
-    def _draw_annotations(self, image_bytes: bytes, annotations: list[Annotation]) -> bytes:
-        image = Image.open(io.BytesIO(image_bytes))
-        # Convert palette/greyscale images and ensure an alpha channel so that
-        # highlight fills and other transparent overlays render correctly.
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
+    @staticmethod
+    def _coord_to_normalized(value: Any, dim: int) -> float:
+        """Normalize a coordinate that may be in [0,1] or in raw pixels.
 
-        draw = ImageDraw.Draw(image, "RGBA")
-        width, height = image.size
-        font = self._load_font()
+        Values > 1.0 are assumed to be pixel offsets and are divided by ``dim``
+        (the image width or height). Everything is then clamped to [0,1].
+        """
+        v = float(value)
+        if dim and v > 1.0:
+            v = v / dim
+        return VisionAnnotator._clamp(v)
+
+    def _draw_annotations(self, image_bytes: bytes, annotations: list[Annotation]) -> bytes:
+        """Draw annotations as transparent outlines (no fill) using OpenCV.
+
+        Boxes, circles, and highlights are rendered as a colored outline only —
+        the interior stays transparent so the underlying image is fully visible.
+        A small solid label tag is drawn above each annotation.
+        """
+        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError("Could not decode image for annotation")
+        height, width = image.shape[:2]
 
         for idx, ann in enumerate(annotations):
-            color = ann.color or self._DEFAULT_COLORS[idx % len(self._DEFAULT_COLORS)]
-            fill_color = self._hex_to_rgba(color, alpha=60)
-            outline_color = color
+            color_hex = ann.color or self._DEFAULT_COLORS[idx % len(self._DEFAULT_COLORS)]
+            bgr = self._hex_to_bgr(color_hex)
 
             if ann.type == "box" and ann.x1 is not None:
                 x1 = int(ann.x1 * width)
                 y1 = int(ann.y1 * height)
                 x2 = int(ann.x2 * width)
                 y2 = int(ann.y2 * height)
-                draw.rectangle([x1, y1, x2, y2], outline=outline_color, width=3, fill=fill_color)
-                self._draw_label(draw, ann.label, x1, y1, outline_color, font)
+                cv2.rectangle(image, (x1, y1), (x2, y2), bgr, thickness=3)
+                self._draw_label(image, ann.label, x1, y1, bgr)
 
             elif ann.type == "circle" and ann.cx is not None:
                 cx = int(ann.cx * width)
                 cy = int(ann.cy * height)
                 r = int(ann.radius * max(width, height))
-                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=outline_color, width=3, fill=fill_color)
-                self._draw_label(draw, ann.label, cx - r, cy - r, outline_color, font)
+                cv2.circle(image, (cx, cy), r, bgr, thickness=3)
+                self._draw_label(image, ann.label, cx - r, cy - r, bgr)
 
             elif ann.type == "highlight" and ann.points:
-                pts = [(int(p[0] * width), int(p[1] * height)) for p in ann.points]
-                draw.polygon(pts, outline=outline_color, fill=fill_color, width=3)
-                if pts:
-                    min_x = min(p[0] for p in pts)
-                    min_y = min(p[1] for p in pts)
-                    self._draw_label(draw, ann.label, min_x, min_y, outline_color, font)
+                pts = np.array(
+                    [[int(p[0] * width), int(p[1] * height)] for p in ann.points],
+                    dtype=np.int32,
+                )
+                cv2.polylines(image, [pts], isClosed=True, color=bgr, thickness=3)
+                if len(pts):
+                    min_x = int(pts[:, 0].min())
+                    min_y = int(pts[:, 1].min())
+                    self._draw_label(image, ann.label, min_x, min_y, bgr)
 
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        return buffer.getvalue()
-
-    @staticmethod
-    def _load_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "C:/Windows/Fonts/arialbd.ttf",
-        ]
-        for path in candidates:
-            try:
-                return ImageFont.truetype(path, size=16)
-            except Exception:
-                continue
-        return ImageFont.load_default()
+        ok, buffer = cv2.imencode(".png", image)
+        if not ok:
+            raise RuntimeError("Could not encode annotated image to PNG")
+        return buffer.tobytes()
 
     @staticmethod
-    def _draw_label(
-        draw: ImageDraw.ImageDraw,
-        label: str,
-        x: int,
-        y: int,
-        color: str,
-        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-    ) -> None:
-        text = label
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        padding = 4
-        label_y = max(0, y - text_h - padding * 2)
-        draw.rectangle(
-            [x, label_y, x + text_w + padding * 2, label_y + text_h + padding * 2],
-            fill=color,
-        )
-        draw.text((x + padding, label_y + padding), text, fill="white", font=font)
-
-    @staticmethod
-    def _hex_to_rgba(hex_color: str, alpha: int) -> tuple[int, int, int, int]:
+    def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
+        """Convert a #RRGGBB hex string to the BGR tuple OpenCV expects."""
         hex_color = hex_color.lstrip("#")
         if len(hex_color) == 3:
             hex_color = "".join(ch * 2 for ch in hex_color)
         r = int(hex_color[0:2], 16)
         g = int(hex_color[2:4], 16)
         b = int(hex_color[4:6], 16)
-        return (r, g, b, alpha)
+        return (b, g, r)
+
+    @staticmethod
+    def _text_color_for(bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+        """Pick black or white text for a label tag based on background luminance."""
+        b, g, r = bgr
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return (0, 0, 0) if luminance > 160 else (255, 255, 255)
+
+    @staticmethod
+    def _draw_label(
+        image: np.ndarray,
+        label: str,
+        x: int,
+        y: int,
+        bgr: tuple[int, int, int],
+    ) -> None:
+        """Draw a filled label tag with contrasting text above (x, y)."""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        padding = 4
+        label_y = max(0, y - text_h - padding * 2 - baseline)
+        cv2.rectangle(
+            image,
+            (x, label_y),
+            (x + text_w + padding * 2, label_y + text_h + padding * 2 + baseline),
+            bgr,
+            thickness=-1,
+        )
+        cv2.putText(
+            image,
+            label,
+            (x + padding, label_y + text_h + padding),
+            font,
+            font_scale,
+            VisionAnnotator._text_color_for(bgr),
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
 
     @staticmethod
     def _annotation_to_dict(ann: Annotation) -> dict[str, Any]:

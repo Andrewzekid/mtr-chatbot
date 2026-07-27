@@ -16,8 +16,14 @@ echo "[2/8] Upgrade pip tooling"
 echo "[3/8] Install backend dependencies"
 .venv/bin/python -m pip install -r requirements.txt
 
-echo "[3.5/8] Install PyTorch CUDA runtime for SenseVoice"
-.venv/bin/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# Read STT backend choice (default: sensevoice). SenseVoice also needs PyTorch CUDA.
+STT_BACKEND=${STT_BACKEND:-sensevoice}
+if [ "$STT_BACKEND" = "sensevoice" ]; then
+  echo "[3.5/8] Install PyTorch CUDA runtime for SenseVoice"
+  .venv/bin/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+else
+  echo "[3.5/8] STT_BACKEND=whisper — skipping PyTorch (faster-whisper uses CTranslate2)"
+fi
 
 echo "[4/8] Ensure .env exists"
 if [ ! -f ".env" ]; then
@@ -27,14 +33,16 @@ fi
 echo "[5/8] Ensure local directories"
 ensure_dir models
 ensure_dir models/piper
+ensure_dir models/whisper-cache
 ensure_dir bin
 ensure_dir bin/piper
 
 # Fix ownership if directories were previously created by Docker (running as root)
 sudo chown -R "$(id -u):$(id -g)" models bin 2>/dev/null || true
 
-echo "[6/8] Download SenseVoiceSmall (ModelScope iic/SenseVoiceSmall)"
-.venv/bin/python -c "
+if [ "$STT_BACKEND" = "sensevoice" ]; then
+  echo "[6/8] Download SenseVoiceSmall (ModelScope iic/SenseVoiceSmall)"
+  .venv/bin/python -c "
 from modelscope import snapshot_download
 import os, shutil
 src = snapshot_download('iic/SenseVoiceSmall')
@@ -43,6 +51,14 @@ shutil.rmtree(dst, ignore_errors=True)
 shutil.copytree(src, dst)
 print('SenseVoiceSmall ->', dst)
 "
+else
+  echo "[6/8] Pre-download Whisper model (Systran/faster-whisper-large-v3) into models/whisper-cache"
+  .venv/bin/python -c "
+from faster_whisper import WhisperModel
+WhisperModel('large-v3', device='cpu', compute_type='int8', download_root='models/whisper-cache')
+print('Whisper large-v3 cached in models/whisper-cache')
+" || echo "  (Whisper will auto-download on first backend start if this step is skipped)"
+fi
 
 echo "[7/8] Download Piper runtime and voice"
 TAR_PATH="bin/piper/piper_linux_x86_64.tar.gz"

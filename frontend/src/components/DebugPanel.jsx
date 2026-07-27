@@ -63,6 +63,16 @@ export default function DebugPanel({ toolCalls, toolRouterRaw }) {
                         </pre>
                       </details>
                     )}
+                    {call.name === "annotate_image" &&
+                      typeof call.output === "string" &&
+                      call.output.includes("--- Vision model raw output ---") && (
+                        <details className="debug-call-output" open>
+                          <summary>Vision model raw output</summary>
+                          <pre>
+                            {call.output.split("--- Vision model raw output ---")[1]?.trim()}
+                          </pre>
+                        </details>
+                      )}
                   </li>
                 ))}
               </ul>

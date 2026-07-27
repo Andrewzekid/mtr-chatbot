@@ -204,6 +204,7 @@ async def websocket_chat(ws: WebSocket) -> None:
     active_task = None
     selected_voice_model: str | None = None
     conversation_history: list[tuple[str, str]] = []
+    tool_call_history: list[dict[str, object]] = []
 
     async def cancel_active(reason: str, request_id: str | None = None) -> None:
         nonlocal active_task
@@ -220,8 +221,11 @@ async def websocket_chat(ws: WebSocket) -> None:
         user_text = ""
         assistant_text = ""
         current_request_id: str | None = None
+        last_tool_payload: dict[str, object] | None = None
 
         def send_tool_calls(payload: dict[str, object]) -> None:
+            nonlocal last_tool_payload
+            last_tool_payload = payload
             asyncio.create_task(
                 ws.send_json(
                     ServerMessage(
@@ -238,6 +242,7 @@ async def websocket_chat(ws: WebSocket) -> None:
             suffix=suffix,
             voice_model_path=selected_voice_model,
             chat_history=conversation_history,
+            tool_history=tool_call_history,
             tool_calls_callback=send_tool_calls,
         ):
             if event.type == "transcript":
@@ -251,6 +256,10 @@ async def websocket_chat(ws: WebSocket) -> None:
             conversation_history.append((user_text, assistant_text))
             if len(conversation_history) > 12:
                 del conversation_history[:-12]
+        if last_tool_payload and last_tool_payload.get("tool_calls"):
+            tool_call_history.append(last_tool_payload)
+            if len(tool_call_history) > 6:
+                del tool_call_history[:-6]
 
     try:
         while True:

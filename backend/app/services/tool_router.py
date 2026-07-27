@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
@@ -136,6 +137,25 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Category name, e.g. Ticket Gate.",
                 }
+            },
+            "required": ["category"],
+        },
+    },
+    {
+        "name": "get_category_objects_with_images",
+        "description": "Track IDs, coordinates, and sample image frames for objects in a category. Use this when the user asks to see objects WITH their images, e.g. 'show me exit signs with track IDs, coordinates, and images'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Category name, e.g. Exit Sign.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum objects to return.",
+                    "default": 5,
+                },
             },
             "required": ["category"],
         },
@@ -396,25 +416,30 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "annotate_image",
-        "description": "Analyze and draw annotations (boxes, circles, highlights) on an inspection image to mark anomalies or areas of interest. Provide exactly one of image_url, track_id, or category. Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
+        "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, track_id, or category. For track_id or category, up to `limit` images are annotated (default 5). Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
         "parameters": {
             "type": "object",
             "properties": {
                 "image_url": {
                     "type": "string",
-                    "description": "URL or path to the image, e.g. /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.",
+                    "description": "URL or path to a single image, e.g. /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.",
                 },
                 "track_id": {
                     "type": "integer",
-                    "description": "Numeric track/object ID. The first available frame for this track will be annotated.",
+                    "description": "Numeric track/object ID. All available frames for this track (up to `limit`) will be annotated.",
                 },
                 "category": {
                     "type": "string",
-                    "description": "Category name. A sample image of this category will be annotated.",
+                    "description": "Category name. Up to `limit` sample images of this category will be annotated.",
                 },
                 "question": {
                     "type": "string",
                     "description": "What to look for or how to annotate. Defaults to the user's original question.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum number of images to annotate for a track_id or category. Default 5.",
                 },
             },
         },
@@ -605,7 +630,17 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Use ONLY when the user asks for coordinates/positions of a SPECIFIC category. Do not call for every category in broad "all objects" questions.
     - Example: User: "What are the coordinates of the ticket gates?" -> get_category_objects_coordinates(category="Ticket Gate")
 
-12. get_category_proximity
+12. get_category_objects_with_images
+    - Purpose: track IDs, coordinates, and sample image frames for objects in a category. Returns everything the user needs when they ask for "show me X with images".
+    - Args: category (string, required), limit (integer, default 5).
+    - Output sample:
+        Exit Signs with coordinates and sample frames:
+        - Track 648: centroid (-44.78, 45.18, -16.23)
+          ![frame](/inspection/images/1781168040076490000.jpg)
+    - Use when the user asks for objects with their images, e.g. "show me exit signs with track IDs, coordinates, and images".
+    - Example: User: "Show me examples of exit signs with track IDs, coordinates, and images." -> get_category_objects_with_images(category="Exit Sign", limit=5)
+
+13. get_category_proximity
     - Purpose: count objects from other categories near each object in a target category. Also returns target centroids.
     - Args: target_category (string, required), other_categories (list of strings, required), radius_m (number, default 2.0).
     - Output sample:
@@ -660,10 +695,11 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Purpose: per-frame observations captured within a time window.
     - Args: start_time (string or integer, required), end_time (string or integer, required), limit (integer, default 50).
     - Output sample:
-        50 observation(s) between 2026-06-11 16:53:40.000 and 2026-06-11 16:53:50.000:
+        50 observation(s) between 2026-06-11 16:53:00.000 and 2026-06-11 16:54:00.000:
         - 2026-06-11 16:53:40.877: Track 1455 (Ticket Gate), 96 points at (-15.99, 42.53, -6.18)
     - Use for: "show me detections around time T".
-    - Example: User: "Show me detections around 16:53:45." -> get_observations_in_time_range(start_time="16:53:40", end_time="16:53:50")
+    - When the user gives a bare time like "at 4:53" or "around 4:53", interpret it as a one-minute window from that minute to the next minute (e.g. start_time="16:53:00", end_time="16:54:00"), NOT a 10-second window.
+    - Example: User: "Show me detections around 4:53 PM." -> get_observations_in_time_range(start_time="16:53:00", end_time="16:54:00")
 
 18. get_objects_near_position
     - Purpose: objects within a radius of a 3D point.
@@ -747,7 +783,8 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Purpose: sample images captured in a time window.
     - Args: start_time, end_time (required), category (optional), limit (integer, default 5).
     - Use for: "show me what the camera saw at 4:51".
-    - Example: User: "Show me images from 4:51 to 4:52." -> get_images_in_time_range(start_time="16:51:00", end_time="16:52:00")
+    - When the user gives a bare time like "at 4:53" or "around 4:53", interpret it as a one-minute window from that minute to the next minute (e.g. start_time="16:53:00", end_time="16:54:00"), NOT a 10-second window.
+    - Example: User: "What did the camera see at 4:53 PM?" -> get_images_in_time_range(start_time="16:53:00", end_time="16:54:00")
 
 29. get_category_cooccurrence
     - Purpose: which categories appear together most often in temporal clusters.
@@ -772,11 +809,11 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Example: User: "Tell me about all the lights and advertisement boards, their timestamps and coordinates." -> run_sql_query(query="SELECT category, COUNT(*) as object_count, MIN(first_seen_ns) as first_seen, MAX(last_seen_ns) as last_seen, AVG(centroid_x) as avg_x, AVG(centroid_y) as avg_y, AVG(centroid_z) as avg_z, MIN(centroid_x) as min_x, MAX(centroid_x) as max_x, MIN(centroid_y) as min_y, MAX(centroid_y) as max_y, MIN(centroid_z) as min_z, MAX(centroid_z) as max_z FROM objects WHERE category IN ('Lights', 'Advertisement Board') GROUP BY category")
 
 32. annotate_image
-    - Purpose: analyze an inspection image with a vision model and draw annotations (boxes, circles, highlights) around anomalies or areas of interest.
-    - Args: provide exactly one of image_url, track_id, or category. Optionally pass question to guide what to look for.
-    - image_url: a URL or path such as /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.
-    - track_id: use the first available frame for this track.
-    - category: use a random sample image of this category.
+    - Purpose: analyze one or more inspection images with a vision model and draw annotations (boxes, circles, highlights) around anomalies or areas of interest.
+    - Args: provide exactly one of image_url, track_id, or category. Optionally pass question to guide what to look for, and limit (default 5) to cap how many images are annotated for a track_id or category.
+    - image_url: a single URL or path such as /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.
+    - track_id: annotate all available frames for this track (up to limit).
+    - category: annotate up to limit random sample images of this category.
     - Output sample:
         Annotated image:
         ![annotated](/annotated/images/a1b2c3d4.png)
@@ -785,6 +822,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
     - Use for: "highlight anomalies in this image", "circle the defect on track 218", "draw on an advertisement board image", "mark what is wrong with this picture".
     - Example: User: "Circle the anomaly on the image of track 218." -> annotate_image(track_id=218, question="circle the anomaly")
     - Example: User: "Highlight defects on an advertisement board." -> annotate_image(category="Advertisement Board", question="highlight defects")
+    - Example: User: "Annotate all frames of track 218." -> annotate_image(track_id=218, question="highlight any anomalies", limit=10)
 
 ## Multi-tool flow examples
 
@@ -794,6 +832,13 @@ Plan:
 1. get_summary
 2. get_category_objects_coordinates(category="Ticket Gate")
 3. get_category_proximity(target_category="Ticket Gate", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Exit Sign"])
+
+Example A2 (multi-tool + re-call with changed parameter):
+User: "For the two exit signs recorded around 4:56 PM, what were their coordinates, and what objects were within a 1 meter radius of them?"
+Plan:
+1. get_objects_by_category_in_time_range(category="Exit Sign", start_time="16:56:00", end_time="16:57:00")
+2. get_category_proximity(target_category="Exit Sign", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Ticket Gate"], radius_m=1.0)
+Note: even if a previous turn already called get_category_proximity for Exit Sign with radius_m=3.0, the user now asks for 1 m, so you MUST call it again with radius_m=1.0.
 
 Example B:
 User: "How many times were advertisement boards seen, and what is near coordinate (-18, 32, -6)?"
@@ -807,6 +852,11 @@ Plan:
 1. get_category_sample_images(category="Advertisement Board", limit=5)
 2. get_object_distance(track_id_a=218, track_id_b=165)
 
+Example C2:
+User: "Show me examples of exit signs with their track IDs, coordinates, and images."
+Plan:
+1. get_category_objects_with_images(category="Exit Sign", limit=5)
+
 Example D:
 User: "What anomalies did you find, and how many objects were detected?"
 Plan:
@@ -817,6 +867,11 @@ Example E:
 User: "Where was the cluster at 4:51 PM?"
 Plan:
 1. get_objects_in_temporal_cluster(center_time="16:51:45", window_ms=5000)
+
+Example E2:
+User: "What did the camera see at 4:53 PM?"
+Plan:
+1. get_images_in_time_range(start_time="16:53:00", end_time="16:54:00")
 
 Example F:
 User: "Give me a summary of all the lights and advertisement boards found."
@@ -830,22 +885,95 @@ Plan:
 
 ## Rules
 
-- Call every tool that is needed in a single turn. Do not chain sequentially.
+- Call every tool that is needed in a single turn. Do not chain sequentially. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count. Combine tools freely; the backend runs all of them and merges their results.
+- A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, track ID, coordinates, limit, target_category, other_categories, n, etc.), you MUST call the relevant tool again with the new parameters, even if a similar question was answered moments ago. When in doubt whether the parameters match, call the tool.
+- Example of the above: the user first asks "what is within 3 m of the exit signs" and you called get_category_proximity(radius_m=3.0). If the user then asks "what is within 1 m of the exit signs", you MUST call get_category_proximity(radius_m=1.0) again — do NOT reuse or paraphrase the 3 m answer.
+- Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
 - For proximity questions, pass all other known categories as other_categories unless the user names a specific subset.
 - For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because the inspection ran around 4:50 PM.
+- When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
 - When the user asks for a summary of specific categories (e.g., "summary of lights and advertisement boards", "tell me about the lights and advertisement boards"), do NOT call get_summary. Use run_sql_query with GROUP BY category that returns COUNT, MIN/MAX first_seen_ns/last_seen_ns, and AVG/MIN/MAX centroid coordinates.
 - When the user asks about anomalies, findings, issues, problems, state changes, recommendations, or what was wrong, call get_report_summary. Do not call coordinate tools for anomaly questions.
 - Do not output explanatory text; only emit tool calls.
 """
 
-    def select_tool(self, query: str) -> list[tuple[str, Any]]:
+    @staticmethod
+    def _extract_image_urls(text: str) -> list[str]:
+        """Return image URLs found in a text turn, in order of appearance."""
+        urls: list[str] = []
+        for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", text):
+            urls.append(match.group(1))
+        for match in re.finditer(r"(/(?:inspection|reports|annotated)/images/[^\s\)\"]+)", text):
+            if match.group(1) not in urls:
+                urls.append(match.group(1))
+        return urls
+
+    @staticmethod
+    def _image_context_from_history(chat_history: Sequence[tuple[str, str]] | None) -> str:
+        """Build a compact line of prior image URLs for the router prompt."""
+        if not chat_history:
+            return ""
+        urls: list[str] = []
+        for _, assistant_text in chat_history:
+            if not assistant_text:
+                continue
+            for url in ToolRouter._extract_image_urls(assistant_text):
+                if url not in urls:
+                    urls.append(url)
+        if not urls:
+            return ""
+        numbered = ", ".join(f"{i + 1}. {url}" for i, url in enumerate(urls[-6:]))
+        return (
+            f"\n\nPrior images shown in this conversation (most recent last): {numbered}. "
+            "When the user refers to 'the first image', 'that image', 'this image', or 'the last image', "
+            "use the matching image_url in annotate_image instead of picking a random category sample."
+        )
+
+    @staticmethod
+    def _prior_tool_context(tool_history: Sequence[dict[str, object]] | None) -> str:
+        """Build a compact list of previously called tools and their exact arguments.
+
+        Only the tool name + arguments are included (not the outputs): the point is to let
+        the router see WHICH parameters were used before so it can detect when the user is
+        asking the same kind of question with DIFFERENT parameters and must re-call the tool.
+        """
+        if not tool_history:
+            return ""
+        calls: list[str] = []
+        for entry in tool_history:
+            for call in entry.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name", "unknown")
+                args = call.get("args", {})
+                try:
+                    arg_str = dict(args) if isinstance(args, dict) else args
+                except Exception:
+                    arg_str = args
+                calls.append(f"- {name}({arg_str})")
+        if not calls:
+            return ""
+        recent = calls[-8:]
+        return (
+            "\n\nPreviously called tools in this conversation (most recent last), with the EXACT "
+            "arguments used:\n" + "\n".join(recent)
+        )
+
+    def select_tool(
+        self,
+        query: str,
+        chat_history: Sequence[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
+    ) -> list[tuple[str, Any]]:
         """Return a list of (tool_name, args) chosen by the base model."""
         if not self.settings.tool_router_enabled:
             return []
 
         q = query.lower()
+        prior_images = self._image_context_from_history(chat_history)
+        prior_tools = self._prior_tool_context(tool_history)
 
         # Annotation requests take priority when the user asks to draw/highlight/mark an image,
         # and we can identify which image (URL, track, or category) to annotate.
@@ -866,6 +994,30 @@ Plan:
             url_match = re.search(r"(/[^\s]+\.(?:jpg|jpeg|png))", q, re.IGNORECASE)
             if url_match:
                 args["image_url"] = url_match.group(1)
+            elif prior_images:
+                # If the query refers to an earlier image, prefer resolving it from history.
+                urls = [
+                    m.group(1).rstrip(".,;:!?")
+                    for m in re.finditer(r"\d+\.\s+(/[^\s,]+)", prior_images)
+                ]
+                if urls:
+                    if re.search(r"\b(first|1st)\s+image\b", q):
+                        args["image_url"] = urls[0]
+                    elif re.search(r"\b(second|2nd)\s+image\b", q) and len(urls) > 1:
+                        args["image_url"] = urls[1]
+                    elif re.search(r"\b(third|3rd)\s+image\b", q) and len(urls) > 2:
+                        args["image_url"] = urls[2]
+                    elif re.search(r"\bimage\s+(\d+)\b", q):
+                        idx = int(re.search(r"\bimage\s+(\d+)\b", q).group(1)) - 1
+                        if 0 <= idx < len(urls):
+                            args["image_url"] = urls[idx]
+                        else:
+                            args["image_url"] = urls[-1]
+                    elif re.search(r"\b(last|that|this|the)\s+image\b", q):
+                        args["image_url"] = urls[-1]
+                    elif re.search(r"\bimage\b|\bpicture\b|\bphoto\b|\bframe\b", q):
+                        # Generic image reference: default to the most recent image.
+                        args["image_url"] = urls[-1]
             if args:
                 args["question"] = query
                 logger.info("Forcing annotate_image for annotation query: %r args=%s", query, args)
@@ -908,7 +1060,7 @@ Plan:
         payload = {
             "model": self.settings.tool_router_model,
             "messages": [
-                {"role": "system", "content": self._system_prompt()},
+                {"role": "system", "content": self._system_prompt() + prior_images + prior_tools},
                 {"role": "user", "content": query},
             ],
             "stream": False,

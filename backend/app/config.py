@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     vision_max_tokens: int = 1024
     vision_temperature: float = 0.3
     vision_request_timeout_s: float = 120.0
+    # Extra attempts to ask the vision model for valid JSON when its output fails to parse.
+    vision_max_retries: int = 2
 
     # Tool router (LLM-based intent classification for DB queries)
     # Defaults to the main LLM so the base model decides which tools to call.
@@ -44,9 +46,25 @@ class Settings(BaseSettings):
     tool_router_temperature: float = 0.0
     tool_router_n_ctx: int = 16384
 
-    # SenseVoice (FunASR)
+    # Speech-to-text backend: "sensevoice" (FunASR, default) or "whisper" (faster-whisper).
+    stt_backend: str = "sensevoice"
+
+    # SenseVoice (FunASR) — primary STT backend.
+    # Official model is iic/SenseVoiceSmall. point sensevoice_model_dir at a different FunASR
+    # model snapshot to swap in a larger ASR model.
     sensevoice_model_dir: str = "./models/SenseVoiceSmall"
     sensevoice_device: str = "cuda:0"
+
+    # Whisper (faster-whisper / CTranslate2) — opt-in alternative STT backend (STT_BACKEND=whisper).
+    # Model size or HuggingFace repo: large-v3 (best, EN/zh/yue/Cantonese), medium, small, or
+    # a Systran faster-whisper repo id. large-v3 with int8_float16 fits ~1.5-2GB VRAM.
+    whisper_model: str = "large-v3"
+    whisper_device: str = "cuda:0"  # "cuda:0", "cpu", or "auto"
+    whisper_compute_type: str = "int8_float16"  # float16 (more VRAM, slightly faster), int8, int8_float16
+    whisper_language: str = ""  # "" = auto-detect; or "en", "zh", "yue" to force
+    whisper_beam_size: int = 5
+    whisper_vad_filter: bool = True  # Silero VAD trims silence/noise before transcription
+    whisper_download_root: str = "./models/whisper-cache"  # CTranslate2 model cache dir
 
     # Inspection SQLite database (MTR object grounding results)
     inspection_db_path: str = "/home/wangyiming/code/object_detection_app/output/inspection_mtr.db"
@@ -81,6 +99,7 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: object) -> None:
         self.sensevoice_model_dir = self._resolve_backend_path(self.sensevoice_model_dir)
+        self.whisper_download_root = self._resolve_backend_path(self.whisper_download_root)
         self.reports_dir = self._resolve_backend_path(self.reports_dir)
         self.annotated_image_cache_dir = self._resolve_backend_path(self.annotated_image_cache_dir)
         self.piper_exe_path = self._resolve_backend_path(self.piper_exe_path)

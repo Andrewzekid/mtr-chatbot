@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable, Sequence
 from typing import AsyncGenerator
 
@@ -13,6 +14,9 @@ from app.services.db_service import InspectionDBClient
 from app.services.report_service import InspectionReportClient
 
 logger = logging.getLogger(__name__)
+
+# Markdown image links like ![alt](/annotated/images/xxx.png) or ![alt](/inspection/images/yyy.jpg).
+_IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 
 
 class LocalLLM:
@@ -83,7 +87,8 @@ class LocalLLM:
             "Image links:\n"
             "- The database context may include markdown image links such as ![description](/inspection/images/<filename.jpg>).\n"
             "- It may also include annotated image links from the annotate_image tool, e.g. ![annotated image](/annotated/images/<filename.png>).\n"
-            "- Always preserve these links in your text response so the UI can display the object frames or annotated result to the user.\n"
+            "- ALWAYS preserve these links in your text response so the UI can display the object frames or annotated result to the user. Never drop, summarize, or rephrase them.\n"
+            "- When the context includes multiple image links (e.g. representative frames), include every link in your response; the UI will display them as thumbnails.\n"
             "- Do not describe the image filename or URL in words; the UI handles the image.\n\n"
             "Speech and readability:\n"
             "- Your response is also spoken aloud, so avoid heavy punctuation, markdown syntax, or lists that are hard to speak.\n"
@@ -96,14 +101,45 @@ class LocalLLM:
             "Do not output emojis."
         )
 
+    @staticmethod
+    def _format_tool_history(tool_history: Sequence[dict[str, object]] | None) -> str:
+        """Serialize recent tool calls and their outputs for the LLM context."""
+        if not tool_history:
+            return ""
+        lines = ["Recent tool calls and results (for reference):"]
+        for entry in tool_history:
+            tool_calls = entry.get("tool_calls") or []
+            if not tool_calls:
+                continue
+            for call in tool_calls:
+                name = call.get("name", "unknown")
+                args = call.get("args", {})
+                # Strip image links from past tool outputs so the model does not
+                # re-emit annotated/inspection images from earlier turns.
+                output = LocalLLM._strip_image_links(str(call.get("output", "")))
+                lines.append(f"- {name}({args}): {output}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _strip_image_links(text: str) -> str:
+        """Remove markdown image links so they do not bleed into later turns."""
+        if not text:
+            return text
+        cleaned = _IMAGE_LINK_RE.sub("", text)
+        return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
     def _build_messages(
         self,
         prompt: str,
         chat_history: Sequence[tuple[str, str]] | None,
         db_context: str | None = None,
         report_context: str | None = None,
+        tool_context: str | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt()}]
+
+        if tool_context:
+            messages.append({"role": "system", "content": f"Past tool call history:\n{tool_context}"})
 
         if db_context:
             messages.append({"role": "system", "content": f"Inspection database context (object detections, categories, counts, timelines, and image links):\n{db_context}"})
@@ -125,8 +161,11 @@ class LocalLLM:
             for user_text, assistant_text in reversed(kept):
                 if user_text.strip():
                     messages.append({"role": "user", "content": user_text})
-                if assistant_text.strip():
-                    messages.append({"role": "assistant", "content": assistant_text})
+                # Strip image links from prior assistant replies so the model does
+                # not re-emit annotated/inspection images in unrelated later turns.
+                assistant_clean = self._strip_image_links(assistant_text)
+                if assistant_clean.strip():
+                    messages.append({"role": "assistant", "content": assistant_clean})
 
         messages.append({"role": "user", "content": prompt})
         return messages
@@ -135,6 +174,7 @@ class LocalLLM:
         self,
         prompt: str,
         chat_history: Sequence[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
         tool_calls_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> AsyncGenerator[str, None]:
         db_context = None
@@ -143,7 +183,7 @@ class LocalLLM:
         tool_router_raw: dict[str, object] | None = None
         if self.db_client is not None:
             try:
-                db_context = await self.db_client.lookup(prompt)
+                db_context = await self.db_client.lookup(prompt, chat_history=chat_history, tool_history=tool_history)
                 if db_context:
                     logger.info("Injecting inspection DB context for prompt: %r", prompt)
                 tool_results = [
@@ -151,11 +191,25 @@ class LocalLLM:
                     for r in self.db_client.last_tool_results
                 ]
                 report_needed = any(call.get("name") == "get_report_summary" for call in self.db_client.last_tool_calls)
-                annotated_image_called = any(call.get("name") == "annotate_image" for call in self.db_client.last_tool_calls)
-                if annotated_image_called and db_context:
+                annotate_called = any(
+                    call.get("name") == "annotate_image" for call in self.db_client.last_tool_calls
+                )
+                image_tool_called = annotate_called or any(
+                    call.get("name") in {"get_images_in_time_range", "get_category_sample_images", "get_object_image_paths"}
+                    for call in self.db_client.last_tool_calls
+                )
+                if annotate_called and db_context:
                     db_context = (
-                        "The user asked to annotate/highlight an image. "
-                        "Include the annotated image markdown link shown below in your answer so the UI can display it.\n\n"
+                        "IMPORTANT: The annotate_image tool just produced an annotated image. "
+                        "You MUST include the annotated image markdown link at the start of your answer so the UI displays it. "
+                        "Do NOT summarize it away or describe it in words instead of showing the link.\n\n"
+                        + db_context
+                    )
+                elif image_tool_called and db_context:
+                    db_context = (
+                        "The user asked to see images. "
+                        "Preserve the image markdown links shown below in your answer EXACTLY so the UI can display them. "
+                        "Do not summarize them away.\n\n"
                         + db_context
                     )
                 if self.db_client.router is not None:
@@ -192,11 +246,13 @@ class LocalLLM:
                 tool_calls_callback(debug_payload)
 
         logger.info("LLM request: model=%s prompt=%r", self.settings.llm_model_name, prompt)
+        tool_context = self._format_tool_history(tool_history)
         messages = self._build_messages(
             prompt,
             chat_history,
             db_context=db_context,
             report_context=report_context,
+            tool_context=tool_context,
         )
 
         provider = self.settings.llm_provider.lower().strip()
@@ -486,7 +542,7 @@ class LocalLLM:
                         payload = tags_resp.json()
                         for model in payload.get("models", []):
                             name = model.get("name")
-                            if isinstance(name, str):
+                            if cisinstance(name, str):
                                 ollama_models.append(name)
             except Exception:
                 ollama_ok = False

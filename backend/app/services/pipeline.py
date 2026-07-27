@@ -5,6 +5,7 @@ import base64
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -13,7 +14,7 @@ from app.models import ServerMessage
 from app.services.db_service import InspectionDBClient
 from app.services.llm_service import LocalLLM
 from app.services.report_service import InspectionReportClient
-from app.services.stt_service import STTResult, SenseVoiceSTT
+from app.services.stt_service import STTResult, build_stt
 from app.services.tool_router import ToolRouter
 from app.services.tts_service import PiperTTS
 from app.services.vision_service import VisionAnnotator
@@ -26,7 +27,7 @@ class VoicePipeline:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.stt = SenseVoiceSTT(settings)
+        self.stt = build_stt(settings)
 
         db_client = None
         if settings.inspection_db_path:
@@ -160,6 +161,7 @@ class VoicePipeline:
         suffix: str = ".webm",
         voice_model_path: str | None = None,
         chat_history: list[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
         tool_calls_callback: Callable[[list[dict[str, object]]], None] | None = None,
     ) -> AsyncGenerator[ServerMessage, None]:
         request_id = str(uuid.uuid4())
@@ -190,6 +192,7 @@ class VoicePipeline:
             async for token in self.llm.stream_reply(
                 transcript,
                 chat_history=chat_history,
+                tool_history=tool_history,
                 tool_calls_callback=tool_calls_callback,
             ):
                 full_reply += token

@@ -29,6 +29,14 @@ services:
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_MODEL_NAME: gemma4:e2b
       HF_HOME: /app/models/hf-cache
+      STT_BACKEND: sensevoice
+      WHISPER_MODEL: large-v3
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_LANGUAGE: ""
+      WHISPER_BEAM_SIZE: "5"
+      WHISPER_VAD_FILTER: "true"
+      WHISPER_DOWNLOAD_ROOT: /app/models/whisper-cache
       SENSEVOICE_MODEL_DIR: /app/models/SenseVoiceSmall
       SENSEVOICE_DEVICE: cpu
       PIPER_EXE_PATH: /opt/piper/piper/piper

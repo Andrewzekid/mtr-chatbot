@@ -7,6 +7,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlparse
 
@@ -85,6 +86,7 @@ class InspectionDBClient:
         self._last_tool_calls: list[dict[str, Any]] = []
         self._last_tool_results: list[dict[str, Any]] = []
         self._last_query: str = ""
+        self._last_chat_history: list[tuple[str, str]] = []
 
     @staticmethod
     def _format_timestamp(ns: int | None) -> str:
@@ -92,7 +94,11 @@ class InspectionDBClient:
             return "unknown"
         try:
             dt = datetime.fromtimestamp(ns / 1e9)
-            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            # Include an explicit 12-hour AM/PM rendering so the LLM does not have to
+            # convert 24-hour times itself (it was mis-reading 16:58 as "6:58 PM").
+            base = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            ampm = dt.strftime("%I:%M %p").lstrip("0").replace(" AM", "am").replace(" PM", "pm")
+            return f"{base} ({ampm})"
         except (OSError, OverflowError, ValueError):
             return str(ns)
 
@@ -113,6 +119,109 @@ class InspectionDBClient:
             return None
         return f"/inspection/images/{name}"
 
+    def _image_track_info(self, image_path: str) -> str:
+        """Compact 'Track <id> (<category>)' summary of every object seen in one frame.
+
+        Used to annotate image links with the track IDs they contain, so the LLM can
+        answer 'which track ID' questions even when the user only asked for images.
+        """
+        if not image_path:
+            return ""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT DISTINCT track_id, category
+            FROM observations
+            WHERE image_path = ? AND track_id IS NOT NULL
+            ORDER BY track_id ASC
+            """,
+            (image_path,),
+        ).fetchall()
+        if not rows:
+            return ""
+        parts = []
+        for row in rows:
+            cat = row["category"] or "unknown"
+            parts.append(f"Track {row['track_id']} ({cat})")
+        return ", ".join(parts)
+
+    _IMAGE_URL_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    _PLAIN_IMAGE_RE = re.compile(r"(/(?:inspection|reports|annotated)/images/[^\s\)\"]+)")
+
+    @staticmethod
+    def _extract_image_urls(text: str) -> list[str]:
+        """Return image URLs found in a text turn, in order of appearance."""
+        urls: list[str] = []
+        for match in InspectionDBClient._IMAGE_URL_RE.finditer(text):
+            urls.append(match.group(1))
+        for match in InspectionDBClient._PLAIN_IMAGE_RE.finditer(text):
+            if match.group(1) not in urls:
+                urls.append(match.group(1))
+        return urls
+
+    @classmethod
+    def _image_urls_from_history(cls, chat_history: Sequence[tuple[str, str]] | None) -> list[str]:
+        """Collect image URLs from assistant turns in chronological order."""
+        if not chat_history:
+            return []
+        urls: list[str] = []
+        for _, assistant_text in chat_history:
+            if not assistant_text:
+                continue
+            for url in cls._extract_image_urls(assistant_text):
+                if url not in urls:
+                    urls.append(url)
+        return urls
+
+    @classmethod
+    def _resolve_image_reference(
+        cls,
+        query: str,
+        chat_history: Sequence[tuple[str, str]] | None,
+    ) -> str | None:
+        """Resolve phrases like 'first image', 'last image', 'that image' to a URL."""
+        urls = cls._image_urls_from_history(chat_history)
+        if not urls:
+            return None
+
+        q = query.lower()
+
+        # Explicit URL in the query wins.
+        url_match = cls._PLAIN_IMAGE_RE.search(q)
+        if url_match:
+            return url_match.group(1)
+
+        # Ordinal numbers.
+        ordinal_match = re.search(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\s+image\b", q)
+        if ordinal_match:
+            word = ordinal_match.group(1)
+            if word in ("first", "1st"):
+                return urls[0]
+            if word in ("second", "2nd"):
+                return urls[1] if len(urls) > 1 else urls[-1]
+            if word in ("third", "3rd"):
+                return urls[2] if len(urls) > 2 else urls[-1]
+            if word in ("fourth", "4th"):
+                return urls[3] if len(urls) > 3 else urls[-1]
+            if word in ("fifth", "5th"):
+                return urls[4] if len(urls) > 4 else urls[-1]
+            if word == "last":
+                return urls[-1]
+
+        # Numeric "image 1", "image 2".
+        numeric_match = re.search(r"\bimage\s+(\d+)\b", q)
+        if numeric_match:
+            idx = int(numeric_match.group(1)) - 1
+            if 0 <= idx < len(urls):
+                return urls[idx]
+            return urls[-1]
+
+        # Generic references like 'that image', 'this image', 'the image', 'it'.
+        if re.search(r"\b(that|this|the|it)\s+image\b|\bthat image\b|\bthis image\b|\bthe image\b|\bdraw (?:on|over) it\b|\bon it\b", q):
+            return urls[-1]
+
+        return None
+
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.db_path))
@@ -128,16 +237,28 @@ class InspectionDBClient:
     # Structured queries
     # ------------------------------------------------------------------
 
-    def get_summary(self) -> dict[str, Any]:
-        """Overall counts and category breakdown."""
+    def get_summary(self, top_n: int = 5) -> dict[str, Any]:
+        """Overall counts, category breakdown, and a few notable track IDs."""
         conn = self._connect()
         total_objects = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
         categories = conn.execute(
             "SELECT category, COUNT(*) AS count FROM objects GROUP BY category ORDER BY count DESC"
         ).fetchall()
+        objects = conn.execute(
+            """
+            SELECT track_id, category, observation_count, total_point_count,
+                   centroid_x, centroid_y, centroid_z,
+                   first_seen_ns, last_seen_ns
+            FROM objects
+            ORDER BY total_point_count DESC
+            LIMIT ?
+            """,
+            (top_n,),
+        ).fetchall()
         return {
             "total_objects": total_objects,
             "categories": [{"category": row["category"], "count": row["count"]} for row in categories],
+            "objects": [dict(row) for row in objects],
         }
 
     def get_categories(self) -> list[str]:
@@ -185,6 +306,31 @@ class InspectionDBClient:
             ORDER BY first_seen_ns
             """,
             (category,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_category_objects_with_images(
+        self, category: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Return objects in a category with centroid and one sample image path each."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT
+                o.track_id,
+                o.centroid_x, o.centroid_y, o.centroid_z,
+                o.first_seen_ns,
+                (SELECT image_path
+                 FROM observations
+                 WHERE track_id = o.track_id AND image_path IS NOT NULL
+                 ORDER BY timestamp_ns
+                 LIMIT 1) AS sample_image_path
+            FROM objects o
+            WHERE o.category = ?
+            ORDER BY o.first_seen_ns
+            LIMIT ?
+            """,
+            (category, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -762,14 +908,18 @@ class InspectionDBClient:
         category: str | None = None,
         limit: int = 5,
     ) -> list[str]:
-        """Distinct image paths captured in a time window, optionally filtered by category."""
+        """Representative image paths captured in a time window, optionally filtered by category.
+
+        Returns up to *limit* images spread evenly across the requested window rather
+        than a random handful, so the raw output reflects the full interval.
+        """
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return []
         conn = self._connect()
         sql = """
-            SELECT DISTINCT image_path
+            SELECT image_path, MIN(timestamp_ns) AS first_seen
             FROM observations
             WHERE timestamp_ns >= ? AND timestamp_ns <= ? AND image_path IS NOT NULL
         """
@@ -777,10 +927,25 @@ class InspectionDBClient:
         if category:
             sql += " AND category = ?"
             params.append(category)
-        sql += " ORDER BY RANDOM() LIMIT ?"
-        params.append(limit)
+        sql += " GROUP BY image_path ORDER BY first_seen ASC"
         rows = conn.execute(sql, params).fetchall()
-        return [row["image_path"] for row in rows if row["image_path"]]
+        distinct = [row["image_path"] for row in rows if row["image_path"]]
+        if not distinct:
+            return []
+        if len(distinct) <= limit:
+            return distinct
+
+        # Evenly sample *limit* frames across the interval.
+        step = max(1, (len(distinct) - 1) / (limit - 1))
+        sampled: list[str] = []
+        seen: set[str] = set()
+        for i in range(limit):
+            idx = min(int(round(i * step)), len(distinct) - 1)
+            path = distinct[idx]
+            if path not in seen:
+                sampled.append(path)
+                seen.add(path)
+        return sampled
 
     def get_category_cooccurrence(
         self, window_ms: int = 500, top_n: int = 10
@@ -879,10 +1044,16 @@ class InspectionDBClient:
     # Natural language routing
     # ------------------------------------------------------------------
 
-    async def lookup(self, query: str) -> str | None:
+    async def lookup(
+        self,
+        query: str,
+        chat_history: Sequence[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
+    ) -> str | None:
         """Return a text summary for DB-related queries, or None if unrelated."""
         q = query.lower().strip()
         self._last_query = query
+        self._last_chat_history = list(chat_history) if chat_history else []
         if not q:
             return None
 
@@ -920,13 +1091,13 @@ class InspectionDBClient:
         # Try LLM-based tool selection first.
         if self.router is not None:
             try:
-                tool_calls = self.router.select_tool(query)
+                tool_calls = self.router.select_tool(query, chat_history=chat_history, tool_history=tool_history)
                 self._record_tool_calls(tool_calls)
                 if tool_calls:
                     results: list[str] = []
                     tool_results: list[dict[str, Any]] = []
                     for tool_name, args in tool_calls:
-                        result = await self._execute_tool(tool_name, args)
+                        result = await self._execute_tool(tool_name, args, chat_history=chat_history)
                         tool_results.append({"name": tool_name, "args": args, "output": result})
                         if result:
                             results.append(result)
@@ -950,7 +1121,9 @@ class InspectionDBClient:
             if track_match:
                 track_id = int(track_match.group(1))
                 if wants_annotation:
+                    resolved_url = self._resolve_image_reference(query, chat_history)
                     result = await self.annotate_image(
+                        image_url=resolved_url,
                         track_id=track_id,
                         question=self._last_query,
                     )
@@ -1007,8 +1180,10 @@ class InspectionDBClient:
             for alias, canonical in self._CATEGORY_ALIASES.items():
                 if alias in q:
                     if wants_annotation:
+                        resolved_url = self._resolve_image_reference(query, chat_history)
                         result = await self.annotate_image(
-                            category=canonical,
+                            image_url=resolved_url,
+                            category=canonical if resolved_url is None else None,
                             question=self._last_query,
                         )
                         return self._format_annotate_image(result)
@@ -1028,15 +1203,30 @@ class InspectionDBClient:
 
         return None
 
-    async def _execute_tool(self, tool_name: str, args: dict[str, Any]) -> str | None:
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        chat_history: Sequence[tuple[str, str]] | None = None,
+    ) -> str | None:
         """Execute a tool selected by the LLM router and return its formatted result."""
         try:
             if tool_name == "annotate_image":
+                image_url = args.get("image_url") or self._resolve_image_reference(
+                    self._last_query, chat_history
+                )
+                track_id = int(args["track_id"]) if args.get("track_id") is not None else None
+                category = (
+                    self._canonical_category(args["category"])
+                    if args.get("category") and image_url is None
+                    else None
+                )
                 result = await self.annotate_image(
-                    image_url=args.get("image_url"),
-                    track_id=int(args["track_id"]) if args.get("track_id") is not None else None,
-                    category=self._canonical_category(args["category"]) if args.get("category") else None,
+                    image_url=image_url,
+                    track_id=track_id,
+                    category=category,
                     question=args.get("question") or self._last_query,
+                    limit=int(args["limit"]) if args.get("limit") is not None else 5,
                 )
                 return self._format_annotate_image(result)
             if tool_name == "get_summary":
@@ -1066,6 +1256,11 @@ class InspectionDBClient:
                 return self._format_category_windows([self._canonical_category(c) for c in categories])
             if tool_name == "get_category_objects_coordinates":
                 return self._format_category_coordinates(self._canonical_category(args["category"]))
+            if tool_name == "get_category_objects_with_images":
+                return self._format_category_objects_with_images(
+                    self._canonical_category(args["category"]),
+                    limit=int(args.get("limit", 5)),
+                )
             if tool_name == "get_category_proximity":
                 target = self._canonical_category(args["target_category"])
                 others = args.get("other_categories", args.get("other_category", []))
@@ -1169,51 +1364,80 @@ class InspectionDBClient:
         track_id: int | None = None,
         category: str | None = None,
         question: str | None = None,
+        limit: int = 5,
     ) -> dict[str, Any] | None:
-        """Run vision annotation on an inspection image and cache the result.
+        """Run vision annotation on one or more inspection images and cache results.
 
-        Resolves *image_url*, *track_id*, or *category* into a local image path,
-        asks the vision model to mark anomalies, and saves the annotated PNG
-        to the configured cache directory so the frontend can request it.
+        Resolves *image_url* (a single image), *track_id* (all distinct frames for
+        the track, up to ``limit``), or *category* (up to ``limit`` random samples)
+        into local image paths, asks the vision model to mark anomalies on each,
+        and saves every annotated PNG to the configured cache directory so the
+        frontend can request it.
         """
         if not self.vision_annotator:
             return {"error": "Vision annotator is not configured."}
 
-        image_path: Path | None = None
+        raw_paths: list[str] = []
         if image_url:
-            image_path = self._resolve_image_path(image_url)
-        if image_path is None and track_id is not None:
-            paths = self.get_object_image_paths(track_id)
-            if paths:
-                image_path = self._resolve_image_path(paths[0])
-        if image_path is None and category:
-            paths = self.get_category_sample_images(category, limit=1)
-            if paths:
-                image_path = self._resolve_image_path(paths[0])
+            resolved = self._resolve_image_path(image_url)
+            raw_paths = [str(resolved)] if resolved else []
+        elif track_id is not None:
+            raw_paths = self.get_object_image_paths(track_id)[:limit]
+        elif category:
+            raw_paths = self.get_category_sample_images(category, limit=limit)
 
-        if image_path is None or not image_path.exists():
-            return {"error": f"Could not locate image for annotation from image_url={image_url}, track_id={track_id}, category={category}"}
+        # Resolve to local paths and deduplicate while preserving order.
+        image_paths: list[Path] = []
+        seen: set[str] = set()
+        for path_str in raw_paths:
+            resolved = self._resolve_image_path(path_str)
+            if resolved is None:
+                continue
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            image_paths.append(resolved)
 
-        image_bytes = image_path.read_bytes()
+        if not image_paths:
+            return {"error": f"Could not locate images for annotation from image_url={image_url}, track_id={track_id}, category={category}"}
+
         q = question or "What anomalies are in this image?"
-
-        try:
-            result = await self.vision_annotator.annotate(image_bytes, q)
-        except Exception as exc:
-            logger.warning("Vision annotation failed for %s: %s", image_path, exc)
-            return {"error": f"Vision annotation failed: {exc}"}
-
-        annotated_bytes = base64.b64decode(result["annotated_image_base64"])
         cache_dir = self._annotated_image_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{hashlib.sha256(annotated_bytes).hexdigest()[:16]}.png"
-        cache_path = cache_dir / filename
-        cache_path.write_bytes(annotated_bytes)
+
+        images_result: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for image_path in image_paths:
+            if not image_path.exists():
+                errors.append(f"{image_path.name}: missing on disk")
+                continue
+            image_bytes = image_path.read_bytes()
+            try:
+                result = await self.vision_annotator.annotate(image_bytes, q)
+            except Exception as exc:
+                logger.warning("Vision annotation failed for %s: %s", image_path, exc)
+                errors.append(f"{image_path.name}: {exc}")
+                continue
+
+            annotated_bytes = base64.b64decode(result["annotated_image_base64"])
+            filename = f"{hashlib.sha256(annotated_bytes).hexdigest()[:16]}.png"
+            (cache_dir / filename).write_bytes(annotated_bytes)
+            images_result.append({
+                "source": image_path.name,
+                "description": result.get("description", ""),
+                "annotated_image_url": f"/annotated/images/{filename}",
+                "annotations": result.get("annotations", []),
+                "vision_raw_response": result.get("raw_response", ""),
+            })
+
+        if not images_result:
+            return {"error": "Vision annotation failed for all images: " + "; ".join(errors)}
 
         return {
-            "description": result.get("description", ""),
-            "annotated_image_url": f"/annotated/images/{filename}",
-            "annotations": result.get("annotations", []),
+            "images": images_result,
+            "count": len(images_result),
+            "errors": errors,
         }
 
     def _resolve_image_path(self, image_url: str | None) -> Path | None:
@@ -1266,16 +1490,35 @@ class InspectionDBClient:
             return "Image annotation returned no result."
         if "error" in result:
             return f"Image annotation failed: {result['error']}"
-        lines = [
-            "Annotated image:",
-            f"![annotated image]({result['annotated_image_url']})",
+        images = result.get("images") or []
+        if not images:
+            return "Image annotation produced no annotated images."
+        total = len(images)
+        lines: list[str] = [
+            f"{total} annotated image(s) are shown below. PRESERVE every image link in your answer.",
             "",
-            f"Description: {result.get('description', 'No description provided.')}",
         ]
-        annotations = result.get("annotations", [])
-        if annotations:
-            lines.append(f"Annotations drawn: {len(annotations)}")
-        return "\n".join(lines)
+        raws: list[str] = []
+        for idx, im in enumerate(images, start=1):
+            lines.append(f"### Annotated image {idx}/{total}")
+            lines.append(f"![annotated result]({im['annotated_image_url']})")
+            lines.append("")
+            lines.append(f"Description: {im.get('description') or 'No description provided.'}")
+            anns = im.get("annotations") or []
+            if anns:
+                lines.append(f"Annotations drawn: {len(anns)}")
+            lines.append("")
+            raw = im.get("vision_raw_response")
+            if raw:
+                raws.append(f"[Image {idx}] {raw}")
+        if raws:
+            lines.append("--- Vision model raw output ---")
+            lines.extend(raws)
+        errors = result.get("errors") or []
+        if errors:
+            lines.append("")
+            lines.append(f"Skipped {len(errors)} image(s): " + "; ".join(errors))
+        return "\n".join(lines).strip()
 
     # ------------------------------------------------------------------
     # Formatters
@@ -1290,6 +1533,14 @@ class InspectionDBClient:
             lines.append("Objects by category:")
             for row in data["categories"]:
                 lines.append(f"- {row['category']}: {row['count']}")
+        if data.get("objects"):
+            lines.append("Notable tracks:")
+            for obj in data["objects"][:5]:
+                lines.append(
+                    f"- Track {obj['track_id']} ({obj['category']}): "
+                    f"{obj['observation_count']} observations"
+                )
+        lines.append("You can ask me about any track ID to see its frames.")
         return "\n".join(lines)
 
     def _format_categories(self) -> str:
@@ -1305,13 +1556,14 @@ class InspectionDBClient:
         objects = self.get_objects_by_category(category, limit=10)
         if not objects:
             return f"No objects found in category '{category}'."
-        lines = [f"Found {len(objects)} object(s) in category '{category}':"]
+        lines = [f"Found {len(objects)} object(s) in category '{category}'. Track IDs:"]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']}: {obj['observation_count']} observations, "
                 f"{obj['total_point_count']} points, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
+        lines.append(f"To see frames, say: 'show me images of track {objects[0]['track_id']}'.")
         return "\n".join(lines)
 
     def _format_object(self, track_id: int) -> str:
@@ -1334,39 +1586,60 @@ class InspectionDBClient:
         objects = self.get_top_objects(n)
         if not objects:
             return "No objects found in the database."
-        lines = [f"Top {len(objects)} objects by total point count:"]
+        lines = [f"Top {len(objects)} objects by total point count. Track IDs:"]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']} ({obj['category']}): "
                 f"{obj['total_point_count']} points, "
                 f"{obj['observation_count']} observations"
             )
+        lines.append("To see frames for a track, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_recent_objects(self, limit: int = 5) -> str:
         objects = self.get_recent_objects(limit)
         if not objects:
             return "No objects found in the database."
-        lines = [f"{len(objects)} most recently seen object(s):"]
+        lines = [f"{len(objects)} most recently seen object(s). Track IDs:"]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']} ({obj['category']}): "
                 f"last seen at {self._format_timestamp(obj['last_seen_ns'])}"
             )
+        lines.append("To see frames, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_category_coordinates(self, category: str) -> str:
         objects = self.get_category_objects_with_coordinates(category)
         if not objects:
             return f"No objects found in category '{category}'."
-        lines = [f"Objects in category '{category}' with coordinates (ordered by first appearance):"]
+        lines = [f"Objects in category '{category}' with coordinates (ordered by first appearance). Track IDs:"]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']}: first seen {self._format_timestamp(obj['first_seen_ns'])}, "
-                f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f}), "
-                f"bbox3d min ({obj['bbox3d_min_x']:.2f}, {obj['bbox3d_min_y']:.2f}, {obj['bbox3d_min_z']:.2f}), "
-                f"max ({obj['bbox3d_max_x']:.2f}, {obj['bbox3d_max_y']:.2f}, {obj['bbox3d_max_z']:.2f})"
+                f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
+        lines.append("Ask: 'show me images of track [ID]' to view frames.")
+        return "\n".join(lines)
+
+    def _format_category_objects_with_images(self, category: str, limit: int = 5) -> str:
+        objects = self.get_category_objects_with_images(category, limit)
+        if not objects:
+            return f"No objects found in category '{category}'."
+        lines = [
+            f"Objects in category '{category}' with track IDs, coordinates, and sample images "
+            f"(showing {len(objects)} of up to {limit}):"
+        ]
+        for obj in objects:
+            lines.append(
+                f"- Track {obj['track_id']}: "
+                f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f}), "
+                f"first seen {self._format_timestamp(obj['first_seen_ns'])}"
+            )
+            sample_url = self._image_url(obj.get("sample_image_path"))
+            if sample_url:
+                lines.append(f"  ![sample frame]({sample_url})")
+        lines.append("To see more frames for a track, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_category_proximity(
@@ -1426,18 +1699,18 @@ class InspectionDBClient:
                 if i % step == 0 or i == len(observations) - 1:
                     lines.append(
                         f"  - {self._format_timestamp(obs['timestamp_ns'])}: "
-                        f"{obs['point_count']} points at centroid "
-                        f"({obs['centroid_x']:.2f}, {obs['centroid_y']:.2f}, {obs['centroid_z']:.2f})"
+                        f"{obs['point_count']} points"
                     )
 
         image_urls = self.get_object_image_paths(track_id)
         if image_urls:
             lines.append("Object frames:")
             for url in image_urls[:10]:
-                lines.append(f"![Track {track_id} frame]({self._image_url(url)})")
+                lines.append(f"![frame]({self._image_url(url)})")
+            lines.append(f"To view all frames for this object, ask: 'show me all images of track {track_id}'.")
         return "\n".join(lines)
 
-    def _format_object_images(self, track_id: int) -> str:
+    def _format_object_images(self, track_id: int, limit: int = 10) -> str:
         obj = self.get_object_by_track_id(track_id)
         if obj is None:
             return f"No object found with track ID {track_id}."
@@ -1447,10 +1720,10 @@ class InspectionDBClient:
             return f"No images are stored for track {track_id}."
 
         lines = [
-            f"Showing {min(len(image_urls), 10)} of {len(image_urls)} frames for track {track_id} ({obj['category']}):",
+            f"Track {track_id} ({obj['category']}): showing {min(len(image_urls), limit)} of {len(image_urls)} frames:",
         ]
-        for url in image_urls[:10]:
-            lines.append(f"![Track {track_id} frame]({self._image_url(url)})")
+        for url in image_urls[:limit]:
+            lines.append(f"![frame]({self._image_url(url)})")
         return "\n".join(lines)
 
     def _format_category_timeline(self, category: str) -> str:
@@ -1458,7 +1731,7 @@ class InspectionDBClient:
         if not objects:
             return f"No objects found in category '{category}'."
 
-        lines = [f"Timeline for category '{category}' ({len(objects)} object(s)):"]
+        lines = [f"Timeline for category '{category}' ({len(objects)} object(s)). Track IDs:"]
         for obj in objects:
             first_ns = obj.get("first_seen_ns")
             last_ns = obj.get("last_seen_ns")
@@ -1468,6 +1741,7 @@ class InspectionDBClient:
                 f"last seen {self._format_timestamp(last_ns)}, "
                 f"{obj['observation_count']} observations over {self._format_duration(duration_s)}"
             )
+        lines.append("To see frames, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_category_windows(self, categories: list[str]) -> str:
@@ -1542,13 +1816,14 @@ class InspectionDBClient:
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not objects:
             return f"No objects found between {start_str} and {end_str}."
-        lines = [f"{len(objects)} object(s) detected between {start_str} and {end_str}:"]
+        lines = [f"{len(objects)} object(s) detected between {start_str} and {end_str}. Track IDs:"]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']} ({obj['category']}): "
                 f"{obj['observation_count']} observations, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
+        lines.append("To see frames, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_observations_in_time_range(
@@ -1559,12 +1834,13 @@ class InspectionDBClient:
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not observations:
             return f"No observations found between {start_str} and {end_str}."
-        lines = [f"{len(observations)} observation(s) between {start_str} and {end_str}:"]
+        lines = [f"{len(observations)} observation(s) between {start_str} and {end_str}. Track IDs:"]
         for obs in observations:
             lines.append(
                 f"- {self._format_timestamp(obs['timestamp_ns'])}: Track {obs['track_id']} ({obs['category']}), "
-                f"{obs['point_count']} points at ({obs['centroid_x']:.2f}, {obs['centroid_y']:.2f}, {obs['centroid_z']:.2f})"
+                f"{obs['point_count']} points"
             )
+        lines.append("To see frames, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_objects_near_position(
@@ -1580,23 +1856,27 @@ class InspectionDBClient:
             cat_str = f" of category '{category}'" if category else ""
             return f"No objects{cat_str} found within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f})."
         lines = [
-            f"{len(objects)} object(s) within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f}):"
+            f"{len(objects)} object(s) within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f}). Track IDs:"
         ]
         for obj in objects:
             lines.append(
                 f"- Track {obj['track_id']} ({obj['category']}): "
-                f"distance {obj['distance_m']:.2f} m, "
-                f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
+                f"distance {obj['distance_m']:.2f} m"
             )
+        lines.append("To see frames, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_category_sample_images(self, category: str, limit: int = 5) -> str:
         image_urls = self.get_category_sample_images(category, limit)
         if not image_urls:
             return f"No sample images found for category '{category}'."
-        lines = [f"Sample images for category '{category}':"]
-        for url in image_urls:
-            lines.append(f"![{category} sample]({self._image_url(url)})")
+        lines = [f"Sample images for category '{category}'. Track IDs visible in each frame are listed below the image:"]
+        for path in image_urls:
+            track_info = self._image_track_info(path)
+            lines.append(f"![frame]({self._image_url(path)})")
+            if track_info:
+                lines.append(f"Objects in this frame: {track_info}")
+        lines.append("To see more frames for a track, ask: 'show me images of track [ID]'.")
         return "\n".join(lines)
 
     def _format_inspection_poses(self, limit: int = 20) -> str:
@@ -1732,16 +2012,46 @@ class InspectionDBClient:
         category: str | None = None,
         limit: int = 5,
     ) -> str:
+        total_images = self._count_images_in_time_range(start_time, end_time, category)
         image_urls = self.get_images_in_time_range(start_time, end_time, category, limit)
         start_str = self._format_timestamp(self._parse_time_string(start_time))
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not image_urls:
             cat_str = f" of category '{category}'" if category else ""
             return f"No images{cat_str} found between {start_str} and {end_str}."
-        lines = [f"Sample images between {start_str} and {end_str}{' (' + category + ')' if category else ''}:"]
-        for url in image_urls:
-            lines.append(f"![frame]({self._image_url(url)})")
+        cat_str = f" ({category})" if category else ""
+        lines = [
+            f"{total_images} distinct images were captured between {start_str} and {end_str}{cat_str}. "
+            f"Showing {len(image_urls)} representative frames. Track IDs visible in each frame are listed below the image:"
+        ]
+        for path in image_urls:
+            track_info = self._image_track_info(path)
+            lines.append(f"![frame]({self._image_url(path)})")
+            if track_info:
+                lines.append(f"Objects in this frame: {track_info}")
         return "\n".join(lines)
+
+    def _count_images_in_time_range(
+        self,
+        start_time: str | int | float,
+        end_time: str | int | float,
+        category: str | None = None,
+    ) -> int:
+        start_ns = self._parse_time_string(start_time)
+        end_ns = self._parse_time_string(end_time)
+        if start_ns is None or end_ns is None:
+            return 0
+        sql = """
+            SELECT COUNT(DISTINCT image_path) AS c
+            FROM observations
+            WHERE timestamp_ns >= ? AND timestamp_ns <= ? AND image_path IS NOT NULL
+        """
+        params: list[Any] = [start_ns, end_ns]
+        if category:
+            sql += " AND category = ?"
+            params.append(category)
+        row = self._connect().execute(sql, params).fetchone()
+        return int(row["c"] or 0) if row else 0
 
     def _format_category_cooccurrence(
         self, window_ms: int = 500, top_n: int = 10

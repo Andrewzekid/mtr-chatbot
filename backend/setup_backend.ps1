@@ -12,8 +12,15 @@ Write-Host "[2/5] Upgrading pip tooling..."
 Write-Host "[3/5] Installing backend requirements..."
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-Write-Host "[3.5/5] Installing PyTorch CUDA runtime for SenseVoice..."
-.\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+$sttBackend = $env:STT_BACKEND; if (-not $sttBackend) { $sttBackend = "sensevoice" }
+if ($sttBackend -eq "sensevoice") {
+  Write-Host "[3.5/5] Installing PyTorch CUDA runtime for SenseVoice..."
+  .\.venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+} else {
+  Write-Host "[3.5/5] STT_BACKEND=whisper - faster-whisper uses CTranslate2 (no PyTorch needed)."
+  Write-Host "         Whisper large-v3 will auto-download to .\models\whisper-cache on first start."
+  New-Item -ItemType Directory -Force -Path "models\whisper-cache" | Out-Null
+}
 
 Write-Host "[4/5] Creating .env from template if missing..."
 if (-not (Test-Path ".env")) {

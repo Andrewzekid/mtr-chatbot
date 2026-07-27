@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import re
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -9,6 +10,129 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+class WhisperSTT:
+    """Speech-to-text via faster-whisper (CTranslate2 Whisper).
+
+    Drop-in replacement for SenseVoiceSTT. Supports English, Mandarin (zh) and
+    Cantonese (yue) and returns the detected language code so the TTS layer can
+    route to the matching voice. Whisper has no emotion detection, so
+    ``emotion_tag`` is always None.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._model = None
+        self._fallback = False
+        self._fallback_reason = "Whisper is unavailable"
+        self._init_model()
+
+    def _init_model(self) -> None:
+        try:
+            from faster_whisper import WhisperModel  # type: ignore
+        except Exception as exc:
+            self._fallback = True
+            self._fallback_reason = f"faster-whisper not installed: {exc}"
+            return
+
+        device, device_index = self._resolve_device()
+        compute_type = (self.settings.whisper_compute_type or "int8_float16").strip()
+        if device == "cpu" and compute_type not in {"int8", "float32"}:
+            # float16 is not supported on CPU; fall back to int8.
+            compute_type = "int8"
+        download_root = self.settings.whisper_download_root or None
+        if download_root:
+            Path(download_root).mkdir(parents=True, exist_ok=True)
+
+        try:
+            logger.info(
+                "Loading Whisper model=%s device=%s index=%s compute_type=%s cache=%s",
+                self.settings.whisper_model, device, device_index, compute_type, download_root,
+            )
+            self._model = WhisperModel(
+                self.settings.whisper_model,
+                device=device,
+                device_index=device_index,
+                compute_type=compute_type,
+                download_root=download_root,
+            )
+            logger.info("Whisper model loaded: %s", self.settings.whisper_model)
+        except Exception as exc:
+            self._fallback = True
+            self._fallback_reason = f"Whisper init failed: {exc}"
+            logger.exception("Whisper init failed: %s", exc)
+
+    def _resolve_device(self) -> tuple[str, int]:
+        desired = (self.settings.whisper_device or "auto").lower().strip()
+        if desired in {"auto", "gpu", "cuda"}:
+            device, idx = "cuda", 0
+        elif desired.startswith("cuda"):
+            device, idx = "cuda", 0
+            if ":" in desired:
+                try:
+                    idx = int(desired.split(":", 1)[1])
+                except ValueError:
+                    idx = 0
+        else:
+            device, idx = "cpu", 0
+
+        if device == "cuda":
+            try:
+                import torch  # type: ignore
+
+                if not torch.cuda.is_available():
+                    logger.warning("CUDA not available for Whisper; falling back to CPU")
+                    return "cpu", 0
+            except Exception:
+                logger.warning("torch not available to verify CUDA; assuming CPU for Whisper")
+                return "cpu", 0
+        return device, idx
+
+    def transcribe_with_metadata(self, audio_bytes: bytes, suffix: str = ".webm") -> STTResult:
+        if self._fallback or self._model is None:
+            fallback_text = f"[{self._fallback_reason}]"
+            return STTResult(text=fallback_text, language_tag=None, emotion_tag=None, raw_text=fallback_text)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = Path(tmp.name)
+
+        try:
+            language = (self.settings.whisper_language or "").strip().lower() or None
+            segments, info = self._model.transcribe(
+                str(tmp_path),
+                language=language,
+                beam_size=int(self.settings.whisper_beam_size or 5),
+                vad_filter=bool(self.settings.whisper_vad_filter),
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+            detected = (info.language or "").strip().lower() if info and info.language else None
+            return STTResult(
+                text=text,
+                language_tag=detected,
+                emotion_tag=None,
+                raw_text=text,
+            )
+        except Exception as exc:
+            logger.exception("Whisper transcription failed: %s", exc)
+            fallback_text = f"[Whisper transcription failed: {exc}]"
+            return STTResult(text=fallback_text, language_tag=None, emotion_tag=None, raw_text=fallback_text)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def transcribe_bytes(self, audio_bytes: bytes, suffix: str = ".webm") -> str:
+        return self.transcribe_with_metadata(audio_bytes, suffix).text
+
+
+def build_stt(settings: Settings) -> Any:
+    """Construct the configured STT backend (whisper or sensevoice)."""
+    backend = (settings.stt_backend or "whisper").lower().strip()
+    if backend == "sensevoice":
+        return SenseVoiceSTT(settings)
+    return WhisperSTT(settings)
 
 
 class SenseVoiceSTT:

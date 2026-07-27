@@ -2,7 +2,7 @@
 
 A voice-to-voice chatbot layer for Hong Kong MTR subway station inspection. It extends a local realtime voice pipeline (STT → LLM → TTS) with live SQLite integration so inspectors can ask about objects detected by the automated grounding pipeline.
 
-- **STT:** SenseVoice (English / Cantonese / Mandarin) via FunASR
+- **STT:** SenseVoice (FunASR, zh/en/ja/ko with emotion tags), with Whisper `large-v3` via faster-whisper (English / Mandarin / Cantonese) as an alternative backend selectable via `STT_BACKEND=whisper`
 - **LLM:** Ollama (default `gemma4:e2b`), with vLLM as an alternative provider
 - **TTS:** Piper (multiple English and Chinese voices, with browser SpeechSynthesis fallback for Cantonese)
 - **Backend:** FastAPI + WebSocket
@@ -20,7 +20,7 @@ A voice-to-voice chatbot layer for Hong Kong MTR subway station inspection. It e
 │  (Port 3000) │    JSON msgs     │  (Port 8000)                                    │
 └──────┬──────┘                   │                                                │
        │                          │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
-       │ audio (webm/wav)         │  │SenseVoice│  │   LLM    │  │   Piper TTS  │  │
+       │ audio (webm/wav)         │  │ SenseV.  │  │   LLM    │  │   Piper TTS  │  │
        │                          │  │  (STT)   │  │ (Ollama) │  │              │  │
        ▼                          │  └────┬─────┘  └────┬─────┘  └──────┬───────┘  │
 ┌──────────────┐                  │       │             │               │          │
@@ -42,7 +42,7 @@ A voice-to-voice chatbot layer for Hong Kong MTR subway station inspection. It e
 
 1. User holds **Space** to record audio via `MediaRecorder` (WebM format).
 2. Release sends base64-encoded audio to the backend over WebSocket.
-3. Backend transcribes with **SenseVoice** → detects language (en/yue/zh) + emotion.
+3. Backend transcribes with **SenseVoice** (FunASR) → detects language (en/zh/yue) and emotion. Whisper `large-v3` (faster-whisper, EN/zh/yue/Cantonese) is available as an alternative backend via `STT_BACKEND=whisper`.
 4. The **Tool Router** (an Ollama call with tool definitions) decides which DB queries are needed.
 5. **InspectionDBClient** executes the chosen queries against the SQLite database.
 6. The main **LLM** receives the query + DB results + optional report context → streams a text answer.
@@ -73,8 +73,14 @@ A voice-to-voice chatbot layer for Hong Kong MTR subway station inspection. It e
 | `tool_router_enabled` | `True` | Enable LLM-based tool routing |
 | `tool_router_model` | `"gemma4:26b"` | Model used for tool selection |
 | `tool_router_temperature` | `0.0` | Tool router temperature (greedy) |
-| `sensevoice_model_dir` | `./models/SenseVoiceSmall` | Path to SenseVoice model |
-| `sensevoice_device` | `"cuda:0"` | Device for STT |
+| `stt_backend` | `"sensevoice"` | STT backend: `sensevoice` (FunASR) or `whisper` (faster-whisper) |
+| `sensevoice_model_dir` | `./models/SenseVoiceSmall` | Path to SenseVoice model snapshot (default `iic/SenseVoiceSmall`; point at a larger FunASR model dir to swap) |
+| `sensevoice_device` | `"cuda:0"` | Device for SenseVoice STT |
+| `whisper_model` | `"large-v3"` | Whisper model size / repo (EN/zh/yue). Auto-downloads to `whisper_download_root` |
+| `whisper_device` | `"cuda:0"` | Device for Whisper STT (`cuda:0`, `cpu`, `auto`) |
+| `whisper_compute_type` | `"int8_float16"` | CTranslate2 compute type (use `float16` if VRAM allows; `int8` on CPU) |
+| `whisper_language` | `""` | Empty = auto-detect; or force `en`/`zh`/`yue` |
+| `whisper_vad_filter` | `True` | Silero VAD trims silence/noise before transcription |
 | `inspection_db_path` | absolute path | SQLite DB path |
 | `inspection_image_dir` | absolute path | Source camera frames |
 | `reports_dir` | `../reports` | Anomaly report directory |
@@ -138,9 +144,11 @@ Relative paths in `.env` are resolved relative to `backend/`.
 
 ---
 
-### `app/services/stt_service.py` — Speech-to-Text (SenseVoice)
+### `app/services/stt_service.py` — Speech-to-Text (SenseVoice / Whisper)
 
-**`class SenseVoiceSTT`**
+The active backend is chosen by `STT_BACKEND` (`sensevoice` by default, or `whisper`) via the `build_stt(settings)` factory.
+
+**`class SenseVoiceSTT`** (default) — FunASR SenseVoice, zh/en/ja/ko, includes emotion tags.
 
 | Method | Description |
 |--------|-------------|
@@ -152,6 +160,15 @@ Relative paths in `.env` are resolved relative to `backend/`.
 | `_extract_emotion_tag(raw_text, payload)` | Parses emotion tags (`happy`, `sad`, `angry`, `neutral`, etc.) from SenseVoice output. |
 | `_normalize_emotion(value)` | Maps various emotion strings to a canonical set: happy, sad, angry, fear, surprised, disgust, neutral. |
 | `_clean_transcript(text)` | Strips all `<\|...\|>` tags and normalizes whitespace. |
+
+**`class WhisperSTT`** (alternative, `STT_BACKEND=whisper`) — faster-whisper (CTranslate2 Whisper). Supports English, Mandarin (`zh`) and Cantonese (`yue`); Whisper has no emotion detection so `emotion_tag` is always `None`.
+
+| Method | Description |
+|--------|-------------|
+| `_init_model()` | Loads `faster_whisper.WhisperModel` (`whisper_model`, default `large-v3`) onto `whisper_device` with `whisper_compute_type` (default `int8_float16`, ~1.5–2 GB VRAM). Falls back gracefully if faster-whisper is missing or the model fails to load. |
+| `_resolve_device()` | Parses `cuda:0` → device `cuda` + index; falls back to CPU if CUDA is unavailable. |
+| `transcribe_with_metadata(audio_bytes, suffix)` | Writes audio to a temp file, runs `model.transcribe()` with Silero VAD (`whisper_vad_filter`) and `whisper_beam_size`, returns `STTResult` with text and the detected language code (`en`/`zh`/`yue`). |
+| `transcribe_bytes(audio_bytes, suffix)` | Convenience wrapper that returns just the text. |
 
 **`@dataclass STTResult`**: `text`, `language_tag`, `emotion_tag`, `raw_text`
 
@@ -494,10 +511,27 @@ Each tool maps to an `InspectionDBClient` method. The tool router's system promp
 
 ### Multi-tool flow examples
 
-The router can call multiple tools in a single turn for compound questions:
-- "Tell me about the inspection objects and their coordinates, and which objects were close to ticket gates" → `get_summary` + `get_category_objects_coordinates("Ticket Gate")` + `get_category_proximity("Ticket Gate", [...])`
+The router can call multiple tools in a single turn for compound questions. The backend runs every selected tool and merges their outputs, so the assistant can answer questions that span counts, coordinates, proximity, images, timelines, and anomalies at once:
+
+- "Tell me about the inspection objects and their coordinates, and which objects were close to ticket gates" → `get_summary` + `get_category_objects_coordinates("Ticket Gate")` + `get_category_proximity("Ticket Gate", ["Lights", "Advertisement Board", "Map", "TV", "Exit Sign"])`
 - "What anomalies did you find, and how many objects were detected?" → `get_summary` + `get_report_summary`
-- "How many times were advertisement boards seen, and what is near (-18, 32, -6)?" → `get_observation_counts_by_category` + `get_objects_near_position(-18, 32, -6)`
+- "How many times were advertisement boards seen, and what is near (-18, 32, -6)?" → `get_observation_counts_by_category` + `get_objects_near_position(x=-18, y=32, z=-6, radius_m=2.0)`
+- "For the two exit signs recorded around 4:56 PM, what were their coordinates, and what objects were within a 1 meter radius of them?" → `get_objects_by_category_in_time_range("Exit Sign", "16:56:00", "16:57:00")` + `get_category_proximity("Exit Sign", ["Lights", "Advertisement Board", "Map", "TV", "Ticket Gate"], radius_m=1.0)`
+- "Show me the exit signs with their track IDs, coordinates, and images, and tell me which ones were seen most often" → `get_category_objects_with_images("Exit Sign", limit=5)` + `get_category_observation_timeline("Exit Sign", bucket_seconds=60)`
+- "Give me images of what the camera saw at 4:53 PM, and annotate any anomalies on them" → `get_images_in_time_range("16:53:00", "16:54:00")` + `annotate_image(category="Exit Sign", question="highlight any anomalies")`
+- "Which categories appear together most often, and how far apart are tracks 218 and 165?" → `get_category_cooccurrence(window_ms=500)` + `get_object_distance(track_id_a=218, track_id_b=165)`
+- "Show me some advertisement boards, and what was filtered out during the inspection?" → `get_category_sample_images("Advertisement Board", limit=5)` + `get_filtered_objects(limit=50)`
+- "What did the camera see at 4:51 PM, and where was the cluster at that time?" → `get_images_in_time_range("16:51:00", "16:52:00")` + `get_objects_in_temporal_cluster(center_time="16:51:45", window_ms=5000)`
+- "Summarise the lights and ticket gates — counts, time spans, and coordinates — and list any anomalies" → `run_sql_query("SELECT category, COUNT(*), MIN(first_seen_ns), MAX(last_seen_ns), AVG(centroid_x), AVG(centroid_y), AVG(centroid_z) FROM objects WHERE category IN ('Lights','Ticket Gate') GROUP BY category")` + `get_report_summary`
+
+#### Re-calling a tool when parameters change
+
+A previous answer is **not** a substitute for a fresh tool call when the user changes a parameter. The router receives the exact arguments used in prior tool calls and is instructed to re-call whenever a required argument differs:
+
+- Turn 1: "What objects are within 3 meters of the exit signs?" → `get_category_proximity("Exit Sign", [...], radius_m=3.0)`
+- Turn 2: "And within 1 meter?" → `get_category_proximity("Exit Sign", [...], radius_m=1.0)` *(must re-call with `radius_m=1.0`; the 3 m result does not satisfy the 1 m question)*
+
+The same applies to changing the time window, category, track ID, coordinates, or `limit` — the router re-calls the relevant tool with the new value rather than reusing a prior answer.
 
 ---
 
@@ -615,6 +649,33 @@ Response: "Ticket gates are located around x: -18.50 to -15.20, y: 30.10 to 45.3
 User: "Are ticket gates close to advertisement boards?"
 Tools: get_category_proximity(target_category="Ticket Gate", other_categories=["Advertisement Board", "Lights", ...])
 Response: "There are 45 lights and 12 advertisement boards within 2 meters of ticket gates. For example, Track 218 at (-18.22, 32.17, -6.85) has 2 lights and 1 ad board nearby."
+```
+
+### Compound (multi-tool) questions
+
+The router returns several tool calls in one turn and the backend merges the results, so a single spoken question can combine coordinates, proximity, images, timelines, and anomalies:
+```
+User: "For the exit signs around 4:56 PM, what were their coordinates and what was within 1 meter of them?"
+Tools: get_objects_by_category_in_time_range(category="Exit Sign", start_time="16:56:00", end_time="16:57:00")
+     + get_category_proximity(target_category="Exit Sign", other_categories=["Lights","Advertisement Board","Map","TV","Ticket Gate"], radius_m=1.0)
+Response: "Around 4:56 PM I recorded one exit sign — Track 2141 at (-88.56, 56.56, -33.45). Within 1 meter of it there were no other objects; the nearest were 2 advertisement boards and a map just outside that radius."
+```
+```
+User: "Show me the exit signs with track IDs, coordinates, and images, and tell me when they were busiest."
+Tools: get_category_objects_with_images(category="Exit Sign", limit=5)
+     + get_category_observation_timeline(category="Exit Sign", bucket_seconds=60)
+Response: "Here are the exit signs — Track 2141 at (-88.56, 56.56, -33.45) ![frame](/inspection/images/....jpg) ... Exit-sign detections peaked during the 16:56 minute."
+```
+```
+User: "Give me what the camera saw at 4:53 PM and annotate any anomalies on it."
+Tools: get_images_in_time_range(start_time="16:53:00", end_time="16:54:00")
+     + annotate_image(category="Exit Sign", question="highlight any anomalies")
+Response: "Here are frames from 4:53 PM ![frame](/inspection/images/....jpg). I also annotated the exit-sign frame: ![annotated](/annotated/images/a1b2c3d4.png) — a small crack was highlighted on the left panel."
+```
+Re-calling with a changed parameter (the router re-calls rather than reusing the prior answer):
+```
+Turn 1: "What's within 3 meters of the exit signs?"  → get_category_proximity(..., radius_m=3.0)
+Turn 2: "And within 1 meter?"                        → get_category_proximity(..., radius_m=1.0)
 ```
 
 ### Time-window clusters
@@ -759,9 +820,21 @@ VISION_MAX_TOKENS=1024
 VISION_TEMPERATURE=0.3
 VISION_REQUEST_TIMEOUT_S=120
 
-# STT (SenseVoice)
+# STT backend: sensevoice (default, FunASR zh/en/ja/ko) or whisper (EN/zh/yue)
+STT_BACKEND=sensevoice
+
+# SenseVoice (FunASR) — used when STT_BACKEND=sensevoice
 SENSEVOICE_MODEL_DIR=./models/SenseVoiceSmall
 SENSEVOICE_DEVICE=cuda:0
+
+# Whisper (faster-whisper / CTranslate2) — only when STT_BACKEND=whisper
+WHISPER_MODEL=large-v3
+WHISPER_DEVICE=cuda:0
+WHISPER_COMPUTE_TYPE=int8_float16
+WHISPER_LANGUAGE=          # empty = auto-detect; or en/zh/yue
+WHISPER_BEAM_SIZE=5
+WHISPER_VAD_FILTER=true
+WHISPER_DOWNLOAD_ROOT=./models/whisper-cache
 
 # Inspection DB
 INSPECTION_DB_PATH=/home/.../inspection_mtr.db

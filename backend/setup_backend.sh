@@ -13,8 +13,15 @@ echo "[2/5] Upgrading pip tooling..."
 echo "[3/5] Installing backend requirements..."
 .venv/bin/python -m pip install -r requirements.txt
 
-echo "[3.5/5] Installing PyTorch CUDA runtime for SenseVoice..."
-.venv/bin/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+STT_BACKEND=${STT_BACKEND:-sensevoice}
+if [ "$STT_BACKEND" = "sensevoice" ]; then
+  echo "[3.5/5] Installing PyTorch CUDA runtime for SenseVoice..."
+  .venv/bin/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+else
+  echo "[3.5/5] STT_BACKEND=whisper — faster-whisper uses CTranslate2 (no PyTorch needed)."
+  echo "         Whisper large-v3 will auto-download to ./models/whisper-cache on first start."
+  mkdir -p models/whisper-cache
+fi
 
 echo "[4/5] Creating .env from template if missing..."
 if [ ! -f ".env" ]; then
