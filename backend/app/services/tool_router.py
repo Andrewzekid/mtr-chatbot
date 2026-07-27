@@ -422,7 +422,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "image_url": {
                     "type": "string",
-                    "description": "URL or path to a single image, e.g. /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.",
+                    "description": "URL or path to a single image, e.g. /inspection/images/1781168192465731000.jpg or /reports/extracted_images/img-021.jpg.",
                 },
                 "track_id": {
                     "type": "integer",
@@ -811,7 +811,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 32. annotate_image
     - Purpose: analyze one or more inspection images with a vision model and draw annotations (boxes, circles, highlights) around anomalies or areas of interest.
     - Args: provide exactly one of image_url, track_id, or category. Optionally pass question to guide what to look for, and limit (default 5) to cap how many images are annotated for a track_id or category.
-    - image_url: a single URL or path such as /inspection/images/1781168192465731000.jpg or /reports/images/anomaly_001.jpg.
+    - image_url: a single URL or path such as /inspection/images/1781168192465731000.jpg or /reports/extracted_images/img-021.jpg.
     - track_id: annotate all available frames for this track (up to limit).
     - category: annotate up to limit random sample images of this category.
     - Output sample:
@@ -883,6 +883,13 @@ User: "Highlight any anomalies on the image of track 218."
 Plan:
 1. annotate_image(track_id=218, question="highlight any anomalies")
 
+Example G2 (referencing a previously shown image):
+User: "Annotate the previous image for advertisement board defects."
+Context: prior images list ends with /reports/extracted_images/img-007.jpg.
+Plan:
+1. annotate_image(image_url="/reports/extracted_images/img-007.jpg", question="highlight advertisement board defects")
+Note: "the previous image" means the LAST url in the prior-images list — do NOT sample a fresh category image.
+
 ## Rules
 
 - Call every tool that is needed in a single turn. Do not chain sequentially. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count. Combine tools freely; the backend runs all of them and merges their results.
@@ -905,16 +912,16 @@ Plan:
         urls: list[str] = []
         for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", text):
             urls.append(match.group(1))
-        for match in re.finditer(r"(/(?:inspection|reports|annotated)/images/[^\s\)\"]+)", text):
+        for match in re.finditer(r"((?:/(?:inspection|annotated)/images/|/reports/(?:extracted_)?images/)[^\s\)\"]+)", text):
             if match.group(1) not in urls:
                 urls.append(match.group(1))
         return urls
 
     @staticmethod
-    def _image_context_from_history(chat_history: Sequence[tuple[str, str]] | None) -> str:
-        """Build a compact line of prior image URLs for the router prompt."""
+    def _prior_image_urls(chat_history: Sequence[tuple[str, str]] | None) -> list[str]:
+        """Ordered, de-duplicated list of image URLs previously shown to the user."""
         if not chat_history:
-            return ""
+            return []
         urls: list[str] = []
         for _, assistant_text in chat_history:
             if not assistant_text:
@@ -922,13 +929,32 @@ Plan:
             for url in ToolRouter._extract_image_urls(assistant_text):
                 if url not in urls:
                     urls.append(url)
+        return urls
+
+    @staticmethod
+    def _image_context_from_history(chat_history: Sequence[tuple[str, str]] | None) -> str:
+        """Build a numbered list of prior image URLs for the router prompt.
+
+        The router LLM uses this list to resolve natural-language image references
+        ("the previous image", "the second one", "the one with the backpack") to a
+        concrete image_url, replacing brittle regex matching.
+        """
+        urls = ToolRouter._prior_image_urls(chat_history)
         if not urls:
             return ""
-        numbered = ", ".join(f"{i + 1}. {url}" for i, url in enumerate(urls[-6:]))
+        numbered = "\n".join(f"  {i + 1}. {url}" for i, url in enumerate(urls[-8:]))
         return (
-            f"\n\nPrior images shown in this conversation (most recent last): {numbered}. "
-            "When the user refers to 'the first image', 'that image', 'this image', or 'the last image', "
-            "use the matching image_url in annotate_image instead of picking a random category sample."
+            "\n\nPrior images shown in this conversation (most recent last, numbered):"
+            f"\n{numbered}\n"
+            "When the user asks to annotate/highlight/circle/draw on/mark/outline a previously "
+            "shown image (\"the previous image\", \"the last image\", \"that image\", \"this image\", "
+            "\"the second image\", \"image 3\", \"the one with the backpack\", etc.), call "
+            "annotate_image with image_url set to the EXACT matching URL from the list above "
+            "(verbatim, full path). \"the previous/last image\" = the last URL in the list; "
+            "\"the first image\" = the first; \"the Nth image\" / \"image N\" = the Nth. If the user "
+            "describes the image by content, pick the URL that best matches. Never invent a URL "
+            "that is not in the list. Only fall back to a category or track_id when the user did "
+            "NOT refer to a specific prior image (e.g. \"annotate an advertisement board\")."
         )
 
     @staticmethod
@@ -975,60 +1001,16 @@ Plan:
         prior_images = self._image_context_from_history(chat_history)
         prior_tools = self._prior_tool_context(tool_history)
 
-        # Annotation requests take priority when the user asks to draw/highlight/mark an image,
-        # and we can identify which image (URL, track, or category) to annotate.
+        # Detect annotation intent up front. We do NOT force a tool here: the router
+        # LLM resolves which image (URL / track_id / category) the user means from the
+        # prior-images context above, which is far more robust than regex heuristics for
+        # phrases like "the previous image", "the second one", or "the one with the
+        # backpack". `wants_annotation` is kept only to drive a safety-net fallback
+        # below in case the LLM fails to emit an annotate_image call.
         annotation_keywords = (
             "highlight", "circle", "draw", "mark", "annotate", "outline", "point out",
         )
         wants_annotation = any(kw in q for kw in annotation_keywords)
-        if wants_annotation:
-            args: dict[str, Any] = {}
-            track_match = re.search(r"(?:track|object)\s*#?\s*(\d+)", q)
-            if track_match:
-                args["track_id"] = int(track_match.group(1))
-            else:
-                for alias, canonical in _CATEGORY_ALIASES.items():
-                    if alias in q:
-                        args["category"] = canonical
-                        break
-            url_match = re.search(r"(/[^\s]+\.(?:jpg|jpeg|png))", q, re.IGNORECASE)
-            if url_match:
-                args["image_url"] = url_match.group(1)
-            elif prior_images:
-                # If the query refers to an earlier image, prefer resolving it from history.
-                urls = [
-                    m.group(1).rstrip(".,;:!?")
-                    for m in re.finditer(r"\d+\.\s+(/[^\s,]+)", prior_images)
-                ]
-                if urls:
-                    if re.search(r"\b(first|1st)\s+image\b", q):
-                        args["image_url"] = urls[0]
-                    elif re.search(r"\b(second|2nd)\s+image\b", q) and len(urls) > 1:
-                        args["image_url"] = urls[1]
-                    elif re.search(r"\b(third|3rd)\s+image\b", q) and len(urls) > 2:
-                        args["image_url"] = urls[2]
-                    elif re.search(r"\bimage\s+(\d+)\b", q):
-                        idx = int(re.search(r"\bimage\s+(\d+)\b", q).group(1)) - 1
-                        if 0 <= idx < len(urls):
-                            args["image_url"] = urls[idx]
-                        else:
-                            args["image_url"] = urls[-1]
-                    elif re.search(r"\b(last|that|this|the)\s+image\b", q):
-                        args["image_url"] = urls[-1]
-                    elif re.search(r"\bimage\b|\bpicture\b|\bphoto\b|\bframe\b", q):
-                        # Generic image reference: default to the most recent image.
-                        args["image_url"] = urls[-1]
-            if args:
-                args["question"] = query
-                logger.info("Forcing annotate_image for annotation query: %r args=%s", query, args)
-                self.last_raw_response = {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {"function": {"name": "annotate_image", "arguments": args}}
-                    ],
-                }
-                return [("annotate_image", args)]
 
         anomaly_keywords = (
             "anomaly", "anomalies", "finding", "findings", "issue", "issues",
@@ -1106,6 +1088,32 @@ Plan:
             args = func.get("arguments") or {}
             if isinstance(name, str) and name in valid_names:
                 results.append((name, args))
+
+        # Safety net: if this was clearly an annotation request but the router did not
+        # emit an annotate_image call (it blanked or chose a non-annotation tool),
+        # synthesize a best-effort annotate_image so the user's request is not lost.
+        # The LLM is expected to resolve the image reference normally; this only fires
+        # as a last resort and prefers the most recently shown image.
+        if wants_annotation and not any(name == "annotate_image" for name, _ in results):
+            fallback: dict[str, Any] = {"question": query}
+            prior_urls = self._prior_image_urls(chat_history)
+            if prior_urls:
+                fallback["image_url"] = prior_urls[-1]
+            else:
+                track_match = re.search(r"(?:track|object)\s*#?\s*(\d+)", q)
+                if track_match:
+                    fallback["track_id"] = int(track_match.group(1))
+                else:
+                    for alias, canonical in _CATEGORY_ALIASES.items():
+                        if alias in q:
+                            fallback["category"] = canonical
+                            break
+            if "image_url" in fallback or "track_id" in fallback or "category" in fallback:
+                logger.info(
+                    "annotate_image safety-net fallback for annotation query: %r args=%s",
+                    query, fallback,
+                )
+                results.append(("annotate_image", fallback))
 
         logger.info("Tool router selected %s for query: %r", results, query)
         return results

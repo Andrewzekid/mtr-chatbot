@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 # Markdown image links like ![alt](/annotated/images/xxx.png) or ![alt](/inspection/images/yyy.jpg).
 _IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+# Annotated-image links specifically (produced by the annotate_image tool).
+_ANNOTATED_IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\((/annotated/images/[^\)]+)\)")
 
 
 class LocalLLM:
@@ -87,12 +89,21 @@ class LocalLLM:
             "Image links:\n"
             "- The database context may include markdown image links such as ![description](/inspection/images/<filename.jpg>).\n"
             "- It may also include annotated image links from the annotate_image tool, e.g. ![annotated image](/annotated/images/<filename.png>).\n"
-            "- ALWAYS preserve these links in your text response so the UI can display the object frames or annotated result to the user. Never drop, summarize, or rephrase them.\n"
+            "- ALWAYS include these image markdown links VERBATIM in your text response. The UI renders them as inline images for the user. "
+            "Never drop, summarize, rephrase, omit, or replace them with a prose description. If the context contains an image link, your answer MUST contain that exact link.\n"
             "- When the context includes multiple image links (e.g. representative frames), include every link in your response; the UI will display them as thumbnails.\n"
-            "- Do not describe the image filename or URL in words; the UI handles the image.\n\n"
+            "- Do not describe the image filename or URL in words; the UI handles the image.\n"
+            "- IMPORTANT: only use image links that appear VERBATIM in the provided context (the 'Extracted anomaly images' list or tool outputs). "
+            "Never invent, guess, or construct image filenames. In particular, do NOT convert a report's 'Frame N' reference into an "
+            "img-N.jpg link — the extracted image filenames do NOT correspond to frame numbers. If you are not given a link for an image, do not show one.\n"
+            "- When the annotate_image tool ran, the annotation is ALREADY done by the system's vision model and the annotated image is shown to the user. "
+            "Never say you cannot annotate, draw, or edit images. Just describe what the annotation found (object, location, anomaly) in plain language.\n\n"
             "Speech and readability:\n"
             "- Your response is also spoken aloud, so avoid heavy punctuation, markdown syntax, or lists that are hard to speak.\n"
-            "- Do not include raw filenames, URLs, or image markdown in the spoken part of your answer.\n\n"
+            "- IMAGE MARKDOWN LINKS (e.g. ![...](/annotated/images/...png) or ![...](/inspection/images/...jpg)) are the ONE exception: "
+            "always include them in your text. The UI extracts and displays them as images and EXCLUDES them from speech, so they do not make the spoken answer awkward. "
+            "Never omit an image link because you think it should not be spoken — include it anyway.\n"
+            "- Do not include raw filenames, URLs, or other non-image markdown in the spoken part of your answer.\n\n"
             "Example of a bad answer:\n"
             "1. 16:51:45 — 106 Lights. 2. 16:51:51 — 50 Lights, 35 Map...\n\n"
             "Example of a good answer:\n"
@@ -181,6 +192,9 @@ class LocalLLM:
         tool_results: list[dict[str, object]] = []
         report_needed = False
         tool_router_raw: dict[str, object] | None = None
+        # Annotated-image links the backend emits itself (see yield below) so
+        # the image is guaranteed to display regardless of model compliance.
+        annotated_links: list[str] = []
         if self.db_client is not None:
             try:
                 db_context = await self.db_client.lookup(prompt, chat_history=chat_history, tool_history=tool_history)
@@ -199,12 +213,40 @@ class LocalLLM:
                     for call in self.db_client.last_tool_calls
                 )
                 if annotate_called and db_context:
-                    db_context = (
-                        "IMPORTANT: The annotate_image tool just produced an annotated image. "
-                        "You MUST include the annotated image markdown link at the start of your answer so the UI displays it. "
-                        "Do NOT summarize it away or describe it in words instead of showing the link.\n\n"
-                        + db_context
-                    )
+                    # Collect the annotated-image links the tool produced. The
+                    # backend emits them itself (see stream_reply) so the image
+                    # is guaranteed to display even if the model would otherwise
+                    # drop the link. Strip them from the context shown to the
+                    # model so it cannot duplicate or paraphrase them.
+                    annotated_links = []
+                    for r in tool_results:
+                        if r.get("name") != "annotate_image":
+                            continue
+                        for m in _ANNOTATED_IMAGE_LINK_RE.finditer(str(r.get("output", ""))):
+                            link = m.group(0)
+                            if link not in annotated_links:
+                                annotated_links.append(link)
+                    if annotated_links:
+                        db_context = _ANNOTATED_IMAGE_LINK_RE.sub("", db_context)
+                        db_context = re.sub(r"[ \t]{2,}", " ", db_context)
+                        db_context = (
+                            "The system's annotate_image tool has ALREADY run: a vision model analyzed the image "
+                            "and drew annotation boxes, and the annotated image is displayed ABOVE your answer "
+                            "(the image link is shown by the system, so do NOT re-emit it and do NOT say you cannot annotate). "
+                            "You are NOT being asked to generate, edit, or draw anything — the annotation is already done. "
+                            "Your ONLY job is to write a short natural-language summary of what the annotation found, "
+                            "using the description and annotation details below (what object/anomaly, where in the frame, confidence if given). "
+                            "Never claim you lack the ability to annotate; the annotation already happened.\n\n"
+                            + db_context
+                        )
+                    else:
+                        db_context = (
+                            "IMPORTANT: The annotate_image tool just produced an annotated image. "
+                            "You MUST include the annotated image markdown link at the start of your answer so the UI displays it. "
+                            "Do NOT summarize it away or describe it in words instead of showing the link. "
+                            "The annotation is already done by the system; just describe what it found.\n\n"
+                            + db_context
+                        )
                 elif image_tool_called and db_context:
                     db_context = (
                         "The user asked to see images. "
@@ -256,6 +298,13 @@ class LocalLLM:
         )
 
         provider = self.settings.llm_provider.lower().strip()
+
+        # Guarantee annotated images display: emit their markdown links as the
+        # first tokens of the reply, before the model's own text. The links were
+        # stripped from db_context above so the model cannot duplicate them.
+        if annotated_links:
+            prefix = "\n\n".join(annotated_links) + "\n\n"
+            yield prefix
 
         if provider == "ollama":
             try:

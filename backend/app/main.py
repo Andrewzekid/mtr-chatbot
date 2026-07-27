@@ -63,10 +63,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve extracted anomaly images from inspection reports.
+# Serve extracted anomaly images from inspection reports. The URL prefix
+# mirrors the on-disk directory name (reports/extracted_images).
 _images_dir = Path(settings.reports_dir) / "extracted_images"
 if _images_dir.exists():
-    app.mount("/reports/images", StaticFiles(directory=str(_images_dir)), name="report_images")
+    app.mount("/reports/extracted_images", StaticFiles(directory=str(_images_dir)), name="report_extracted_images")
 
 # Serve source camera frames referenced by observations.image_path.
 _inspection_img_dir = Path(settings.inspection_image_dir)
@@ -149,7 +150,7 @@ def report_image_list() -> dict[str, list[str]]:
     if not images_dir.exists():
         return {"images": []}
     names = sorted(p.name for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-    return {"images": [f"/reports/images/{name}" for name in names]}
+    return {"images": [f"/reports/extracted_images/{name}" for name in names]}
 
 
 @app.get("/status")

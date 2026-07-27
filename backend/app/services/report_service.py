@@ -85,7 +85,7 @@ class InspectionReportClient:
             p.name for p in images_dir.iterdir()
             if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
         )
-        return [f"/reports/images/{name}" for name in names]
+        return [f"/reports/extracted_images/{name}" for name in names]
 
     def lookup(self, query: str | None = None) -> str | None:
         """Return the full report context, including anomaly images if available.

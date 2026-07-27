@@ -88,11 +88,14 @@ class VisionAnnotator:
             '- "box" with x1, y1, x2, y2 (REQUIRED keys)\n'
             '- "circle" with cx, cy, radius\n'
             '- "highlight" with points as a list of [x, y]\n\n'
-            "Only include annotations for real anomalies. If there are none, return an empty annotations list.\n\n"
+            "Only include annotations for REAL anomalies or objects that are actually visible in the image. "
+            "Never fabricate a box for something that is not present.\n\n"
             f"User's question: {question}\n\n"
-            "If the user asks to highlight, circle, mark, or draw on the image, you MUST output at least one "
-            "annotation so the backend can draw it on the image. "
-            "When in doubt, return a box around the most relevant area instead of skipping the annotation."
+            "If the user asks to highlight, circle, mark, or draw on something AND that thing is visible in "
+            "the image, output at least one annotation marking it. If the requested target is NOT visible in "
+            "the image (e.g. 'draw the exit sign' when no exit sign is present), return an EMPTY annotations "
+            "list and explain in the description that the target was not found. Do NOT draw a placeholder or "
+            "default box when nothing was found."
         )
 
     @staticmethod
@@ -256,28 +259,13 @@ class VisionAnnotator:
 
         parsed = self._extract_json(raw_content)
 
-        # Ensure highlight/draw requests produce at least one annotation.
-        q_lower = question.lower()
-        draw_intent_keywords = (
-            "highlight", "circle", "draw", "mark", "annotate", "box", "outline", "point out"
-        )
-        if any(kw in q_lower for kw in draw_intent_keywords):
-            annotations = parsed.get("annotations")
-            if not isinstance(annotations, list) or len(annotations) == 0:
-                parsed["annotations"] = [
-                    {
-                        "type": "box",
-                        "label": "area of interest",
-                        "x1": 0.45,
-                        "y1": 0.45,
-                        "x2": 0.55,
-                        "y2": 0.55,
-                    }
-                ]
-                parsed.setdefault(
-                    "description",
-                    "The model did not specify a location, so a default reference box was drawn on the image.",
-                )
+        # Honor the model's annotation verdict. An empty "annotations" list means
+        # the model found nothing to annotate (e.g. "draw the exit sign" when no
+        # exit sign is present). The prompt already strongly instructs the model to
+        # emit at least one annotation for highlight/draw requests when something IS
+        # there, so an empty list is a deliberate "nothing found" — do NOT inject a
+        # fake center box, which would mislead the user into thinking a target was
+        # located when it was not.
 
         return parsed, raw_content
 
@@ -347,7 +335,17 @@ class VisionAnnotator:
         """
         # Direct keys.
         if all(k in item for k in ("x1", "y1", "x2", "y2")):
-            return item
+            # Return a clean dict with only the four canonical keys so stray
+            # keys the model sometimes emits (e.g. a typo'd "ysl") never leak.
+            try:
+                return {
+                    "x1": float(item["x1"]),
+                    "y1": float(item["y1"]),
+                    "x2": float(item["x2"]),
+                    "y2": float(item["y2"]),
+                }
+            except (ValueError, TypeError):
+                return item
 
         # Array form: [x1, y1, x2, y2]
         for key in ("box", "bbox", "coordinates", "coords"):

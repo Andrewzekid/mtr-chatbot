@@ -345,7 +345,7 @@ The largest service file (~1650 lines). Provides structured queries, a natural-l
 |--------|-------------|
 | `_load_context()` | Reads all `.txt` and `.pdf` files from `reports_dir`. Uses `pdftotext` (system tool) for PDF extraction. Caches the result. |
 | `get_context()` | Returns the cached combined report text, or loads it on first call. |
-| `get_image_urls()` | Lists anomaly images in `reports_dir/extracted_images/` as `/reports/images/<filename>` URLs. |
+| `get_image_urls()` | Lists anomaly images in `reports_dir/extracted_images/` as `/reports/extracted_images/<filename>` URLs. |
 | `lookup(query)` | Packages the report context with image references. Used when the tool router selected `get_report_summary`. |
 
 ---
@@ -725,7 +725,7 @@ Response: "The largest object was Track 383 (TV) with 15,321 points over 105 obs
 User: "Show me images of the objects that had anomalies"
 Tools: get_report_summary → (report text mentions specific tracks or image filenames) + get_object_image_paths(track_id=...) for each
 Note: The tool router calls get_report_summary. The main LLM reads the report context (which lists anomaly images like img-003.jpg and img-007.jpg) and answers using the anomaly image URLs from the report context.
-Response: "The anomalies were found in these inspection frames: ![anomaly](/reports/images/img-003.jpg) ![anomaly](/reports/images/img-007.jpg). These show cracks on the east wall panel and a loose cable near the track bed."
+Response: "The anomalies were found in these inspection frames: ![anomaly](/reports/extracted_images/img-003.jpg) ![anomaly](/reports/extracted_images/img-007.jpg). These show cracks on the east wall panel and a loose cable near the track bed."
 ```
 
 ### Image annotation (via tool router)
@@ -746,7 +746,7 @@ Response: "Here's a sample advertisement board frame with the anomaly circled: !
 
 ```
 User: "Draw boxes around all the defects in the inspection report images"
-Tools: get_report_summary → (reads img-003.jpg and img-007.jpg from report images) → annotate_image(image_url="/reports/images/img-003.jpg", question="Draw boxes around all defects") + annotate_image(image_url="/reports/images/img-007.jpg", question="Draw boxes around all defects")
+Tools: get_report_summary → (reads img-003.jpg and img-007.jpg from report images) → annotate_image(image_url="/reports/extracted_images/img-003.jpg", question="Draw boxes around all defects") + annotate_image(image_url="/reports/extracted_images/img-007.jpg", question="Draw boxes around all defects")
 Response: "I analyzed the anomaly images from the report. In the first frame: ![annotated](/annotated/images/b2c3d4e5.png) — a box around the wall crack on the left panel. In the second frame: ![annotated](/annotated/images/f6g7h8i9.png) — a box around the loose cable near the bottom."
 ```
 
@@ -778,7 +778,7 @@ User: "Give me a complete debrief of this inspection run — what was detected, 
 Tools: get_summary + get_temporal_clusters(window_ms=500, top_n=5) + get_report_summary
 Router: Identifies "debrief" as needing summary + clusters + report.
 Response: "Here's the full inspection debrief. We detected 345 objects across 6 categories over an 8.5-minute run starting at 16:50. The busiest moment was at 4:51 PM when 106 lights were seen in under a second as the robot entered the main hall. As for anomalies, the report flags 5 frames showing wall cracks, a torn advertisement poster, and a loose cable near the track bed.
-Anomaly images: ![anomaly](/reports/images/img-003.jpg) ![anomaly](/reports/images/img-007.jpg)
+Anomaly images: ![anomaly](/reports/extracted_images/img-003.jpg) ![anomaly](/reports/extracted_images/img-007.jpg)
 Sample frames from the busiest moment: ![frame](/inspection/images/1781168192465731000.jpg)"
 ```
 

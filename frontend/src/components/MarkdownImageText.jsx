@@ -36,7 +36,22 @@ export function renderTextWithImages(text, onImageClick) {
         onClick={() => onImageClick(resolvedSrc)}
         title={alt || "Inspection frame"}
       >
-        <img src={resolvedSrc} alt={alt || "Inspection frame"} loading="lazy" />
+        <img
+          src={resolvedSrc}
+          alt={alt || "Inspection frame"}
+          loading="lazy"
+          onError={(e) => {
+            // Hide the whole thumbnail button if the image fails to load
+            // (e.g. a hallucinated/non-existent filename) so the chat does
+            // not fill up with broken-image icons.
+            const btn = e.currentTarget.parentElement;
+            if (btn && btn.classList.contains("chat-image-thumb")) {
+              btn.style.display = "none";
+            } else {
+              e.currentTarget.style.display = "none";
+            }
+          }}
+        />
       </button>
     );
     lastIndex = match.index + full.length;

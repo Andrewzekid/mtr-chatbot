@@ -146,7 +146,11 @@ class InspectionDBClient:
         return ", ".join(parts)
 
     _IMAGE_URL_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
-    _PLAIN_IMAGE_RE = re.compile(r"(/(?:inspection|reports|annotated)/images/[^\s\)\"]+)")
+    # Match canonical image URL prefixes. /reports/extracted_images is the
+    # anomaly-image route; /reports/images is accepted as a legacy alias.
+    _PLAIN_IMAGE_RE = re.compile(
+        r"((?:/(?:inspection|annotated)/images/|/reports/(?:extracted_)?images/)[^\s\)\"]+)"
+    )
 
     @staticmethod
     def _extract_image_urls(text: str) -> list[str]:
@@ -1457,10 +1461,17 @@ class InspectionDBClient:
             if not self.settings:
                 return None
             return Path(self.settings.inspection_image_dir) / Path(image_url).name
-        if image_url.startswith("/reports/images/"):
+        if image_url.startswith("/reports/extracted_images/") or image_url.startswith("/reports/images/"):
+            # /reports/images is a legacy alias for the extracted_images dir.
             if not self.settings:
                 return None
             return Path(self.settings.reports_dir) / "extracted_images" / Path(image_url).name
+        if image_url.startswith("/annotated/images/"):
+            # A previously annotated image (output of annotate_image). Allow
+            # re-annotating it by mapping to the annotated-image cache dir.
+            if not self.settings:
+                return None
+            return Path(self.settings.annotated_image_cache_dir) / Path(image_url).name
 
         # Already an absolute local path.
         raw = Path(image_url)
