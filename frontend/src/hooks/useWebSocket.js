@@ -156,9 +156,29 @@ export function useWebSocket(url, onMessage) {
   useEffect(() => {
     connect();
 
+    // When the tab is backgrounded, Firefox throttles setTimeout/setInterval
+    // heavily, so a reconnect scheduled by onclose may not fire for a long
+    // time. On return to the tab, force an immediate reconnect if the socket
+    // is not already open so push-to-talk works right away.
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        // Cancel any pending (throttled) reconnect and connect now.
+        if (reconnectTimerRef.current) {
+          window.clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        connect();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
       intentionallyClosedRef.current = true;
       clearTimers();
+      document.removeEventListener("visibilitychange", onVisibility);
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
