@@ -256,6 +256,11 @@ async def websocket_chat(ws: WebSocket) -> None:
         while True:
             payload = await ws.receive_json()
             message_type = payload.get("type")
+            if message_type == "ping":
+                # Application-level heartbeat from the frontend.
+                await ws.send_json({"type": "pong", "timestamp": payload.get("timestamp")})
+                continue
+
             if message_type == "interrupt":
                 interrupt = ClientInterruptMessage.model_validate(payload)
                 await cancel_active(reason="user_interrupt", request_id=interrupt.request_id)

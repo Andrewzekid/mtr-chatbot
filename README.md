@@ -78,6 +78,9 @@ A voice-to-voice chatbot layer for Hong Kong MTR subway station inspection. It e
 | `inspection_db_path` | absolute path | SQLite DB path |
 | `inspection_image_dir` | absolute path | Source camera frames |
 | `reports_dir` | `../reports` | Anomaly report directory |
+| `annotated_image_cache_dir` | `./annotated_images` | Cache for annotated images |
+| `ws_ping_interval_s` | `60` | Uvicorn WebSocket ping interval (seconds) |
+| `ws_ping_timeout_s` | `60` | Uvicorn WebSocket ping timeout (seconds) |
 | `piper_*` | various | Piper TTS voice/model paths |
 | `vision_*` | various | Vision model settings |
 
@@ -107,6 +110,7 @@ Relative paths in `.env` are resolved relative to `backend/`.
 | `"interrupt"` | `{ request_id? }` | Cancel the current response |
 | `"set_voice"` | `{ voice_id }` | Switch TTS voice for this session |
 | `"clear_context"` | `{}` | Reset conversation history |
+| `"ping"` | `{ timestamp }` | Application-level heartbeat (sent every 15s when idle) |
 
 *Server → Client:*
 | `type` | Payload | Purpose |
@@ -120,6 +124,7 @@ Relative paths in `.env` are resolved relative to `backend/`.
 | `"llm_done"` | `{ text, request_id, tts_text_language, tts_voice_reason? }` | LLM stream complete |
 | `"interrupted"` | `{ reason, request_id }` | Current request was cancelled |
 | `"error"` | `{ error }` | Error message |
+| `"pong"` | `{ timestamp }` | Heartbeat response from server |
 
 ---
 
@@ -764,6 +769,11 @@ INSPECTION_IMAGE_DIR=/home/.../camera/right
 
 # Reports
 REPORTS_DIR=../reports
+ANNOTATED_IMAGE_CACHE_DIR=./annotated_images
+
+# WebSocket keep-alive (increase if you see reconnects on idle connections)
+WS_PING_INTERVAL_S=60
+WS_PING_TIMEOUT_S=60
 
 # TTS (Piper)
 PIPER_EXE_PATH=./bin/piper/piper/piper
@@ -804,14 +814,14 @@ This starts Ollama, backend (Port 8000), and frontend (Port 3000). Models must a
 cd backend
 ./setup_all.sh        # Installs Python venv + downloads piper binary
 source .venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --ws-ping-interval 60 --ws-ping-timeout 60
 ```
 
 **Backend (Windows):**
 ```powershell
 cd backend
 .\setup_all.ps1
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --ws-ping-interval 60 --ws-ping-timeout 60
 ```
 
 **Frontend:**

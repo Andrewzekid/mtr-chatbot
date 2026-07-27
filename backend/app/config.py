@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # Cache directory for vision-annotated images served under /annotated/images
     annotated_image_cache_dir: str = "./annotated_images"
 
+    # WebSocket keep-alive (Uvicorn/websockets protocol pings). Increase these if you
+    # see reconnects behind proxies or on idle connections. The frontend also sends an
+    # application-level heartbeat every 15 seconds, so these are a fallback.
+    ws_ping_interval_s: float = 60.0
+    ws_ping_timeout_s: float = 60.0
+
     # Piper TTS
     piper_exe_path: str = "./bin/piper/piper/piper.exe"
     piper_voices_dir: str = "./models/piper"

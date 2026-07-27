@@ -75,4 +75,4 @@ ollama --version
 ollama pull gemma4:e2b
 
 echo "Setup complete."
-echo "Start backend with: .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+echo "Start backend with: .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --ws-ping-interval 60 --ws-ping-timeout 60"

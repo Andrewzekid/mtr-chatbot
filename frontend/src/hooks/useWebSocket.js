@@ -11,20 +11,34 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * @param {function} onMessage - Async function called with each parsed message object.
  * @returns {{ socketState: string, send: function }}
  */
+const HEARTBEAT_INTERVAL_MS = 15000; // keep connection alive during idle periods
+const HEARTBEAT_GRACE_MS = 5000; // how late a pong can be before we treat it as missing
+
 export function useWebSocket(url, onMessage) {
   const [socketState, setSocketState] = useState("connecting");
   const wsRef = useRef(null);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef(null);
+  const heartbeatTimerRef = useRef(null);
+  const heartbeatTimeoutRef = useRef(null);
+  const lastPongRef = useRef(Date.now());
   const onMessageRef = useRef(onMessage);
   const intentionallyClosedRef = useRef(false);
   const pendingMessagesRef = useRef([]);
   onMessageRef.current = onMessage;
 
-  const clearReconnectTimer = useCallback(() => {
+  const clearTimers = useCallback(() => {
     if (reconnectTimerRef.current) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+    }
+    if (heartbeatTimerRef.current) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    if (heartbeatTimeoutRef.current) {
+      window.clearTimeout(heartbeatTimeoutRef.current);
+      heartbeatTimeoutRef.current = null;
     }
   }, []);
 
@@ -46,7 +60,7 @@ export function useWebSocket(url, onMessage) {
       return;
     }
 
-    clearReconnectTimer();
+    clearTimers();
     intentionallyClosedRef.current = false;
     setSocketState("connecting");
 
@@ -54,14 +68,43 @@ export function useWebSocket(url, onMessage) {
       const ws = new WebSocket(url);
       wsRef.current = ws;
 
+      const sendPing = () => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn("WebSocket ping failed:", err);
+          }
+        }
+      };
+
+      const startHeartbeat = () => {
+        lastPongRef.current = Date.now();
+        heartbeatTimerRef.current = window.setInterval(() => {
+          const sinceLastPong = Date.now() - lastPongRef.current;
+          if (sinceLastPong > HEARTBEAT_INTERVAL_MS + HEARTBEAT_GRACE_MS) {
+            // eslint-disable-next-line no-console
+            console.warn(`WebSocket heartbeat missed (last pong ${sinceLastPong}ms ago); closing to reconnect.`);
+            ws.close(1001, "heartbeat missed");
+            return;
+          }
+          sendPing();
+        }, HEARTBEAT_INTERVAL_MS);
+      };
+
       ws.onopen = () => {
         reconnectAttemptRef.current = 0;
         setSocketState("connected");
         flushPendingMessages();
+        startHeartbeat();
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        clearTimers();
         wsRef.current = null;
+        // eslint-disable-next-line no-console
+        console.log(`WebSocket closed code=${event.code} reason=${event.reason || "(none)"} wasClean=${event.wasClean}`);
         if (intentionallyClosedRef.current) {
           setSocketState("disconnected");
           return;
@@ -69,7 +112,8 @@ export function useWebSocket(url, onMessage) {
 
         setSocketState("reconnecting");
         const attempt = reconnectAttemptRef.current;
-        const delay = Math.min(1000 * 2 ** attempt, 30000);
+        // Base 1s delay plus exponential backoff, capped at 30s.
+        const delay = Math.min(1000 + 1000 * 2 ** attempt, 30000);
         reconnectAttemptRef.current = attempt + 1;
 
         reconnectTimerRef.current = window.setTimeout(() => {
@@ -77,8 +121,10 @@ export function useWebSocket(url, onMessage) {
         }, delay);
       };
 
-      ws.onerror = () => {
+      ws.onerror = (event) => {
         // Let onclose handle reconnection logic; mark error only if not already reconnecting.
+        // eslint-disable-next-line no-console
+        console.warn("WebSocket error:", event);
         if (reconnectTimerRef.current === null && wsRef.current?.readyState !== WebSocket.OPEN) {
           setSocketState("error");
         }
@@ -87,6 +133,10 @@ export function useWebSocket(url, onMessage) {
       ws.onmessage = async (event) => {
         try {
           const msg = JSON.parse(event.data);
+          if (msg.type === "pong" || msg.type === "ping") {
+            lastPongRef.current = Date.now();
+            return;
+          }
           await onMessageRef.current(msg);
         } catch (err) {
           // Non-fatal parse or handler error; keep the connection alive.
@@ -101,20 +151,20 @@ export function useWebSocket(url, onMessage) {
         connect();
       }, 2000);
     }
-  }, [url, clearReconnectTimer, flushPendingMessages]);
+  }, [url, clearTimers, flushPendingMessages]);
 
   useEffect(() => {
     connect();
 
     return () => {
       intentionallyClosedRef.current = true;
-      clearReconnectTimer();
+      clearTimers();
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [connect, clearReconnectTimer]);
+  }, [connect, clearTimers]);
 
   const send = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
