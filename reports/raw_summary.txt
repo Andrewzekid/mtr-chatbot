@@ -1,0 +1,37 @@
+Total images processed: 101
+- No anomaly: 96
+- Anomalies detected: 5 (total 8 anomalies)
+- Parse errors: 0
+- API failures: 0
+
+--- Merged Anomaly Descriptions ---
+Frame 28: missing_object - right-side black machine / printer at countertop center-right, in front of the window [300, 300, 470, 610] (conf=0.95).
+{
+  "anomaly_1": {
+    "frame": 6,
+    "category": "foreign_object",
+    "location": "center-right foreground near the wall corner/display wall",
+    "details": "A small standing table with an open laptop has been placed in the walkway area. This is a temporary object obstructing/occupying space and is not the same as the countertop clutter seen later.",
+    "severity": "medium"
+  },
+  "anomaly_2": {
+    "frame": 28,
+    "category": "foreign_object",
+    "location": "center-right on top of the long countertop/cabinet beneath the interior window",
+    "details": "A pile of boxes, papers, and small electronic items is present on the countertop. This is a separate clutter/temporary storage anomaly from the standing table with laptop.",
+    "severity": "low"
+  }
+}
+Frame 28: missing_object - whiteboard/sign board on the far right at right end of countertop near the window edge [650, 520, 768, 700] (conf=0.82).
+Frame 47: state_change - right-side access gate indicator light at front-right gate lane [612, 470, 660, 610] (conf=0.84).
+{
+  "category": "foreign_object",
+  "location": "Right foreground of the corridor, beside the wall display, where a temporary table/desk and chair are set up",
+  "time_range": {
+    "start_frame": 5,
+    "end_frame": 6
+  },
+  "severity": "medium",
+  "details": "Both detections refer to the same physical anomaly: an unauthorized temporary furniture setup occupying the right-side foreground walkway area. Frame 5 focuses mainly on the chair, while Frame 6 captures the broader desk-and-chair arrangement."
+}
+Frame 60: foreign_object - hanging black cable/wire at upper center of the room, descending from the ceiling toward the middle aisle [365, 0, 470, 470] (conf=0.95).

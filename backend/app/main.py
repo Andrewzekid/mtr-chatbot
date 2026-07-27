@@ -6,14 +6,17 @@ import asyncio
 import time
 import sys
 from contextlib import suppress
+from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.models import ClientAudioMessage, ClientInterruptMessage, ServerMessage
+from app.models import ClientAudioMessage, ClientInterruptMessage, ImageAnnotationResponse, ServerMessage
 from app.services.pipeline import VoicePipeline
 from app.services.runtime_status import get_vram_status
+from app.services.vision_service import VisionAnnotator
 
 
 class _DuplicateLogFilter(logging.Filter):
@@ -51,7 +54,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 settings = get_settings()
-app = FastAPI(title="Local Realtime Voice Chatbot")
+app = FastAPI(title="MTR-Insight Inspection Voice Assistant")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.cors_origin],
@@ -60,7 +63,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve extracted anomaly images from inspection reports.
+_images_dir = Path(settings.reports_dir) / "extracted_images"
+if _images_dir.exists():
+    app.mount("/reports/images", StaticFiles(directory=str(_images_dir)), name="report_images")
+
+# Serve source camera frames referenced by observations.image_path.
+_inspection_img_dir = Path(settings.inspection_image_dir)
+if _inspection_img_dir.exists():
+    app.mount("/inspection/images", StaticFiles(directory=str(_inspection_img_dir)), name="inspection_images")
+
 pipeline = VoicePipeline(settings)
+vision_annotator = VisionAnnotator(settings)
 _models_loaded = False
 _models_loading = False
 _preload_lock = asyncio.Lock()
@@ -123,6 +137,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/reports/image-list")
+def report_image_list() -> dict[str, list[str]]:
+    """Return URLs of extracted anomaly images from inspection reports."""
+    images_dir = Path(settings.reports_dir) / "extracted_images"
+    if not images_dir.exists():
+        return {"images": []}
+    names = sorted(p.name for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    return {"images": [f"/reports/images/{name}" for name in names]}
+
+
 @app.get("/status")
 async def runtime_status() -> dict[str, object]:
     return await _runtime_snapshot()
@@ -136,6 +160,29 @@ def voices() -> dict[str, object]:
         "chinese_fallback_voice": pipeline.tts.chinese_fallback_model_path,
         "voices": pipeline.tts.list_available_voices(),
     }
+
+
+@app.post("/annotate-image", response_model=ImageAnnotationResponse)
+async def annotate_image(
+    image: UploadFile = File(...),
+    question: str = Form("What anomalies are in this image?"),
+) -> dict[str, object]:
+    """Upload an image, ask a question, and receive the image back with anomaly annotations."""
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image")
+
+    try:
+        image_bytes = await image.read()
+        if len(image_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded image is empty")
+
+        result = await vision_annotator.annotate(image_bytes, question)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _app_logger.exception("Image annotation failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Image annotation failed: {exc}") from exc
 
 
 @app.websocket("/ws")
@@ -167,14 +214,30 @@ async def websocket_chat(ws: WebSocket) -> None:
     async def stream_audio_request(audio_bytes: bytes, suffix: str) -> None:
         user_text = ""
         assistant_text = ""
+        current_request_id: str | None = None
+
+        def send_tool_calls(payload: dict[str, object]) -> None:
+            asyncio.create_task(
+                ws.send_json(
+                    ServerMessage(
+                        type="tool_calls",
+                        tool_calls=payload.get("tool_calls"),
+                        tool_router_raw=payload.get("tool_router_raw"),
+                        request_id=current_request_id,
+                    ).model_dump(exclude_none=True)
+                )
+            )
+
         async for event in pipeline.handle_audio(
             audio_bytes,
             suffix=suffix,
             voice_model_path=selected_voice_model,
             chat_history=conversation_history,
+            tool_calls_callback=send_tool_calls,
         ):
             if event.type == "transcript":
                 user_text = event.transcript or ""
+                current_request_id = event.request_id
             elif event.type == "llm_done":
                 assistant_text = event.text or ""
             await ws.send_json(event.model_dump(exclude_none=True))

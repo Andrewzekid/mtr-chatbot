@@ -187,8 +187,14 @@ h1 {
   vertical-align: middle;
 }
 
-.card p {
+.card p,
+.assistant-streaming-text {
   margin: 0;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.markdown-image-text {
   line-height: 1.55;
   white-space: pre-wrap;
 }
@@ -249,6 +255,335 @@ h1 {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+.report-gallery {
+  grid-column: 1 / -1;
+  min-height: auto;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.image-thumb {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 0;
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+
+.image-thumb:hover {
+  transform: translateY(-2px);
+  border-color: rgba(217, 110, 48, 0.55);
+}
+
+.image-thumb img {
+  width: 100%;
+  height: 120px;
+  object-fit: cover;
+  display: block;
+}
+
+.chat-image-thumb {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 0;
+  margin: 8px 8px 0 0;
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease;
+  vertical-align: top;
+}
+
+.chat-image-thumb:hover {
+  transform: translateY(-2px);
+  border-color: rgba(217, 110, 48, 0.55);
+}
+
+.chat-image-thumb img {
+  width: 140px;
+  height: 100px;
+  object-fit: cover;
+  display: block;
+}
+
+.debug-panel {
+  grid-column: 1 / -1;
+  min-height: auto;
+}
+
+.debug-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.debug-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.debug-toggle {
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.debug-body {
+  margin-top: 10px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.debug-turn {
+  margin-bottom: 10px;
+}
+
+.debug-turn-label {
+  margin: 0 0 4px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.debug-call-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.debug-call {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.debug-call-name {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--accent-2);
+}
+
+.debug-call-args {
+  margin: 6px 0 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 6px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.debug-call-output {
+  margin: 6px 0 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+}
+
+.debug-call-output summary {
+  cursor: pointer;
+  color: var(--accent-2);
+  font-weight: 500;
+}
+
+.debug-call-output pre {
+  margin: 6px 0 0;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 6px;
+  border-radius: 6px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+  cursor: zoom-out;
+}
+
+.image-lightbox img {
+  max-width: 90vw;
+  max-height: 90vh;
+  border-radius: 8px;
+}
+
+.annotator-card {
+  grid-column: 1 / -1;
+  min-height: auto;
+}
+
+.annotator-help {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.annotator-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.annotator-file-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.annotator-file-label input[type="file"] {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.annotator-file-button {
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.82);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--ink);
+  transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.annotator-file-label:hover .annotator-file-button {
+  transform: translateY(-1px);
+  border-color: rgba(217, 110, 48, 0.55);
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.annotator-file-name {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.annotator-question {
+  flex: 1;
+  min-width: 220px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.82);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.annotator-question:focus {
+  outline: none;
+  border-color: rgba(42, 143, 112, 0.55);
+}
+
+.annotator-submit {
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 10px;
+  padding: 8px 16px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease;
+}
+
+.annotator-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: #c25b24;
+}
+
+.annotator-submit:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.annotator-error {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 59, 48, 0.12);
+  color: #a92525;
+  font-size: 13px;
+}
+
+.annotator-result {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.annotator-preview,
+.annotator-output {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.annotator-preview-label {
+  margin: 0 0 8px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.annotator-preview img,
+.annotator-output img {
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  border-radius: 8px;
+  display: block;
+}
+
+.annotator-image-button {
+  display: block;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: zoom-in;
+}
+
+.annotator-description {
+  margin: 10px 0 0;
+  line-height: 1.55;
+  font-size: 14px;
+  color: var(--ink);
 }
 
 @media (max-width: 760px) {

@@ -16,6 +16,7 @@ dist/
 # Environment
 .env
 backend/.env
+backend/g2pW/
 frontend/.env
 
 # Models and binaries
@@ -25,3 +26,4 @@ backend/bin/
 # OS
 .DS_Store
 Thumbs.db
+

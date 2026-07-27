@@ -5,12 +5,16 @@ import base64
 import logging
 import re
 import uuid
+from pathlib import Path
 from typing import AsyncGenerator
 
 from app.config import Settings
 from app.models import ServerMessage
+from app.services.db_service import InspectionDBClient
 from app.services.llm_service import LocalLLM
+from app.services.report_service import InspectionReportClient
 from app.services.stt_service import STTResult, SenseVoiceSTT
+from app.services.tool_router import ToolRouter
 from app.services.tts_service import PiperTTS
 
 logger = logging.getLogger(__name__)
@@ -22,7 +26,25 @@ class VoicePipeline:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.stt = SenseVoiceSTT(settings)
-        self.llm = LocalLLM(settings)
+
+        db_client = None
+        if settings.inspection_db_path:
+            db_path = Path(settings.inspection_db_path)
+            if db_path.exists():
+                router = ToolRouter(settings) if settings.tool_router_enabled else None
+                db_client = InspectionDBClient(db_path, router=router)
+            else:
+                logger.warning("Inspection DB not found at %s; DB lookups disabled", db_path)
+
+        report_client = None
+        if settings.reports_dir:
+            reports_dir = Path(settings.reports_dir)
+            if reports_dir.exists():
+                report_client = InspectionReportClient(reports_dir)
+            else:
+                logger.warning("Reports directory not found at %s; report lookups disabled", reports_dir)
+
+        self.llm = LocalLLM(settings, db_client=db_client, report_client=report_client)
         self.tts = PiperTTS(settings)
 
     async def _stream_tts_segments(
@@ -79,12 +101,59 @@ class VoicePipeline:
 
         return segments, remainder
 
+    @staticmethod
+    def _clean_for_tts(text: str) -> str:
+        """Strip markdown, image links, bullets, and other punctuation that TTS should not read."""
+        # Protect decimal numbers (including negatives) so their punctuation is preserved.
+        decimals: list[str] = []
+
+        def _protect_decimal(match: re.Match) -> str:
+            decimals.append(match.group(0))
+            return f"DECIMAL{len(decimals) - 1}"
+
+        text = re.sub(r"-?\d+\.\d+", _protect_decimal, text)
+
+        # Remove markdown image tags entirely.
+        text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+        # Replace markdown links with just their link text.
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        # Remove standalone URLs.
+        text = re.sub(r"https?://\S+", "", text)
+        # Remove bold/italic/heading/backtick markers.
+        text = re.sub(r"[*_`#]+", "", text)
+        # Remove bullet markers at the start of a line.
+        text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.MULTILINE)
+        # Remove numbered list prefixes at the start of a line.
+        text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+        # Replace multiplication markers used in cluster counts (e.g. "10 x Lights").
+        text = re.sub(r"\s+x\s+", " ", text)
+        # Replace em/en dashes with a comma pause.
+        text = text.replace("—", ",").replace("–", ",")
+        # Remove parentheses and brackets.
+        text = text.replace("(", " ").replace(")", " ")
+        text = text.replace("[", " ").replace("]", " ")
+        # Remove empty parentheses.
+        text = re.sub(r"\(\s*\)", "", text)
+        # Normalize whitespace.
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n+", " ", text)
+        text = re.sub(r"\s+([.,;:!?)])", r"\1", text)
+        # Collapse repeated punctuation.
+        text = re.sub(r"([.,;:!?]){2,}", r"\1", text)
+
+        # Restore decimal numbers.
+        for i, value in enumerate(decimals):
+            text = text.replace(f"DECIMAL{i}", value)
+
+        return text.strip()
+
     async def handle_audio(
         self,
         audio_bytes: bytes,
         suffix: str = ".webm",
         voice_model_path: str | None = None,
         chat_history: list[tuple[str, str]] | None = None,
+        tool_calls_callback: Callable[[list[dict[str, object]]], None] | None = None,
     ) -> AsyncGenerator[ServerMessage, None]:
         request_id = str(uuid.uuid4())
         logger.info("Pipeline start: request_id=%s audio_bytes=%d suffix=%s", request_id, len(audio_bytes), suffix)
@@ -111,7 +180,11 @@ class VoicePipeline:
         tts_chunk_count = 0
 
         try:
-            async for token in self.llm.stream_reply(transcript, chat_history=chat_history):
+            async for token in self.llm.stream_reply(
+                transcript,
+                chat_history=chat_history,
+                tool_calls_callback=tool_calls_callback,
+            ):
                 full_reply += token
                 llm_token_count += 1
                 if llm_token_count <= 5 or llm_token_count % 50 == 0:
@@ -130,8 +203,11 @@ class VoicePipeline:
                 )
 
                 for segment in flushable_segments:
+                    cleaned_segment = self._clean_for_tts(segment)
+                    if not cleaned_segment:
+                        continue
                     async for msg, chunk_bytes in self._stream_tts_segments(
-                        [segment], voice_model_path, stt_result.language_tag, request_id, False
+                        [cleaned_segment], voice_model_path, stt_result.language_tag, request_id, False
                     ):
                         tts_chunk_count += 1
                         logger.info(
@@ -154,6 +230,9 @@ class VoicePipeline:
                 final_segments, _ = self._extract_flushable_segments(tts_pending_text, keep_last_complete=False)
                 if not final_segments and tts_pending_text.strip():
                     final_segments = [tts_pending_text.strip()]
+
+                final_segments = [self._clean_for_tts(seg) for seg in final_segments]
+                final_segments = [seg for seg in final_segments if seg]
 
                 if final_segments:
                     async for msg, chunk_bytes in self._stream_tts_segments(

@@ -5,6 +5,9 @@ import { useRecorder } from "./hooks/useRecorder";
 import StatusPanel from "./components/StatusPanel";
 import ChatHistory from "./components/ChatHistory";
 import TranscriptCards from "./components/TranscriptCards";
+import ReportImageGallery from "./components/ReportImageGallery";
+import DebugPanel from "./components/DebugPanel";
+import ImageAnnotator from "./components/ImageAnnotator";
 
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws";
 const STATUS_URL = WS_URL.replace("ws://", "http://").replace("wss://", "https://").replace(/\/ws$/, "/status");
@@ -37,6 +40,8 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState([]);
   const [status, setStatus] = useState("Hold Space to talk");
   const [runtime, setRuntime] = useState(INITIAL_RUNTIME);
+  const [toolCalls, setToolCalls] = useState([]);
+  const [toolRouterRaw, setToolRouterRaw] = useState(null);
 
   // Coordination refs shared across callbacks
   const isSpacePressedRef = useRef(false);
@@ -150,6 +155,20 @@ export default function App() {
         return;
       }
 
+      if (msg.type === "tool_calls") {
+        const requestId = msg.request_id || currentRequestIdRef.current || `${Date.now()}`;
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          setToolCalls((prev) => [
+            ...prev,
+            { requestId, calls: msg.tool_calls || [] },
+          ]);
+        }
+        if (msg.tool_router_raw) {
+          setToolRouterRaw({ requestId, raw: msg.tool_router_raw });
+        }
+        return;
+      }
+
       if (msg.type === "llm_token") {
         const requestId = msg.request_id || currentRequestIdRef.current;
         if (requestId && interruptedRequestIdsRef.current.has(requestId)) {
@@ -256,6 +275,8 @@ export default function App() {
     setUserEmotion("neutral");
     setAssistantText("");
     setChatHistory([]);
+    setToolCalls([]);
+    setToolRouterRaw(null);
     setStatus("Context cleared. Hold Space to talk");
     stopAllAudio();
     pendingSpeechRef.current = "";
@@ -373,7 +394,7 @@ export default function App() {
     <div className="app-shell">
       <header className="hero">
         <div className="hero-top">
-          <p className="eyebrow">Local Realtime Voice Chatbot</p>
+          <p className="eyebrow">Hong Kong MTR Inspection Robot</p>
           <button
             type="button"
             className="clear-context-btn"
@@ -383,7 +404,7 @@ export default function App() {
             Clear LLM Context
           </button>
         </div>
-        <h1>{`SenseVoice + ${runtime.configured_model || "LLM"} + Piper`}</h1>
+        <h1>{`MTR-Insight · ${runtime.configured_model || "LLM"} Voice Assistant`}</h1>
         <p className="status">{status}</p>
         <div className={`ptt ${isRecording ? "active" : ""}`}>
           <div className="ptt-button">
@@ -402,6 +423,9 @@ export default function App() {
           userEmotion={userEmotion}
         />
         <ChatHistory chatHistory={chatHistory} />
+        <ImageAnnotator disabled={socketState !== "connected"} />
+        <DebugPanel toolCalls={toolCalls} toolRouterRaw={toolRouterRaw} />
+        <ReportImageGallery />
       </main>
 
       <footer className="footer">WebSocket: {socketState}</footer>

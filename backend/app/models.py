@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -30,3 +30,16 @@ class ServerMessage(BaseModel):
     tts_voice_id: Optional[str] = None
     tts_voice_reason: Optional[str] = None
     tts_text_language: Optional[str] = None
+    tool_calls: Optional[list[dict[str, object]]] = None
+    tool_router_raw: Optional[dict[str, object]] = None
+
+
+class ImageAnnotationRequest(BaseModel):
+    question: str = "What anomalies are in this image?"
+
+
+class ImageAnnotationResponse(BaseModel):
+    description: str
+    annotated_image_base64: str
+    mime_type: str = "image/png"
+    annotations: list[dict[str, Any]] = Field(default_factory=list)
