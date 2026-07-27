@@ -10,6 +10,24 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Simple alias map used by heuristics in select_tool to detect category mentions.
+_CATEGORY_ALIASES: dict[str, str] = {
+    "advertisement board": "Advertisement Board",
+    "ad board": "Advertisement Board",
+    "adboard": "Advertisement Board",
+    "poster": "Advertisement Board",
+    "billboard": "Advertisement Board",
+    "exit sign": "Exit Sign",
+    "exit": "Exit Sign",
+    "light": "Lights",
+    "lights": "Lights",
+    "map": "Map",
+    "tv": "TV",
+    "television": "TV",
+    "ticket gate": "Ticket Gate",
+    "gate": "Ticket Gate",
+}
+
 # Tool definitions used by the LLM router. These map to InspectionDBClient methods.
 TOOLS: list[dict[str, Any]] = [
     {
@@ -841,22 +859,7 @@ Plan:
             if track_match:
                 args["track_id"] = int(track_match.group(1))
             else:
-                for alias, canonical in {
-                    "advertisement board": "Advertisement Board",
-                    "ad board": "Advertisement Board",
-                    "adboard": "Advertisement Board",
-                    "poster": "Advertisement Board",
-                    "billboard": "Advertisement Board",
-                    "exit sign": "Exit Sign",
-                    "exit": "Exit Sign",
-                    "light": "Lights",
-                    "lights": "Lights",
-                    "map": "Map",
-                    "tv": "TV",
-                    "television": "TV",
-                    "ticket gate": "Ticket Gate",
-                    "gate": "Ticket Gate",
-                }.items():
+                for alias, canonical in _CATEGORY_ALIASES.items():
                     if alias in q:
                         args["category"] = canonical
                         break
@@ -882,15 +885,25 @@ Plan:
             "state change", "state changes", "defect", "defects", "damage", "damaged",
         )
         if any(kw in q for kw in anomaly_keywords):
-            logger.info("Forcing get_report_summary for anomaly query: %r", query)
-            self.last_raw_response = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"function": {"name": "get_report_summary", "arguments": {}}}
-                ],
-            }
-            return [("get_report_summary", {})]
+            # If the user is asking about anomalies on a specific image, track, or category,
+            # let the LLM choose annotate_image instead of forcing the generic report.
+            has_image_target = (
+                "image" in q or "images" in q or "picture" in q or "pictures" in q
+                or "frame" in q or "frames" in q or "photo" in q or "photos" in q
+                or re.search(r"(/[^\s]+\.(?:jpg|jpeg|png))", q, re.IGNORECASE) is not None
+            )
+            has_track_target = re.search(r"(?:track|object)\s*#?\s*(\d+)", q) is not None
+            has_category_target = any(alias in q for alias in _CATEGORY_ALIASES)
+            if not (has_image_target or has_track_target or has_category_target):
+                logger.info("Forcing get_report_summary for anomaly query: %r", query)
+                self.last_raw_response = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_report_summary", "arguments": {}}}
+                    ],
+                }
+                return [("get_report_summary", {})]
 
         payload = {
             "model": self.settings.tool_router_model,
