@@ -8,6 +8,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.config import Settings
 from app.services.tool_router import ToolRouter
@@ -1222,6 +1223,10 @@ class InspectionDBClient:
         image_url = str(image_url).strip()
         if not image_url:
             return None
+
+        # Strip scheme/host if a full URL was pasted (e.g. http://localhost:8000/inspection/images/...).
+        if image_url.startswith("http://") or image_url.startswith("https://"):
+            image_url = urlparse(image_url).path
 
         # URL prefixes served by the backend.
         if image_url.startswith("/inspection/images/"):

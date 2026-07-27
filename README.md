@@ -633,6 +633,89 @@ Tools: get_category_windows(["Ticket Gate"]) + get_category_objects_coordinates(
 Response: "Ticket gates were first detected at 16:51:27 and last seen at 16:53:46... Their coordinates range from ... There are 45 lights within 2m of ticket gates."
 ```
 
+### Cross-source (DB + reports)
+```
+User: "Were there any anomalies near the ticket gates?"
+Tools: get_report_summary + get_category_proximity(target_category="Ticket Gate", other_categories=["Lights", "Advertisement Board", ...])
+Router: The tool router detects "anomalies" → forces get_report_summary, and also "ticket gates" + "near" → adds get_category_proximity.
+LLM injects: Report context: "Found cracks in wall panels near gate 3..." + Proximity data: "45 lights and 12 ad boards within 2m of ticket gates."
+Response: "The inspection report found cracks in the wall panels near gate 3. Around the ticket gate area specifically, there are 45 lights and 12 advertisement boards within 2 meters — none of which showed anomalies themselves, but the cracked panel was right next to Track 218."
+```
+
+```
+User: "What's the summary of detected objects and are there any defects in the report?"
+Tools: get_summary + get_report_summary
+Router: Calls get_summary for the object overview and get_report_summary because "defects" is an anomaly keyword.
+Response: "We found 345 objects total — 235 lights, 53 advertisement boards, 29 ticket gates, and smaller counts of maps, TVs, and exit signs. As for defects, the inspection report notes cracks in 3 wall panels near the advertisement boards on the east concourse and one loose cable near track 5."
+```
+
+```
+User: "Tell me about the largest objects and whether any of them had issues"
+Tools: get_top_objects(n=5) + get_report_summary
+Response: "The largest object was Track 383 (TV) with 15,321 points over 105 observations. Looking at the report, none of the top 5 objects had anomalies directly associated with them, but the report does mention general issues with wall cracks and loose cabling elsewhere in the station."
+```
+
+```
+User: "Show me images of the objects that had anomalies"
+Tools: get_report_summary → (report text mentions specific tracks or image filenames) + get_object_image_paths(track_id=...) for each
+Note: The tool router calls get_report_summary. The main LLM reads the report context (which lists anomaly images like img-003.jpg and img-007.jpg) and answers using the anomaly image URLs from the report context.
+Response: "The anomalies were found in these inspection frames: ![anomaly](/reports/images/img-003.jpg) ![anomaly](/reports/images/img-007.jpg). These show cracks on the east wall panel and a loose cable near the track bed."
+```
+
+### Image annotation (via tool router)
+The `annotate_image` tool lets the voice assistant itself request a vision-model analysis. When the router selects this tool, the backend fetches a frame from the inspection image directory, sends it to the Ollama vision model, draws annotations on it, and returns the annotated image as a markdown link.
+
+```
+User: "Highlight any cracks on the image of track 218"
+Tools: get_object_image_paths(track_id=218) → (resolves first frame URL) → annotate_image(image_url="/inspection/images/1781167925584555000.jpg", question="Highlight any cracks")
+Response: "I analyzed the frame for track 218 and highlighted the areas with cracks: ![annotated](/annotated/images/a1b2c3d4.png). The vision model found a crack running along the left edge of the panel near the ticket gate."
+```
+
+```
+User: "Can you circle the anomaly on an advertisement board image?"
+Tools: annotate_image(category="Advertisement Board", question="Circle the anomaly on this advertisement board")
+Router picks a random sample image of an advertisement board, then calls annotate_image.
+Response: "Here's a sample advertisement board frame with the anomaly circled: ![annotated](/annotated/images/e5f6g7h8.png). There appears to be a torn poster in the upper right corner of the advertisement board."
+```
+
+```
+User: "Draw boxes around all the defects in the inspection report images"
+Tools: get_report_summary → (reads img-003.jpg and img-007.jpg from report images) → annotate_image(image_url="/reports/images/img-003.jpg", question="Draw boxes around all defects") + annotate_image(image_url="/reports/images/img-007.jpg", question="Draw boxes around all defects")
+Response: "I analyzed the anomaly images from the report. In the first frame: ![annotated](/annotated/images/b2c3d4e5.png) — a box around the wall crack on the left panel. In the second frame: ![annotated](/annotated/images/f6g7h8i9.png) — a box around the loose cable near the bottom."
+```
+
+```
+User: "Mark what's wrong with this image and tell me if that area was near anything else detected"
+Tools: annotate_image(image_url="/inspection/images/1781168192465731000.jpg", question="Mark what's wrong") + get_objects_near_position(x=-18.22, y=32.17, z=-6.85, radius_m=3.0)
+Note: The annotate_image tool returns coordinates of the anomaly. The main LLM can use those coordinates to construct a proximity query, or the router plans both tools together.
+Response: "I found a cracked panel in this frame: ![annotated](/annotated/images/j0k1l2m3.png). That location is about 2.1 meters from Track 218 (a Ticket Gate) and there are 3 lights within 3 meters of the crack site."
+```
+
+### Multi-hop temporal + spatial + cross-category
+```
+User: "Walk me through what happened at 4:51 PM — which objects were seen, where they were, and which ones were near each other"
+Tools: get_objects_in_temporal_cluster(center_time="16:51:45", window_ms=5000) + get_category_proximity(target_category="Lights", other_categories=["Advertisement Board", "Ticket Gate", "Map", "TV", "Exit Sign"])
+Router: Identifies "at 4:51 PM" as a temporal cluster query and "near each other" as a proximity query.
+Response: "At around 4:51 PM, there was a cluster of 106 lights and 35 advertisement boards. The lights were concentrated along the main concourse between x: -20 to -10 and y: 30 to 45. Near those lights, there were 12 advertisement boards within 2 meters and the first ticket gate appeared around 4:51:27. It looks like the robot was passing through the main ticketing hall at that time."
+```
+
+```
+User: "Compare the Lights and Ticket Gates — when were each first seen, how many are there, what area do they cover, and are there any anomalies near them?"
+Tools: get_category_windows(categories=["Lights", "Ticket Gate"]) + get_objects_by_category(category="Lights") + get_objects_by_category(category="Ticket Gate") + get_category_bounding_box(category="Lights") + get_category_bounding_box(category="Ticket Gate") + get_report_summary
+Router: Unpacks "compare" → windows + counts, "area" → bounding boxes, "anomalies near them" → report.
+Response: "Lights were first seen at 16:50:40 and last at 16:53:46 — 235 in total — spread across the full concourse from x: -25 to -5 and y: 20 to 50. Ticket Gates appeared later at 16:51:27 through 16:53:46 — 29 gates — concentrated at x: -18 to -15 and y: 30 to 45. The inspection report does not mention anomalies near either category, but the walls near the lights at the east end had some cracks noted."
+```
+
+### Full inspection debrief
+```
+User: "Give me a complete debrief of this inspection run — what was detected, what were the busiest moments, what anomalies were found, and show me the relevant images"
+Tools: get_summary + get_temporal_clusters(window_ms=500, top_n=5) + get_report_summary
+Router: Identifies "debrief" as needing summary + clusters + report.
+Response: "Here's the full inspection debrief. We detected 345 objects across 6 categories over an 8.5-minute run starting at 16:50. The busiest moment was at 4:51 PM when 106 lights were seen in under a second as the robot entered the main hall. As for anomalies, the report flags 5 frames showing wall cracks, a torn advertisement poster, and a loose cable near the track bed.
+Anomaly images: ![anomaly](/reports/images/img-003.jpg) ![anomaly](/reports/images/img-007.jpg)
+Sample frames from the busiest moment: ![frame](/inspection/images/1781168192465731000.jpg)"
+```
+
 ---
 
 ## Configuration reference
