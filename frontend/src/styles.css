@@ -273,7 +273,7 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 10px;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.92);
   padding: 0;
   cursor: pointer;
   transition: transform 120ms ease, border-color 120ms ease;
@@ -289,6 +289,7 @@ h1 {
   height: 120px;
   object-fit: cover;
   display: block;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .chat-image-thumb {
@@ -296,7 +297,7 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 10px;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.92);
   padding: 0;
   margin: 8px 8px 0 0;
   cursor: pointer;
@@ -314,6 +315,7 @@ h1 {
   height: 100px;
   object-fit: cover;
   display: block;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .debug-panel {
@@ -429,6 +431,7 @@ h1 {
   max-width: 90vw;
   max-height: 90vh;
   border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .annotator-card {
@@ -549,7 +552,7 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 10px;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .annotator-preview-label {
@@ -568,6 +571,7 @@ h1 {
   object-fit: contain;
   border-radius: 8px;
   display: block;
+  background: rgba(255, 255, 255, 0.92);
 }
 
 .annotator-image-button {
