@@ -14,6 +14,7 @@ from app.models import ServerMessage
 from app.services.db_service import InspectionDBClient
 from app.services.llm_service import LocalLLM
 from app.services.report_service import InspectionReportClient
+from app.services.rerun_service import RerunVisualizer
 from app.services.stt_service import STTResult, build_stt
 from app.services.tool_router import ToolRouter
 from app.services.tts_service import PiperTTS
@@ -35,11 +36,13 @@ class VoicePipeline:
             if db_path.exists():
                 router = ToolRouter(settings) if settings.tool_router_enabled else None
                 vision_annotator = VisionAnnotator(settings)
+                rerun_visualizer = RerunVisualizer(settings) if settings.rerun_enabled else None
                 db_client = InspectionDBClient(
                     db_path,
                     router=router,
                     settings=settings,
                     vision_annotator=vision_annotator,
+                    rerun_visualizer=rerun_visualizer,
                 )
             else:
                 logger.warning("Inspection DB not found at %s; DB lookups disabled", db_path)

@@ -66,14 +66,37 @@ class Settings(BaseSettings):
     whisper_vad_filter: bool = True  # Silero VAD trims silence/noise before transcription
     whisper_download_root: str = "./models/whisper-cache"  # CTranslate2 model cache dir
 
-    # Inspection SQLite database (MTR object grounding results)
-    inspection_db_path: str = "/home/wangyiming/code/object_detection_app/output/inspection_mtr.db"
+    # Inspection SQLite database (MTR object grounding results).
+    # New multi-inspection schema: categories / inspections / images / objects / detections
+    # (plus anomaly_types / abnormal_detections / abnormalities, added by the writer later).
+    # Relative paths resolve against the backend/ root (see model_post_init).
+    inspection_db_path: str = "../MTR_Database/inspection_v2.db"
 
     # Inspection anomaly reports (text + PDF summaries)
     reports_dir: str = "../reports"
 
-    # Source camera images referenced by observations.image_path
-    inspection_image_dir: str = "/home/wangyiming/code/object_detection_app/Datasets/MTR/rosbags/2026-06-11_16-50-08_rosbag/camera/right"
+    # Source camera images referenced by images.filename (served at /inspection/images).
+    inspection_image_dir: str = "../MTR_Database/outputs/images"
+
+    # Rerun 3D visualization. The chatbot pushes highlighted coordinates/objects to a
+    # separately-running Rerun viewer (start it with `rerun`) over TCP. Disabled or
+    # unreachable viewers degrade to a friendly status string, never a failed turn.
+    rerun_enabled: bool = True
+    rerun_viewer_addr: str = "127.0.0.1:9876"
+    # Rerun application id. Matches the grounding pipeline's rerun_bridge_node
+    # (inspection_grounding_rerun) so highlights share the grounding scene's recording
+    # space and coordinate frame.
+    rerun_app_id: str = "inspection_grounding_rerun"
+    # Leveling rotation [roll, pitch, yaw] in degrees, mirroring the grounding pipeline's
+    # rerun_bridge_node `leveling_rpy_deg` param. The DB stores object centroids/bboxes in
+    # the tilted camera_init frame; pre-rotating by this matrix lands them level on the
+    # grounding map (same convention the bridge uses for world/bboxes3d). "0.0,20.0,0.0"
+    # matches the 2026-06-11 inspection run.
+    rerun_leveling_rpy_deg: str = "0.0,20.0,0.0"
+    # If true, the backend auto-launches a Rerun viewer (rr.spawn) the first time it has
+    # something to visualize and no viewer is reachable on RERUN_VIEWER_ADDR. Set false to
+    # require a manually-started `rerun` viewer (the earlier "connect to running viewer" mode).
+    rerun_auto_spawn: bool = True
 
     # Cache directory for vision-annotated images served under /annotated/images
     annotated_image_cache_dir: str = "./annotated_images"
@@ -101,6 +124,8 @@ class Settings(BaseSettings):
         self.sensevoice_model_dir = self._resolve_backend_path(self.sensevoice_model_dir)
         self.whisper_download_root = self._resolve_backend_path(self.whisper_download_root)
         self.reports_dir = self._resolve_backend_path(self.reports_dir)
+        self.inspection_db_path = self._resolve_backend_path(self.inspection_db_path)
+        self.inspection_image_dir = self._resolve_backend_path(self.inspection_image_dir)
         self.annotated_image_cache_dir = self._resolve_backend_path(self.annotated_image_cache_dir)
         self.piper_exe_path = self._resolve_backend_path(self.piper_exe_path)
         self.piper_voices_dir = self._resolve_backend_path(self.piper_voices_dir)

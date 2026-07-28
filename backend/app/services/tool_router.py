@@ -11,7 +11,7 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Simple alias map used by heuristics in select_tool to detect category mentions.
+# Simple alias map used by the annotation safety-net fallback to detect category mentions.
 _CATEGORY_ALIASES: dict[str, str] = {
     "advertisement board": "Advertisement Board",
     "ad board": "Advertisement Board",
@@ -29,378 +29,355 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "gate": "Ticket Gate",
 }
 
+# Optional ``inspection_id`` argument, reused by every tool that can be scoped to one
+# inspection. The database can hold multiple inspections; pass it when the user names a
+# specific inspection, otherwise omit it to query across all inspections.
+_INSPECTION_ID_ARG = {
+    "inspection_id": {
+        "type": "integer",
+        "description": (
+            "Optional: scope the query to a single inspection id. Omit to query across "
+            "all inspections. Use get_inspections first if you do not know the id."
+        ),
+    }
+}
+
+
+def _params(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    """Build a tool parameter schema, merging in the optional inspection_id argument."""
+    props = {**properties, **_INSPECTION_ID_ARG}
+    return {"type": "object", "properties": props, "required": required or []}
+
+
 # Tool definitions used by the LLM router. These map to InspectionDBClient methods.
 TOOLS: list[dict[str, Any]] = [
     {
-        "name": "get_summary",
-        "description": "Overall object counts and category breakdown for the inspection database. Use ONLY for generic inspection-wide summaries such as 'what did you find' or 'how many objects overall'. Do NOT use for category-specific summaries; use run_sql_query with GROUP BY category instead.",
+        "name": "get_inspections",
+        "description": "List every inspection in the database with its id, start time, ground-truth flag, and object/detection counts. Call this first when the user mentions a specific inspection or when you need an inspection_id for another tool.",
         "parameters": {"type": "object", "properties": {}},
     },
     {
-        "name": "get_object_by_track_id",
-        "description": "Detailed information, timeline, and image links for a single object by its track ID.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_id": {"type": "integer", "description": "The numeric track/object ID, e.g. 5."}
-            },
-            "required": ["track_id"],
-        },
+        "name": "get_summary",
+        "description": "Overall object counts and category breakdown. Use ONLY for generic inspection-wide summaries such as 'what did you find' or 'how many objects overall'. Do NOT use for category-specific summaries; use run_sql_query with GROUP BY category instead.",
+        "parameters": _params({}),
+    },
+    {
+        "name": "get_categories",
+        "description": "Return the list of distinct object categories in the database. Use this when you need to know what categories exist before writing a SQL query.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_object_by_id",
+        "description": "Detailed information, timeline, and image links for a single object by its object id (the id column of the objects table).",
+        "parameters": _params(
+            {"object_id": {"type": "integer", "description": "The numeric object id, e.g. 9."}},
+            required=["object_id"],
+        ),
     },
     {
         "name": "get_objects_by_category",
         "description": "List objects belonging to a category such as Lights, Advertisement Board, or Ticket Gate.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Category name, e.g. Lights, Advertisement Board, Ticket Gate.",
-                },
+        "parameters": _params(
+            {
+                "category": {"type": "string", "description": "Category name, e.g. Lights, Advertisement Board, Ticket Gate."},
                 "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 10},
             },
-            "required": ["category"],
-        },
+            required=["category"],
+        ),
     },
     {
         "name": "get_top_objects",
-        "description": "The largest objects by total point count.",
-        "parameters": {
-            "type": "object",
-            "properties": {"n": {"type": "integer", "description": "Number of objects to return.", "default": 5}},
-        },
+        "description": "The objects with the most detections (most frequently detected).",
+        "parameters": _params({"n": {"type": "integer", "description": "Number of objects to return.", "default": 5}}),
     },
     {
         "name": "get_recent_objects",
-        "description": "The most recently seen objects.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "description": "Number of objects to return.", "default": 5}
-            },
-        },
+        "description": "The most recently seen objects (by last detection timestamp).",
+        "parameters": _params({"limit": {"type": "integer", "description": "Number of objects to return.", "default": 5}}),
     },
     {
         "name": "get_object_timeline",
-        "description": "A temporal story for a single track: first/last seen times, duration, and key moments.",
-        "parameters": {
-            "type": "object",
-            "properties": {"track_id": {"type": "integer", "description": "The numeric track/object ID."}},
-            "required": ["track_id"],
-        },
+        "description": "A temporal story for a single object: first/last seen times, duration, and key moments across its detections.",
+        "parameters": _params(
+            {"object_id": {"type": "integer", "description": "The numeric object id."}},
+            required=["object_id"],
+        ),
     },
     {
         "name": "get_object_image_paths",
-        "description": "Markdown image links for the frames captured for a single track.",
-        "parameters": {
-            "type": "object",
-            "properties": {"track_id": {"type": "integer", "description": "The numeric track/object ID."}},
-            "required": ["track_id"],
-        },
+        "description": "Markdown image links for the frames an object was detected in.",
+        "parameters": _params(
+            {"object_id": {"type": "integer", "description": "The numeric object id."}},
+            required=["object_id"],
+        ),
     },
     {
         "name": "get_category_timeline",
         "description": "First/last seen timestamps for every object in a category.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Category name, e.g. Lights, Advertisement Board.",
-                }
-            },
-            "required": ["category"],
-        },
+        "parameters": _params(
+            {"category": {"type": "string", "description": "Category name, e.g. Lights, Advertisement Board."}},
+            required=["category"],
+        ),
     },
     {
         "name": "get_category_windows",
         "description": "First/last detection windows for one or more categories. Use this when the user asks about multiple categories at once or wants to compare when categories were detected.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "categories": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of category names, e.g. [\"Lights\", \"Ticket Gate\"].",
-                }
-            },
-            "required": ["categories"],
-        },
+        "parameters": _params(
+            {"categories": {"type": "array", "items": {"type": "string"}, "description": "List of category names, e.g. [\"Lights\", \"Ticket Gate\"]."}},
+            required=["categories"],
+        ),
     },
     {
         "name": "get_category_objects_coordinates",
         "description": "The centroid and 3D bounding-box coordinates for every object in a category, ordered by first appearance. Use this when the user asks for X, Y, Z positions or coordinates.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Category name, e.g. Ticket Gate.",
-                }
-            },
-            "required": ["category"],
-        },
+        "parameters": _params(
+            {"category": {"type": "string", "description": "Category name, e.g. Ticket Gate."}},
+            required=["category"],
+        ),
     },
     {
         "name": "get_category_objects_with_images",
-        "description": "Track IDs, coordinates, and sample image frames for objects in a category. Use this when the user asks to see objects WITH their images, e.g. 'show me exit signs with track IDs, coordinates, and images'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Category name, e.g. Exit Sign.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum objects to return.",
-                    "default": 5,
-                },
+        "description": "Object ids, coordinates, and sample image frames for objects in a category. Use this when the user asks to see objects WITH their images, e.g. 'show me exit signs with object ids, coordinates, and images'.",
+        "parameters": _params(
+            {
+                "category": {"type": "string", "description": "Category name, e.g. Exit Sign."},
+                "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 5},
             },
-            "required": ["category"],
-        },
+            required=["category"],
+        ),
     },
     {
         "name": "get_category_proximity",
         "description": "Counts how many objects from other categories are near objects in a target category. Use this when the user asks whether one category is close to another.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "target_category": {
-                    "type": "string",
-                    "description": "Category whose objects are the reference points, e.g. Ticket Gate.",
-                },
-                "other_categories": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Categories to measure distance to, e.g. [\"Advertisement Board\", \"Lights\"].",
-                },
-                "radius_m": {
-                    "type": "number",
-                    "description": "Search radius in meters around each target object centroid.",
-                    "default": 2.0,
-                },
+        "parameters": _params(
+            {
+                "target_category": {"type": "string", "description": "Category whose objects are the reference points, e.g. Ticket Gate."},
+                "other_categories": {"type": "array", "items": {"type": "string"}, "description": "Categories to measure distance to, e.g. [\"Advertisement Board\", \"Lights\"]."},
+                "radius_m": {"type": "number", "description": "Search radius in meters around each target object centroid.", "default": 2.0},
             },
-            "required": ["target_category", "other_categories"],
-        },
+            required=["target_category", "other_categories"],
+        ),
     },
     {
         "name": "get_inspection_timeline",
-        "description": "Full chronological log of every object detected during the inspection.",
-        "parameters": {"type": "object", "properties": {}},
+        "description": "Full chronological log of every object detected during the inspection (or one inspection when inspection_id is given).",
+        "parameters": _params({}),
     },
     {
         "name": "get_temporal_clusters",
         "description": "Time-window clusters showing which objects were seen together (e.g. 10 x Lights and 5 x Advertisement Board at the same moment).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "window_ms": {
-                    "type": "integer",
-                    "description": "Milliseconds within which observations are considered part of the same cluster.",
-                    "default": 500,
-                },
+        "parameters": _params(
+            {
+                "window_ms": {"type": "integer", "description": "Milliseconds within which detections are considered part of the same cluster.", "default": 500},
                 "top_n": {"type": "integer", "description": "Number of top clusters to return.", "default": 10},
-            },
-        },
+            }
+        ),
     },
     {
-        "name": "get_report_summary",
-        "description": "Fetch the inspection report text, including anomaly findings, issues, state changes, and recommendations. Use this when the user asks about anomalies, findings, problems, or what was wrong during the inspection.",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_observation_counts_by_category",
-        "description": "Per-frame observation counts by category (how many times each category was detected). Use when the user asks about detections, observations, or distinguishes 'how many times was it seen' from 'how many distinct objects exist'.",
-        "parameters": {"type": "object", "properties": {}},
+        "name": "get_detection_counts_by_category",
+        "description": "Per-frame detection counts by category (how many times each category was detected). Use when the user asks about detections and distinguishes 'how many times was it seen' from 'how many distinct objects exist'.",
+        "parameters": _params({}),
     },
     {
         "name": "get_objects_in_time_range",
         "description": "Objects whose detection span overlaps a time window. start_time and end_time can be ISO timestamps, clock times such as '16:51:45', or nanosecond integers. Use for 'what happened between X and Y' questions.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start_time": {
-                    "type": "string",
-                    "description": "Start time as ISO datetime, clock time (e.g. '16:51:45'), or ns integer.",
-                },
-                "end_time": {
-                    "type": "string",
-                    "description": "End time as ISO datetime, clock time, or ns integer.",
-                },
+        "parameters": _params(
+            {
+                "start_time": {"type": "string", "description": "Start time as ISO datetime, clock time (e.g. '16:51:45'), or ns integer."},
+                "end_time": {"type": "string", "description": "End time as ISO datetime, clock time, or ns integer."},
                 "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 50},
             },
-            "required": ["start_time", "end_time"],
-        },
+            required=["start_time", "end_time"],
+        ),
     },
     {
-        "name": "get_observations_in_time_range",
-        "description": "Per-frame observations captured within a time window. start_time and end_time can be ISO timestamps, clock times, or nanosecond integers. Use for 'show me detections around X' questions.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "start_time": {
-                    "type": "string",
-                    "description": "Start time as ISO datetime, clock time, or ns integer.",
-                },
-                "end_time": {
-                    "type": "string",
-                    "description": "End time as ISO datetime, clock time, or ns integer.",
-                },
-                "limit": {"type": "integer", "description": "Maximum observations to return.", "default": 50},
+        "name": "get_detections_in_time_range",
+        "description": "Per-frame detections captured within a time window. start_time and end_time can be ISO timestamps, clock times, or nanosecond integers. Use for 'show me detections around X' questions.",
+        "parameters": _params(
+            {
+                "start_time": {"type": "string", "description": "Start time as ISO datetime, clock time, or ns integer."},
+                "end_time": {"type": "string", "description": "End time as ISO datetime, clock time, or ns integer."},
+                "limit": {"type": "integer", "description": "Maximum detections to return.", "default": 50},
             },
-            "required": ["start_time", "end_time"],
-        },
+            required=["start_time", "end_time"],
+        ),
     },
     {
         "name": "get_objects_near_position",
         "description": "Find objects whose centroid is within radius_m of a 3D point. Use when the user gives a coordinate or asks 'what is near (x, y, z)' or 'what did the camera see 2 meters from here'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "x": {"type": "number", "description": "X coordinate of the search point."},
                 "y": {"type": "number", "description": "Y coordinate of the search point."},
                 "z": {"type": "number", "description": "Z coordinate of the search point."},
                 "radius_m": {"type": "number", "description": "Search radius in meters.", "default": 2.0},
-                "category": {
-                    "type": "string",
-                    "description": "Optional category filter, e.g. 'Lights'.",
-                },
+                "category": {"type": "string", "description": "Optional category filter, e.g. 'Lights'."},
             },
-            "required": ["x", "y", "z"],
-        },
+            required=["x", "y", "z"],
+        ),
     },
     {
         "name": "get_category_sample_images",
         "description": "Return a few example image links for a category. Use when the user asks to see examples of a category such as 'show me some advertisement boards'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "category": {"type": "string", "description": "Category name, e.g. Advertisement Board."},
                 "limit": {"type": "integer", "description": "Number of sample images.", "default": 5},
             },
-            "required": ["category"],
-        },
+            required=["category"],
+        ),
     },
     {
         "name": "get_inspection_poses",
-        "description": "Camera/robot poses recorded during the inspection (one per image). Exposes the inspection_poses table.",
-        "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Maximum poses to return.", "default": 20}}},
-    },
-    {
-        "name": "get_filtered_objects",
-        "description": "Objects or tracks that were filtered out by the merge layer and the reason they were dropped. Exposes the filtered_objects audit table.",
-        "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "description": "Maximum rows to return.", "default": 50}}},
+        "description": "Camera/robot poses recorded during the inspection (one per image, stored on the images table). Exposes the tf_translation / tf_rotation columns.",
+        "parameters": _params({"limit": {"type": "integer", "description": "Maximum poses to return.", "default": 20}}),
     },
     {
         "name": "get_object_distance",
-        "description": "Distance in meters between the centroids of two track IDs. Use when the user asks 'how far apart are track X and track Y'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_id_a": {"type": "integer"},
-                "track_id_b": {"type": "integer"},
+        "description": "Distance in meters between the centroids of two object ids. Use when the user asks 'how far apart are object X and object Y'.",
+        "parameters": _params(
+            {
+                "object_id_a": {"type": "integer"},
+                "object_id_b": {"type": "integer"},
             },
-            "required": ["track_id_a", "track_id_b"],
-        },
+            required=["object_id_a", "object_id_b"],
+        ),
     },
     {
         "name": "get_category_bounding_box",
-        "description": "Axis-aligned 3D bounding box of all objects in a category (centroid and bbox3d min/max). Use when the user asks for the spatial extent or area a category occupies.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "category": {"type": "string", "description": "Category name, e.g. Ticket Gate."}
-            },
-            "required": ["category"],
-        },
+        "description": "Axis-aligned 3D bounding box of all objects in a category (centroid and bbox min/max). Use when the user asks for the spatial extent or area a category occupies.",
+        "parameters": _params(
+            {"category": {"type": "string", "description": "Category name, e.g. Ticket Gate."}},
+            required=["category"],
+        ),
     },
     {
-        "name": "get_category_observation_timeline",
-        "description": "Per-time-bucket observation counts for a category. Use for 'when were most X seen', 'busiest minute for X', or category activity over time.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "name": "get_category_detection_timeline",
+        "description": "Per-time-bucket detection counts for a category. Use for 'when were most X seen', 'busiest minute for X', or category activity over time.",
+        "parameters": _params(
+            {
                 "category": {"type": "string", "description": "Category name, e.g. Lights."},
                 "bucket_seconds": {"type": "integer", "description": "Bucket size in seconds.", "default": 60},
             },
-            "required": ["category"],
-        },
+            required=["category"],
+        ),
     },
     {
         "name": "get_objects_by_category_in_time_range",
         "description": "Objects of a specific category whose detection span overlaps a time window. Use for 'were there any ticket gates after 4:53' or 'lights between X and Y'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "category": {"type": "string", "description": "Category name."},
                 "start_time": {"type": "string", "description": "Start time as ISO, clock time, or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO, clock time, or ns integer."},
                 "limit": {"type": "integer", "default": 50},
             },
-            "required": ["category", "start_time", "end_time"],
-        },
+            required=["category", "start_time", "end_time"],
+        ),
     },
     {
         "name": "get_object_movement",
-        "description": "Centroid path of a single track across its observations. Use when the user asks if a track moved, its trajectory, or path.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_id": {"type": "integer"},
-            },
-            "required": ["track_id"],
-        },
+        "description": "Centroid path of a single object across its detections. Use when the user asks if an object moved, its trajectory, or path.",
+        "parameters": _params(
+            {"object_id": {"type": "integer"}},
+            required=["object_id"],
+        ),
     },
     {
-        "name": "get_nearest_objects_to_track",
-        "description": "Other objects within radius_m of a specific track's centroid. Use for 'what was near track 218'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_id": {"type": "integer"},
+        "name": "get_nearest_objects_to_object",
+        "description": "Other objects within radius_m of a specific object's centroid. Use for 'what was near object 9'.",
+        "parameters": _params(
+            {
+                "object_id": {"type": "integer"},
                 "radius_m": {"type": "number", "default": 2.0},
             },
-            "required": ["track_id"],
-        },
+            required=["object_id"],
+        ),
     },
     {
         "name": "get_images_in_time_range",
         "description": "Sample images captured within a time window, optionally filtered by category. Use for 'show me what the camera saw at 4:51'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "start_time": {"type": "string", "description": "Start time as ISO, clock time, or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO, clock time, or ns integer."},
                 "category": {"type": "string", "description": "Optional category filter."},
                 "limit": {"type": "integer", "default": 5},
             },
-            "required": ["start_time", "end_time"],
-        },
+            required=["start_time", "end_time"],
+        ),
     },
     {
         "name": "get_category_cooccurrence",
         "description": "Which categories most often appear together in the same temporal cluster. Use for 'which objects are usually seen together'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "window_ms": {"type": "integer", "default": 500},
                 "top_n": {"type": "integer", "default": 10},
-            },
-        },
+            }
+        ),
     },
     {
         "name": "get_objects_in_temporal_cluster",
         "description": "Objects with coordinates detected around a specific time. Use for 'where was the 4:51 PM cluster' or 'what was at time T'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
+        "parameters": _params(
+            {
                 "center_time": {"type": "string", "description": "Cluster center time as ISO, clock time, or ns integer."},
                 "window_ms": {"type": "integer", "default": 500},
                 "limit": {"type": "integer", "default": 50},
             },
-            "required": ["center_time"],
-        },
+            required=["center_time"],
+        ),
+    },
+    {
+        "name": "get_anomaly_types",
+        "description": "List the defined anomaly type names (from the anomaly_types table). Use when the user asks what kinds of anomalies exist.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_anomaly_summary",
+        "description": "Counts of abnormal image pairs and abnormalities grouped by anomaly type, and per inspection. Use for 'how many anomalies were found' or an overview of anomalies.",
+        "parameters": _params({}),
+    },
+    {
+        "name": "get_anomalies",
+        "description": "List individual abnormalities: type, 2D pixel bounding box, note, the ground-truth and inspection image links, and the inspection id. Optional filters: anomaly_type, inspection_id, limit. Use for 'show me the anomalies' or 'what defects were found on the ticket gates'.",
+        "parameters": _params(
+            {
+                "anomaly_type": {"type": "string", "description": "Optional: filter to one anomaly type name."},
+                "limit": {"type": "integer", "default": 50},
+            }
+        ),
+    },
+    {
+        "name": "get_report_summary",
+        "description": "Fetch the inspection report text, including anomaly findings, issues, state changes, and recommendations. Use this when the user asks about the written anomaly report or recommendations. Pair with get_anomalies for the structured abnormalities.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "highlight_in_rerun",
+        "description": "Highlight 3D coordinates or objects in the running Rerun viewer so the user can see where they are in the station. Call this whenever the user asks to visualize, show, highlight, or see WHERE objects/coordinates are, or whenever the answer involves specific coordinates or object ids. Provide object_ids, coordinates, or a category (any combination). The viewer must be running separately (start with `rerun`).",
+        "parameters": _params(
+            {
+                "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
+                "coordinates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "z": {"type": "number"},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["x", "y", "z"],
+                    },
+                    "description": "Raw 3D points to highlight.",
+                },
+                "category": {"type": "string", "description": "Highlight every object in this category."},
+                "label": {"type": "string", "description": "Optional label for this highlight set."},
+            }
+        ),
     },
     {
         "name": "run_sql_query",
@@ -416,38 +393,17 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "annotate_image",
-        "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, track_id, or category. For track_id or category, up to `limit` images are annotated (default 5). Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
+        "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, object_id, or category. For object_id or category, up to `limit` images are annotated (default 5). Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
         "parameters": {
             "type": "object",
             "properties": {
-                "image_url": {
-                    "type": "string",
-                    "description": "URL or path to a single image, e.g. /inspection/images/1781168192465731000.jpg or /reports/extracted_images/img-021.jpg.",
-                },
-                "track_id": {
-                    "type": "integer",
-                    "description": "Numeric track/object ID. All available frames for this track (up to `limit`) will be annotated.",
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Category name. Up to `limit` sample images of this category will be annotated.",
-                },
-                "question": {
-                    "type": "string",
-                    "description": "What to look for or how to annotate. Defaults to the user's original question.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "default": 5,
-                    "description": "Maximum number of images to annotate for a track_id or category. Default 5.",
-                },
+                "image_url": {"type": "string", "description": "URL or path to a single image, e.g. /inspection/images/14.jpg or /reports/extracted_images/img-021.jpg."},
+                "object_id": {"type": "integer", "description": "Numeric object id. All frames this object was detected in (up to `limit`) will be annotated."},
+                "category": {"type": "string", "description": "Category name. Up to `limit` sample images of this category will be annotated."},
+                "question": {"type": "string", "description": "What to look for or how to annotate. Defaults to the user's original question."},
+                "limit": {"type": "integer", "default": 5, "description": "Maximum number of images to annotate for an object_id or category. Default 5."},
             },
         },
-    },
-    {
-        "name": "get_categories",
-        "description": "Return the list of distinct object categories in the database. Use this when you need to know what categories exist before writing a SQL query.",
-        "parameters": {"type": "object", "properties": {}},
     },
     {
         "name": "query_database",
@@ -464,7 +420,6 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 # Reduced tool set for testing a SQL-first, minimal-tool assistant.
-# Old tools remain in TOOLS for backward compatibility but are not exposed to the LLM.
 REDUCED_TOOLS: list[dict[str, Any]] = [
     next(t for t in TOOLS if t["name"] == "get_categories"),
     next(t for t in TOOLS if t["name"] == "query_database"),
@@ -490,9 +445,8 @@ def _ollama_tools() -> list[dict[str, Any]]:
 class ToolRouter:
     """Uses the base LLM to pick inspection database tools via Ollama native tool calling.
 
-    This is the first of two requests to the base model: the model chooses tools,
-    the backend executes them, and then the base model is called again to produce
-    the final answer.
+    This is the first of two requests to the base model: the model chooses tools, the
+    backend executes them, and then the base model is called again to produce the answer.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -500,333 +454,78 @@ class ToolRouter:
         self.last_raw_response: dict[str, Any] | None = None
 
     def _system_prompt(self) -> str:
-        return """\\
+        return """\
 You are a tool planner for an MTR subway station inspection assistant.
 Your ONLY job is to select the right tools from the list below to gather the data needed to answer the user's question.
 Do not answer the user directly. Do not output any text other than the tool calls.
 
-## Database overview
+## Database overview (new multi-inspection schema)
 
-- `objects` table: one aggregated row per distinct tracked object. Columns include `track_id`, `category`, `centroid_x/y/z`, `bbox3d_min/max`, `first_seen_ns`, `last_seen_ns`, `observation_count`, `total_point_count`.
-- `observations` table: one row per per-frame detection. Columns include `timestamp_ns`, `track_id`, `category`, `image_path`, `centroid`, `bbox`, `point_count`.
-- `inspection_poses` table: camera/robot pose per image (currently empty in this dataset).
-- `filtered_objects` table: audit of tracks dropped by the merge/filter layer.
+- `categories` table: `id`, `name`. Known names: Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
+- `inspections` table: `id`, `started_at`, `is_gt`. There can be MULTIPLE inspections. Use get_inspections to list them.
+- `images` table: `id`, `inspection_id`, `timestamp_ns`, `tf_translation_x/y/z`, `tf_rotation_x/y/z/w`, `filename`. Camera pose lives here (there is no separate poses table). `filename` is the on-disk frame name (e.g. `14.jpg`), served at `/inspection/images/<filename>`.
+- `objects` table: `id` (the object id — there is NO track_id), `category_id` (→ categories.name), `centroid_x/y/z`, `min_x/y/z`, `max_x/y/z`, `is_gt`, `created_at`. An object has ONE centroid and 3D bbox; it does NOT have stored first_seen/last_seen or observation_count columns.
+- `detections` table: `id`, `image_id` (→ images), `object_id` (→ objects), `centroid_x/y/z`, `min/max_x/y/z`. One row per per-frame detection. An object's detection count and first/last-seen timestamps are DERIVED by joining detections → images.
+- `anomaly_types` table: `id`, `name`.
+- `abnormal_detections` table: `id`, `gt_image` (→ images.id), `inspection_image` (→ images.id). An abnormal image PAIR (ground truth vs inspection).
+- `abnormalities` table: `id`, `pair` (→ abnormal_detections.id), `type` (→ anomaly_types.id), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
+  NOTE: the anomaly tables may not be populated yet. The anomaly tools will return a clear "not yet populated" message in that case — still call them when the user asks about anomalies.
 
 All timestamps are nanoseconds since epoch. Time tools accept ISO datetimes, clock times such as "16:51:45" or "4:51 PM", or raw nanosecond integers.
 
 Known category names (use these exact strings in arguments):
 Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 
+## Multi-inspection
+
+- The database can hold several inspections. Most tools accept an optional `inspection_id`.
+- When the user names a specific inspection ("inspection 2", "the second inspection", "the ground-truth run"), pass `inspection_id`. If you do not know the id, call get_inspections first.
+- When the user does NOT name an inspection, omit `inspection_id` to query across all inspections. The answerer can still reason across inspections because tool outputs include inspection ids where relevant.
+
 ## Tool reference
 
-1. get_summary
-   - Purpose: high-level overview of the inspection. Use ONLY for generic inspection-wide summaries such as "what did you find" or "how many objects overall". Do NOT use for category-specific summaries.
-   - Args: none.
-   - Output sample:
-       Total aggregated objects: 345
-       Objects by category:
-       - Lights: 235
-       - Advertisement Board: 53
-       - Ticket Gate: 29
-   - Use for: "what did you find", "how many objects overall".
-   - Example: User: "What did the robot detect?" -> get_summary
-
-2. get_observation_counts_by_category
-   - Purpose: per-frame detection counts per category.
-   - Args: none.
-   - Output sample:
-       Per-frame observation counts by category:
-       - Lights: 881
-       - Advertisement Board: 408
-       - Ticket Gate: 147
-   - Use for: "how many times was X seen", "observations", "detections".
-   - Example: User: "How many times were advertisement boards seen?" -> get_observation_counts_by_category
-
-3. get_objects_by_category
-   - Purpose: list example objects in a category.
-   - Args: category (string, required), limit (integer, default 10).
-   - Output sample:
-       Found 10 object(s) in category 'Advertisement Board':
-       - Track 6: 19 observations, 2451 points, centroid (1.55, 19.73, 1.24)
-   - Use for: "tell me about the lights".
-   - Example: User: "Tell me about the ticket gates." -> get_objects_by_category(category="Ticket Gate", limit=10)
-
-4. get_top_objects
-   - Purpose: largest objects by total point count.
-   - Args: n (integer, default 5).
-   - Output sample:
-       Top 5 objects by total point count:
-       - Track 383 (TV): 15321 points, 105 observations
-   - Use for: "largest", "biggest", "most points".
-   - Example: User: "What were the biggest objects?" -> get_top_objects(n=5)
-
-5. get_recent_objects
-   - Purpose: most recently seen objects.
-   - Args: limit (integer, default 5).
-   - Output sample:
-       5 most recently seen object(s):
-       - Track 1455 (Ticket Gate): last seen at 2026-06-11 16:53:46.877
-   - Use for: "what was seen last", "recent objects".
-   - Example: User: "What did the robot see most recently?" -> get_recent_objects(limit=5)
-
-6. get_object_by_track_id
-   - Purpose: details for one specific object.
-   - Args: track_id (integer, required).
-   - Output sample:
-       Track ID: 218
-       Category: Ticket Gate
-       Observations: 12
-       Total points: 1847
-       Centroid: (-18.22, 32.17, -6.85)
-   - Use when the user mentions a track or object ID.
-   - Example: User: "Tell me about track 218." -> get_object_by_track_id(track_id=218)
-
-7. get_object_timeline
-   - Purpose: chronological observations for one track.
-   - Args: track_id (integer, required).
-   - Output sample:
-       Track 218 (Ticket Gate) timeline:
-       - First seen: 2026-06-11 16:51:27.387
-       - Last seen: 2026-06-11 16:51:29.187
-       - Observations: 12
-       - Visible for about 1.8 seconds
-   - Use for: "when was track X seen".
-   - Example: User: "When was track 218 detected?" -> get_object_timeline(track_id=218)
-
-8. get_object_image_paths
-   - Purpose: image links for one track.
-   - Args: track_id (integer, required).
-   - Output sample:
-       Showing 5 of 8 frames for track 218 (Ticket Gate):
-       ![Track 218 frame](/inspection/images/1781167925584555000.jpg)
-   - Use for: "show me images of track X".
-   - Example: User: "Show me images of track 218." -> get_object_image_paths(track_id=218)
-
-9. get_category_timeline
-   - Purpose: first/last seen timestamps for every object in a category.
-   - Args: category (string, required).
-   - Output sample:
-       Timeline for category 'Lights' (235 object(s)):
-       - Track 1: first seen 2026-06-11 16:50:40.790, last seen ..., 4 observations over 1.2 seconds
-   - Use for: "when were the lights detected".
-   - Example: User: "When were the lights first seen?" -> get_category_timeline(category="Lights")
-
-10. get_category_windows
-    - Purpose: first/last detection windows for multiple categories.
-    - Args: categories (list of strings, required).
-    - Output sample:
-        Detection windows for 2 category/categories:
-        - Lights: first seen ..., last seen ..., 235 distinct object(s)
-        - Ticket Gate: first seen ..., last seen ..., 29 distinct object(s)
-    - Use for comparing multiple categories at once.
-    - Example: User: "When were lights and ticket gates detected?" -> get_category_windows(categories=["Lights", "Ticket Gate"])
-
-11. get_category_objects_coordinates
-    - Purpose: centroid and 3D bounding box for every object in a category, ordered by first appearance.
-    - Args: category (string, required).
-    - Output sample:
-        Objects in category 'Ticket Gate' with coordinates (ordered by first appearance):
-        - Track 218: first seen 2026-06-11 16:51:27.387, centroid (-18.22, 32.17, -6.85), bbox3d min ..., max ...
-    - Use ONLY when the user asks for coordinates/positions of a SPECIFIC category. Do not call for every category in broad "all objects" questions.
-    - Example: User: "What are the coordinates of the ticket gates?" -> get_category_objects_coordinates(category="Ticket Gate")
-
-12. get_category_objects_with_images
-    - Purpose: track IDs, coordinates, and sample image frames for objects in a category. Returns everything the user needs when they ask for "show me X with images".
-    - Args: category (string, required), limit (integer, default 5).
-    - Output sample:
-        Exit Signs with coordinates and sample frames:
-        - Track 648: centroid (-44.78, 45.18, -16.23)
-          ![frame](/inspection/images/1781168040076490000.jpg)
-    - Use when the user asks for objects with their images, e.g. "show me exit signs with track IDs, coordinates, and images".
-    - Example: User: "Show me examples of exit signs with track IDs, coordinates, and images." -> get_category_objects_with_images(category="Exit Sign", limit=5)
-
-13. get_category_proximity
-    - Purpose: count objects from other categories near each object in a target category. Also returns target centroids.
-    - Args: target_category (string, required), other_categories (list of strings, required), radius_m (number, default 2.0).
-    - Output sample:
-        Proximity summary for 'Ticket Gate' within 2.0 m of Lights, Advertisement Board:
-        Total nearby objects: 45 x Lights, 12 x Advertisement Board
-        Per-target breakdown:
-        - Track 218 at (-18.22, 32.17, -6.85): within 2.0 m — 2 x Lights, 1 x Advertisement Board
-    - Use whenever the user asks what is near/close to/around a category.
-    - Pass ALL other known categories as other_categories unless the user specifies a subset.
-    - Example: User: "Which objects are close to ticket gates?" -> get_category_proximity(target_category="Ticket Gate", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Exit Sign"])
-
-13. get_inspection_timeline
-    - Purpose: chronological log of every object detected.
-    - Args: none.
-    - Output sample:
-        Full inspection timeline: 345 objects from ... to ... (8.5 minutes).
-        Chronological object log:
-        - 2026-06-11 16:50:40.790: Track 1 (Advertisement Board), 4 observations
-    - Use for: "walk me through the inspection".
-    - Example: User: "Walk me through the inspection." -> get_inspection_timeline
-
-14. get_temporal_clusters
-    - Purpose: busiest moments grouped by time window.
-    - Args: window_ms (integer, default 500), top_n (integer, default 10).
-    - Output sample:
-        Top 10 busiest moments (observations grouped within 500 ms):
-        1. 2026-06-11 16:51:45.385 to 16:51:50.485: 106 total observations — 106 x Lights
-    - Use for: "were objects seen in groups", "busiest moment".
-    - Example: User: "Were objects seen in groups?" -> get_temporal_clusters(window_ms=500, top_n=10)
-
-15. get_report_summary
-    - Purpose: fetch anomaly report text and image references. This is the ONLY tool that returns anomaly findings.
-    - Args: none.
-    - Output sample:
-        --- final_summary.txt ---
-        === FINAL INSPECTION SUMMARY ===
-        Five images contained anomalies...
-    - Use when the user asks about anomalies, findings, issues, problems, state changes, recommendations, or what was wrong during the inspection.
-    - Example: User: "What anomalies did you find?" -> get_report_summary
-
-16. get_objects_in_time_range
-    - Purpose: objects whose detection span overlaps a time window.
-    - Args: start_time (string or integer, required), end_time (string or integer, required), limit (integer, default 50).
-    - Time strings: ISO datetime, clock time, or ns integer. The inspection ran around 4:50 PM local time, so prefer 24-hour clock (e.g. "16:51:00").
-    - Output sample:
-        12 object(s) detected between 2026-06-11 16:51:00.000 and 2026-06-11 16:52:00.000:
-        - Track 218 (Ticket Gate): 12 observations, centroid (-18.22, 32.17, -6.85)
-    - Use for: "what happened between X and Y".
-    - Example: User: "What happened between 4:51 and 4:52?" -> get_objects_in_time_range(start_time="16:51:00", end_time="16:52:00")
-
-17. get_observations_in_time_range
-    - Purpose: per-frame observations captured within a time window.
-    - Args: start_time (string or integer, required), end_time (string or integer, required), limit (integer, default 50).
-    - Output sample:
-        50 observation(s) between 2026-06-11 16:53:00.000 and 2026-06-11 16:54:00.000:
-        - 2026-06-11 16:53:40.877: Track 1455 (Ticket Gate), 96 points at (-15.99, 42.53, -6.18)
-    - Use for: "show me detections around time T".
-    - When the user gives a bare time like "at 4:53" or "around 4:53", interpret it as a one-minute window from that minute to the next minute (e.g. start_time="16:53:00", end_time="16:54:00"), NOT a 10-second window.
-    - Example: User: "Show me detections around 4:53 PM." -> get_observations_in_time_range(start_time="16:53:00", end_time="16:54:00")
-
-18. get_objects_near_position
-    - Purpose: objects within a radius of a 3D point.
-    - Args: x, y, z (numbers, required), radius_m (number, default 2.0), category (string, optional).
-    - Output sample:
-        16 object(s) within 2.0 m of (-18.00, 32.00, -6.00):
-        - Track 218 (Ticket Gate): distance 0.89 m, centroid (-18.22, 32.17, -6.85)
-    - Use when the user gives coordinates or asks "what is near (x, y, z)".
-    - Example: User: "What is near coordinate (-18, 32, -6)?" -> get_objects_near_position(x=-18, y=32, z=-6, radius_m=2.0)
-
-19. get_category_sample_images
-    - Purpose: a few example image links for a category.
-    - Args: category (string, required), limit (integer, default 5).
-    - Output sample:
-        Sample images for category 'Advertisement Board':
-        ![Advertisement Board sample](/inspection/images/1781167935783813000.jpg)
-    - Use when the user asks to see examples of a category.
-    - Example: User: "Show me some advertisement boards." -> get_category_sample_images(category="Advertisement Board")
-
-20. get_inspection_poses
-    - Purpose: camera/robot pose records from the inspection_poses table.
-    - Args: limit (integer, default 20).
-    - Output sample:
-        First 20 inspection pose(s):
-        - camera_001.jpg: translation (...), rotation (..., ...)
-    - Use when the user asks about camera trajectory, robot poses, or inspection poses.
-    - Example: User: "What poses did the camera have?" -> get_inspection_poses(limit=20)
-
-21. get_filtered_objects
-    - Purpose: audit of objects dropped by the merge layer.
-    - Args: limit (integer, default 50).
-    - Output sample:
-        Most recent 5 filtered object(s):
-        - Track 999 (Lights): reason='too few points', 12 points, ...
-    - Use when the user asks what was removed/filtered/dropped.
-    - Example: User: "What was filtered out?" -> get_filtered_objects(limit=50)
-
-22. get_object_distance
-    - Purpose: distance between the centroids of two tracks.
-    - Args: track_id_a, track_id_b (integers, required).
-    - Output sample:
-        Distance between Track 218 (Ticket Gate) and Track 165 (Ticket Gate): 0.26 m
-    - Use when the user asks "how far apart are track X and track Y".
-    - Example: User: "How far apart are track 218 and track 165?" -> get_object_distance(track_id_a=218, track_id_b=165)
-
-23. get_category_bounding_box
-    - Purpose: spatial extent of all objects in a category.
-    - Args: category (string, required).
-    - Output sample:
-        Spatial extent for category 'Ticket Gate' (29 object(s)):
-        - Centroid range: x [-18.50, -15.20], y [30.10, 45.30], z [-7.10, -5.90]
-        - Bounding box min: ..., max: ...
-    - Use when the user asks "what area does X occupy" or spatial extent.
-    - Example: User: "What area do the ticket gates occupy?" -> get_category_bounding_box(category="Ticket Gate")
-
-24. get_category_observation_timeline
-    - Purpose: per-time-bucket observation counts for a category.
-    - Args: category (string, required), bucket_seconds (integer, default 60).
-    - Use for: "when were most lights seen", "busiest minute for ticket gates".
-    - Example: User: "When were most advertisement boards seen?" -> get_category_observation_timeline(category="Advertisement Board", bucket_seconds=60)
-
-25. get_objects_by_category_in_time_range
-    - Purpose: objects of one category detected in a time window.
-    - Args: category, start_time, end_time (required), limit (integer, default 50).
-    - Use for: "were there ticket gates after 4:53", "lights between 4:51 and 4:52".
-    - Example: User: "Show me ticket gates after 4:53." -> get_objects_by_category_in_time_range(category="Ticket Gate", start_time="16:53:00", end_time="16:54:00")
-
-26. get_object_movement
-    - Purpose: centroid path of a track across its observations.
-    - Args: track_id (integer, required).
-    - Use for: "did track 218 move", "what was the path of track 218".
-    - Example: User: "Did track 218 move?" -> get_object_movement(track_id=218)
-
-27. get_nearest_objects_to_track
-    - Purpose: objects within radius_m of a specific track's centroid.
-    - Args: track_id (integer, required), radius_m (number, default 2.0).
-    - Use for: "what was near track 218".
-    - Example: User: "What was near track 218?" -> get_nearest_objects_to_track(track_id=218, radius_m=2.0)
-
-28. get_images_in_time_range
-    - Purpose: sample images captured in a time window.
-    - Args: start_time, end_time (required), category (optional), limit (integer, default 5).
-    - Use for: "show me what the camera saw at 4:51".
-    - When the user gives a bare time like "at 4:53" or "around 4:53", interpret it as a one-minute window from that minute to the next minute (e.g. start_time="16:53:00", end_time="16:54:00"), NOT a 10-second window.
-    - Example: User: "What did the camera see at 4:53 PM?" -> get_images_in_time_range(start_time="16:53:00", end_time="16:54:00")
-
-29. get_category_cooccurrence
-    - Purpose: which categories appear together most often in temporal clusters.
-    - Args: window_ms (integer, default 500), top_n (integer, default 10).
-    - Use for: "which objects are usually seen together".
-    - Example: User: "Which categories were seen together?" -> get_category_cooccurrence(window_ms=500, top_n=10)
-
-30. get_objects_in_temporal_cluster
-    - Purpose: objects with coordinates detected around a specific time.
-    - Args: center_time (required), window_ms (integer, default 500), limit (integer, default 50).
-    - Use for: "where was the 4:51 PM cluster", "what was detected at 16:51:45".
-    - Example: User: "Where was the cluster at 4:51 PM?" -> get_objects_in_temporal_cluster(center_time="16:51:45", window_ms=5000)
-
-31. run_sql_query
-    - Purpose: execute a read-only SELECT query. Preferred for summarization, aggregation, and any question that combines counts, timestamps, and coordinates for one or more categories.
-    - Args: query (string, required), limit (integer, default 100).
-    - Use for:
-      - category-specific summaries (e.g., "summary of lights and advertisement boards") -> aggregate with GROUP BY category
-      - counts + coordinates together -> SELECT category, COUNT(*), AVG(centroid_x), AVG(centroid_y), AVG(centroid_z), MIN(first_seen_ns), MAX(last_seen_ns) FROM objects WHERE category IN (...) GROUP BY category
-      - ad-hoc questions that cannot be answered by the tools above.
-    - Example: User: "How many distinct tracks have more than 50 observations?" -> run_sql_query(query="SELECT COUNT(*) FROM objects WHERE observation_count > 50")
-    - Example: User: "Tell me about all the lights and advertisement boards, their timestamps and coordinates." -> run_sql_query(query="SELECT category, COUNT(*) as object_count, MIN(first_seen_ns) as first_seen, MAX(last_seen_ns) as last_seen, AVG(centroid_x) as avg_x, AVG(centroid_y) as avg_y, AVG(centroid_z) as avg_z, MIN(centroid_x) as min_x, MAX(centroid_x) as max_x, MIN(centroid_y) as min_y, MAX(centroid_y) as max_y, MIN(centroid_z) as min_z, MAX(centroid_z) as max_z FROM objects WHERE category IN ('Lights', 'Advertisement Board') GROUP BY category")
-
-32. annotate_image
-    - Purpose: analyze one or more inspection images with a vision model and draw annotations (boxes, circles, highlights) around anomalies or areas of interest.
-    - Args: provide exactly one of image_url, track_id, or category. Optionally pass question to guide what to look for, and limit (default 5) to cap how many images are annotated for a track_id or category.
-    - image_url: a single URL or path such as /inspection/images/1781168192465731000.jpg or /reports/extracted_images/img-021.jpg.
-    - track_id: annotate all available frames for this track (up to limit).
-    - category: annotate up to limit random sample images of this category.
-    - Output sample:
-        Annotated image:
-        ![annotated](/annotated/images/a1b2c3d4.png)
-
-        Description: A small crack was highlighted on the left panel of the advertisement board.
-    - Use for: "highlight anomalies in this image", "circle the defect on track 218", "draw on an advertisement board image", "mark what is wrong with this picture".
-    - Example: User: "Circle the anomaly on the image of track 218." -> annotate_image(track_id=218, question="circle the anomaly")
-    - Example: User: "Highlight defects on an advertisement board." -> annotate_image(category="Advertisement Board", question="highlight defects")
-    - Example: User: "Annotate all frames of track 218." -> annotate_image(track_id=218, question="highlight any anomalies", limit=10)
+1. get_inspections — list inspections (id, started_at, is_gt, object/detection counts). Call first when you need an inspection_id.
+2. get_summary — overall counts + category breakdown. Generic "what did you find" only.
+3. get_categories — distinct category names.
+4. get_object_by_id(object_id) — one object's details, timeline, image links.
+5. get_objects_by_category(category, limit, inspection_id) — objects in a category.
+6. get_top_objects(n, inspection_id) — most-detected objects.
+7. get_recent_objects(limit, inspection_id) — most recently seen objects.
+8. get_object_timeline(object_id) — first/last seen, duration, key moments for one object.
+9. get_object_image_paths(object_id) — image links for one object.
+10. get_category_timeline(category, inspection_id) — first/last seen per object in a category.
+11. get_category_windows(categories[], inspection_id) — first/last windows for several categories.
+12. get_category_objects_coordinates(category, inspection_id) — centroid + 3D bbox per object in a category.
+13. get_category_objects_with_images(category, limit, inspection_id) — object ids, coordinates, and a sample image each.
+14. get_category_proximity(target_category, other_categories[], radius_m, inspection_id) — counts of other-category objects near each target object.
+15. get_inspection_timeline(inspection_id) — chronological object log.
+16. get_temporal_clusters(window_ms, top_n, inspection_id) — busiest moments grouped by time window.
+17. get_detection_counts_by_category(inspection_id) — per-frame detection counts per category.
+18. get_objects_in_time_range(start_time, end_time, limit, inspection_id) — objects whose span overlaps a window.
+19. get_detections_in_time_range(start_time, end_time, limit, inspection_id) — per-frame detections in a window.
+20. get_objects_near_position(x, y, z, radius_m, category, inspection_id) — objects within radius of a 3D point.
+21. get_category_sample_images(category, limit, inspection_id) — a few example image links for a category.
+22. get_inspection_poses(limit, inspection_id) — camera poses (from the images table).
+23. get_object_distance(object_id_a, object_id_b) — centroid distance between two objects.
+24. get_category_bounding_box(category, inspection_id) — spatial extent of a category.
+25. get_category_detection_timeline(category, bucket_seconds, inspection_id) — per-bucket detection counts for a category.
+26. get_objects_by_category_in_time_range(category, start_time, end_time, limit, inspection_id) — one category's objects in a window.
+27. get_object_movement(object_id) — centroid path of one object across its detections.
+28. get_nearest_objects_to_object(object_id, radius_m, inspection_id) — objects within radius of an object.
+29. get_images_in_time_range(start_time, end_time, category, limit, inspection_id) — sample images in a window.
+30. get_category_cooccurrence(window_ms, top_n, inspection_id) — category pairs seen together.
+31. get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id) — objects/detections around a time.
+32. get_anomaly_types — anomaly type names.
+33. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
+34. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, 2D bbox, note, and gt/inspection image links.
+35. get_report_summary — the written anomaly report text + recommendations.
+36. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the running Rerun viewer.
+37. run_sql_query(query, limit) / query_database(sql_query, limit) — read-only SELECT escape hatch.
+38. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
 
 ## Multi-tool flow examples
 
-Example A:
+Example A (multi-tool + cross-source):
 User: "Tell me about the objects found during the inspection and their coordinates, and which objects were close to ticket gates."
 Plan:
 1. get_summary
@@ -834,7 +533,7 @@ Plan:
 3. get_category_proximity(target_category="Ticket Gate", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Exit Sign"])
 
 Example A2 (multi-tool + re-call with changed parameter):
-User: "For the two exit signs recorded around 4:56 PM, what were their coordinates, and what objects were within a 1 meter radius of them?"
+User: "For the exit signs recorded around 4:56 PM, what were their coordinates, and what objects were within a 1 meter radius of them?"
 Plan:
 1. get_objects_by_category_in_time_range(category="Exit Sign", start_time="16:56:00", end_time="16:57:00")
 2. get_category_proximity(target_category="Exit Sign", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Ticket Gate"], radius_m=1.0)
@@ -843,66 +542,71 @@ Note: even if a previous turn already called get_category_proximity for Exit Sig
 Example B:
 User: "How many times were advertisement boards seen, and what is near coordinate (-18, 32, -6)?"
 Plan:
-1. get_observation_counts_by_category
+1. get_detection_counts_by_category
 2. get_objects_near_position(x=-18, y=32, z=-6, radius_m=2.0)
 
 Example C:
-User: "Show me some advertisement boards and how far apart are tracks 218 and 165."
+User: "Show me some advertisement boards and how far apart are objects 16 and 19."
 Plan:
 1. get_category_sample_images(category="Advertisement Board", limit=5)
-2. get_object_distance(track_id_a=218, track_id_b=165)
+2. get_object_distance(object_id_a=16, object_id_b=19)
 
-Example C2:
-User: "Show me examples of exit signs with their track IDs, coordinates, and images."
+Example D (anomalies — structured + report, multi-tool):
+User: "What anomalies did you find, and show me the ones on the ticket gates?"
 Plan:
-1. get_category_objects_with_images(category="Exit Sign", limit=5)
+1. get_anomaly_summary
+2. get_anomalies()
+3. get_report_summary
+(Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report. If the anomaly tables are not yet populated, those tools return a clear message — still call them.)
 
-Example D:
-User: "What anomalies did you find, and how many objects were detected?"
+Example E (Rerun highlight):
+User: "What are the coordinates of the ticket gates? Show me where they are."
 Plan:
-1. get_summary
-2. get_report_summary
+1. get_category_objects_coordinates(category="Ticket Gate")
+2. highlight_in_rerun(category="Ticket Gate", label="ticket gates")
+(The highlight tool pushes the gate centroids + bboxes to the Rerun viewer; the answerer describes the coordinates and notes they are highlighted in the viewer.)
 
-Example E:
-User: "Where was the cluster at 4:51 PM?"
+Example E2 (highlight specific objects from a prior answer):
+User: "Highlight objects 16 and 19 in the 3D viewer."
 Plan:
-1. get_objects_in_temporal_cluster(center_time="16:51:45", window_ms=5000)
+1. highlight_in_rerun(object_ids=[16, 19], label="objects 16 and 19")
 
-Example E2:
-User: "What did the camera see at 4:53 PM?"
+Example F (cross-inspection):
+User: "Compare inspection 1 and inspection 2 — how many objects did each find?"
 Plan:
-1. get_images_in_time_range(start_time="16:53:00", end_time="16:54:00")
+1. get_inspections
+(The output gives per-inspection object and detection counts for all inspections, so the answerer can compare them directly. Only pass inspection_id to a tool when the user wants that single inspection's detail, e.g. get_summary(inspection_id=2).)
 
-Example F:
+Example G (SQL aggregation):
 User: "Give me a summary of all the lights and advertisement boards found."
 Plan:
-1. run_sql_query(query="SELECT category, COUNT(*) as object_count, MIN(first_seen_ns) as first_seen, MAX(last_seen_ns) as last_seen, AVG(centroid_x) as avg_x, AVG(centroid_y) as avg_y, AVG(centroid_z) as avg_z, MIN(centroid_x) as min_x, MAX(centroid_x) as max_x, MIN(centroid_y) as min_y, MAX(centroid_y) as max_y, MIN(centroid_z) as min_z, MAX(centroid_z) as max_z FROM objects WHERE category IN ('Lights', 'Advertisement Board') GROUP BY category")
+1. run_sql_query(query="SELECT c.name AS category, COUNT(*) AS object_count, MIN(i.timestamp_ns) AS first_seen, MAX(i.timestamp_ns) AS last_seen, AVG(o.centroid_x) AS avg_x, AVG(o.centroid_y) AS avg_y, AVG(o.centroid_z) AS avg_z FROM objects o JOIN categories c ON c.id=o.category_id JOIN detections d ON d.object_id=o.id JOIN images i ON i.id=d.image_id WHERE c.name IN ('Lights','Advertisement Board') GROUP BY c.name")
 
-Example G:
-User: "Highlight any anomalies on the image of track 218."
+Example H (annotation):
+User: "Highlight any anomalies on the image of object 16."
 Plan:
-1. annotate_image(track_id=218, question="highlight any anomalies")
+1. annotate_image(object_id=16, question="highlight any anomalies")
 
-Example G2 (referencing a previously shown image):
+Example H2 (referencing a previously shown image):
 User: "Annotate the previous image for advertisement board defects."
-Context: prior images list ends with /reports/extracted_images/img-007.jpg.
+Context: prior images list ends with /inspection/images/14.jpg.
 Plan:
-1. annotate_image(image_url="/reports/extracted_images/img-007.jpg", question="highlight advertisement board defects")
+1. annotate_image(image_url="/inspection/images/14.jpg", question="highlight advertisement board defects")
 Note: "the previous image" means the LAST url in the prior-images list — do NOT sample a fresh category image.
 
 ## Rules
 
-- Call every tool that is needed in a single turn. Do not chain sequentially. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count. Combine tools freely; the backend runs all of them and merges their results.
-- A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, track ID, coordinates, limit, target_category, other_categories, n, etc.), you MUST call the relevant tool again with the new parameters, even if a similar question was answered moments ago. When in doubt whether the parameters match, call the tool.
-- Example of the above: the user first asks "what is within 3 m of the exit signs" and you called get_category_proximity(radius_m=3.0). If the user then asks "what is within 1 m of the exit signs", you MUST call get_category_proximity(radius_m=1.0) again — do NOT reuse or paraphrase the 3 m answer.
+- Call every tool that is needed in a single turn. Do not chain sequentially. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely; the backend runs all of them and merges their results.
+- Call highlight_in_rerun whenever the user asks to visualize/show/highlight/see WHERE things are, or whenever your answer will cite specific coordinates or object ids. It is cheap and the user watches the Rerun viewer.
+- A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
 - Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
 - For proximity questions, pass all other known categories as other_categories unless the user names a specific subset.
-- For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because the inspection ran around 4:50 PM.
+- For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because inspections run in the late afternoon.
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
-- When the user asks for a summary of specific categories (e.g., "summary of lights and advertisement boards", "tell me about the lights and advertisement boards"), do NOT call get_summary. Use run_sql_query with GROUP BY category that returns COUNT, MIN/MAX first_seen_ns/last_seen_ns, and AVG/MIN/MAX centroid coordinates.
-- When the user asks about anomalies, findings, issues, problems, state changes, recommendations, or what was wrong, call get_report_summary. Do not call coordinate tools for anomaly questions.
+- When the user asks for a summary of specific categories (e.g., "summary of lights and advertisement boards"), do NOT call get_summary. Use run_sql_query with GROUP BY category that returns COUNT, MIN/MAX first_seen/last_seen, and AVG/MIN/MAX centroid coordinates (joining objects → categories → detections → images).
+- When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, call get_anomaly_summary / get_anomalies and/or get_report_summary. Do not call coordinate tools for pure anomaly questions.
 - Do not output explanatory text; only emit tool calls.
 """
 
@@ -953,7 +657,7 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
             "(verbatim, full path). \"the previous/last image\" = the last URL in the list; "
             "\"the first image\" = the first; \"the Nth image\" / \"image N\" = the Nth. If the user "
             "describes the image by content, pick the URL that best matches. Never invent a URL "
-            "that is not in the list. Only fall back to a category or track_id when the user did "
+            "that is not in the list. Only fall back to a category or object_id when the user did "
             "NOT refer to a specific prior image (e.g. \"annotate an advertisement board\")."
         )
 
@@ -1002,7 +706,7 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         prior_tools = self._prior_tool_context(tool_history)
 
         # Detect annotation intent up front. We do NOT force a tool here: the router
-        # LLM resolves which image (URL / track_id / category) the user means from the
+        # LLM resolves which image (URL / object_id / category) the user means from the
         # prior-images context above, which is far more robust than regex heuristics for
         # phrases like "the previous image", "the second one", or "the one with the
         # backpack". `wants_annotation` is kept only to drive a safety-net fallback
@@ -1013,10 +717,9 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         wants_annotation = any(kw in q for kw in annotation_keywords)
 
         # Whether to fetch the anomaly report is the router LLM's decision, not a
-        # keyword gate. get_report_summary is listed in TOOLS and the system prompt
-        # instructs the model to call it for anomaly/finding/problem questions, so the
-        # model decides whether the report is relevant — including choosing
-        # annotate_image instead when the user points at a specific image/track/category.
+        # keyword gate. get_report_summary / get_anomaly_* are listed in TOOLS and the
+        # system prompt instructs the model to call them for anomaly/finding/problem
+        # questions, so the model decides whether the report is relevant.
 
         payload = {
             "model": self.settings.tool_router_model,
@@ -1079,15 +782,15 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
             if prior_urls:
                 fallback["image_url"] = prior_urls[-1]
             else:
-                track_match = re.search(r"(?:track|object)\s*#?\s*(\d+)", q)
-                if track_match:
-                    fallback["track_id"] = int(track_match.group(1))
+                id_match = re.search(r"(?:track|object)\s*#?\s*(\d+)", q)
+                if id_match:
+                    fallback["object_id"] = int(id_match.group(1))
                 else:
                     for alias, canonical in _CATEGORY_ALIASES.items():
                         if alias in q:
                             fallback["category"] = canonical
                             break
-            if "image_url" in fallback or "track_id" in fallback or "category" in fallback:
+            if "image_url" in fallback or "object_id" in fallback or "category" in fallback:
                 logger.info(
                     "annotate_image safety-net fallback for annotation query: %r args=%s",
                     query, fallback,

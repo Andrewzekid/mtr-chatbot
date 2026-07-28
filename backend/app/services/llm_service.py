@@ -204,7 +204,13 @@ class LocalLLM:
                     {"name": r["name"], "args": r["args"], "output": r["output"]}
                     for r in self.db_client.last_tool_results
                 ]
-                report_needed = any(call.get("name") == "get_report_summary" for call in self.db_client.last_tool_calls)
+                report_needed = any(
+                    call.get("name") in {"get_report_summary", "get_anomaly_summary", "get_anomalies"}
+                    for call in self.db_client.last_tool_calls
+                )
+                highlight_called = any(
+                    call.get("name") == "highlight_in_rerun" for call in self.db_client.last_tool_calls
+                )
                 annotate_called = any(
                     call.get("name") == "annotate_image" for call in self.db_client.last_tool_calls
                 )
@@ -256,6 +262,25 @@ class LocalLLM:
                     )
                 if self.db_client.router is not None:
                     tool_router_raw = self.db_client.router.last_raw_response
+                if highlight_called and db_context:
+                    db_context = (
+                        "The highlight_in_rerun tool pushed 3D highlights to the user's separately-running "
+                        "Rerun viewer. Mention briefly that the highlighted objects/coordinates are now shown "
+                        "in the Rerun viewer (the user watches it alongside this chat). Do not claim the "
+                        "viewer is in this chat window.\n\n" + db_context
+                    )
+                elif db_context:
+                    # Auto-highlight: if the tool results contain coordinates or object
+                    # ids, push them to the Rerun viewer automatically — no explicit
+                    # highlight_in_rerun call needed. Stay quiet if there was nothing to
+                    # visualize or Rerun is unavailable.
+                    auto_status = self.db_client.auto_highlight(db_context)
+                    if auto_status:
+                        db_context = (
+                            "Coordinates from the results above were automatically highlighted in the "
+                            "Rerun viewer. Mention briefly that they are shown in the viewer (the user "
+                            "watches it alongside this chat).\n\n" + db_context
+                        )
             except Exception as exc:
                 logger.warning("DB lookup failed: %s", exc)
 

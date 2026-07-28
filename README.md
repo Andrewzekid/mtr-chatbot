@@ -41,9 +41,9 @@ Every turn is **two LLM calls** plus streaming TTS — not an agentic loop. The 
 
 1. **Capture** — Frontend records audio via `MediaRecorder` (Space = push-to-talk), base64-encodes it, sends `{"type":"user_audio", audio_base64, mime_type}` over the WebSocket.
 2. **STT** — `VoicePipeline.handle_audio` runs SenseVoice (or Whisper) → returns transcript text, a language tag (`en`/`zh`/`yue`/…), and an emotion tag. Yields a `transcript` message to the client.
-3. **Router — LLM call #1 (tool selection)** — `LocalLLM.stream_reply` calls `InspectionDBClient.lookup`, which calls `ToolRouter.select_tool`. The router sends the transcript + a system prompt (DB schema + all 32 tool descriptions + multi-tool rules + prior-images/prior-tools context) to Ollama with native `tools`. It returns a list of `(tool_name, args)` — possibly several — and nothing else.
+3. **Router — LLM call #1 (tool selection)** — `LocalLLM.stream_reply` calls `InspectionDBClient.lookup`, which calls `ToolRouter.select_tool`. The router sends the transcript + a system prompt (DB schema + all ~38 tool descriptions + multi-tool rules + prior-images/prior-tools context) to Ollama with native `tools`. It returns a list of `(tool_name, args)` — possibly several — and nothing else.
 4. **Tool execution** — `lookup` loops over the selected tools and runs `_execute_tool` for each. Each tool runs a SQL query (or vision annotation, or returns `None` for `get_report_summary`), and its result is formatted to text by a `_format_*` method. All formatted outputs are joined with `\n\n` into one `db_context` string. No re-prompting happens between tools.
-5. **Report (conditional)** — If the router selected `get_report_summary`, `report_needed` is true and `InspectionReportClient.get_context()` (+ anomaly image URLs) is loaded as `report_context`. The report is lazy-loaded only on anomaly/findings intent — the router's decision, not a keyword gate.
+5. **Report (conditional)** — If the router selected `get_report_summary`, `get_anomaly_summary`, or `get_anomalies`, `report_needed` is true and `InspectionReportClient.get_context()` (+ anomaly image URLs) is loaded as `report_context`, so the prose report coexists with the structured anomaly-table output. The report is lazy-loaded only on anomaly/findings intent — the router's decision, not a keyword gate. If `highlight_in_rerun` ran, a note is prepended to `db_context` telling the answerer the highlights are shown in the external Rerun viewer.
 6. **Debug + image-link handling** — The selected tool calls (and the router's raw response) are sent to the frontend as a `tool_calls` message (debug panel). If `annotate_image` ran, its markdown image links are pulled *out* of `db_context` (so the model can't duplicate them) and the backend re-emits them as the first tokens of the reply to guarantee display.
 7. **Answerer — LLM call #2 (synthesis, streamed)** — `_build_messages` assembles:
    - `system`: the assistant persona + style/coordinate/image-link rules
@@ -104,29 +104,31 @@ get_category_proximity {target_category: "Ticket Gate",
 Backend runs all three, each producing formatted text, and joins them:
 ```
 Inspection database context (...):
-Total aggregated objects: 345. Objects by category: Lights: 235, Advertisement Board: 53, ...
+Total objects: 60. Objects by category: Lights: 28, Advertisement Board: 14, ...
 
 Objects in category 'Ticket Gate' with coordinates (ordered by first appearance):
-- Track 218: first seen ..., centroid (-18.22, 32.17, -6.85), ...
+- Object 109: first seen ..., centroid (-18.22, 32.17, -6.85), ...
 
 Proximity summary for 'Ticket Gate' within 2.0 m of Lights, Advertisement Board, Map, TV, Exit Sign:
-Total nearby objects: 45 x Lights, 12 x Advertisement Board
+Total nearby objects: 8 x Lights, 3 x Advertisement Board
 Per-target breakdown:
-- Track 218 at (-18.22, 32.17, -6.85): within 2.0 m — 2 x Lights, 1 x Advertisement Board
+- Object 109 at (-18.22, 32.17, -6.85): within 2.0 m — 2 x Lights, 1 x Advertisement Board
 ```
 Answerer (call #2) reads that single context block and synthesizes one coherent spoken answer covering totals, ticket-gate positions, and what's near them.
 
-### Worked example B — cross-source (DB + report)
+### Worked example B — anomalies (structured DB + prose report)
 
-> **User:** "Were there any anomalies near the ticket gates?"
+> **User:** "What anomalies did you find, and were any near the ticket gates?"
 
 Router returns:
 ```
-get_report_summary {}                                  # anomaly part
+get_anomaly_summary {}                                  # anomaly overview
+get_anomalies {}                                        # individual abnormalities + image links
+get_report_summary {}                                   # prose report + recommendations
 get_category_proximity {target_category: "Ticket Gate",
                          other_categories: ["Lights","Advertisement Board", ...]}   # "near ticket gates" part
 ```
-`get_report_summary` itself returns `None` from `_execute_tool`; its real text is fetched by `llm_service` into `report_context`. So the answerer receives **two** system messages — `db_context` (proximity) and `report_context` (anomaly text + `![...](/reports/extracted_images/...)` links) — and weaves them together: "the report found cracks near gate 3; around the ticket-gate area there are 45 lights and 12 ad boards within 2 m."
+`get_anomaly_summary` / `get_anomalies` read the `anomaly_types` / `abnormal_detections` / `abnormalities` tables and return typed abnormalities with 2D pixel bboxes, notes, and the ground-truth vs inspection image links for each pair. `get_report_summary` returns `None` from `_execute_tool`; its real text is fetched by `llm_service` into `report_context` (loaded because `report_needed` now also triggers on the anomaly tools). So the answerer receives **two** system messages — `db_context` (structured abnormalities + proximity) and `report_context` (prose + `![...](/reports/extracted_images/...)` links) — and weaves them together: "the report found cracks near gate 3; the abnormalities table lists 2 scratches on the ticket-gate panels; around that area there are 8 lights and 3 ad boards within 2 m." (If the anomaly tables are not yet populated, the anomaly tools return a clear "not yet populated" string instead of raising.)
 
 ### Worked example C — images + live annotation (vision tool)
 
@@ -135,9 +137,20 @@ get_category_proximity {target_category: "Ticket Gate",
 Router returns:
 ```
 get_images_in_time_range {start_time: "16:53:00", end_time: "16:54:00"}
-annotate_image {category: "Exit Sign", question: "highlight any anomalies"}   # or track_id, or image_url
+annotate_image {category: "Exit Sign", question: "highlight any anomalies"}   # or object_id, or image_url
 ```
-`get_images_in_time_range` returns markdown links to source frames. `annotate_image` resolves frames (by `category`/`track_id`/`image_url`), sends each to the **base LLM** (multimodal) with a strict-JSON prompt, draws boxes/circles/highlights with OpenCV, writes each annotated PNG to `annotated_image_cache_dir`, and returns `![annotated result](/annotated/images/<hash>.png)` links plus a description. The backend then **strips those annotated links out of `db_context`** and **re-emits them as the first tokens** of the reply, so the image is guaranteed to render even if the model would otherwise paraphrase it away. The answerer only writes a short summary of what the annotation found.
+`get_images_in_time_range` returns markdown links to source frames. `annotate_image` resolves frames (by `category`/`object_id`/`image_url`), sends each to the **base LLM** (multimodal) with a strict-JSON prompt, draws boxes/circles/highlights with OpenCV, writes each annotated PNG to `annotated_image_cache_dir`, and returns `![annotated result](/annotated/images/<hash>.png)` links plus a description. The backend then **strips those annotated links out of `db_context`** and **re-emits them as the first tokens** of the reply, so the image is guaranteed to render even if the model would otherwise paraphrase it away. The answerer only writes a short summary of what the annotation found.
+
+### Worked example B2 — Rerun 3D highlight (alongside the spoken answer)
+
+> **User:** "What are the coordinates of the ticket gates? Show me where they are."
+
+Router returns:
+```
+get_category_objects_coordinates {category: "Ticket Gate"}
+highlight_in_rerun {category: "Ticket Gate", label: "ticket gates"}
+```
+`get_category_objects_coordinates` returns the gate centroids + 3D bboxes as text for the answerer to speak. `highlight_in_rerun` resolves the same objects from the DB and pushes their centroids (bright red points) and 3D bboxes to the user's separately-running **Rerun viewer** over TCP (`rr.connect_tcp` to `127.0.0.1:9876`), alongside a faint context cloud of all object centroids and the camera trajectory. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer") that the answerer cites. It is fully tolerant: a missing `rerun-sdk`, `RERUN_ENABLED=false`, or a viewer that is not running all degrade to a friendly status string — the chat turn never fails because of Rerun.
 
 ### Worked example D — multi-hop temporal + spatial (one turn, parallel)
 
@@ -159,15 +172,15 @@ The router is shown the **exact arguments** used in prior tool calls (`tool_call
 Turn 1: "What's within 3 meters of the exit signs?"  → get_category_proximity(..., radius_m=3.0)
 Turn 2: "And within 1 meter?"                        → get_category_proximity(..., radius_m=1.0)   # re-called
 ```
-The same applies to changing the category, track ID, time window, coordinates, or `limit`.
+The same applies to changing the category, object id, time window, coordinates, `inspection_id`, or `limit`.
 
 ### Cross-turn: referencing a previously shown image
 
-If the user says "annotate the previous image" / "the second one" / "the one with the backpack", the router resolves it from a numbered list of **prior image URLs** (built from `conversation_history`) and calls `annotate_image` with that exact `image_url`. This replaces brittle regex matching. (If the router blanks on an explicit annotation request, a safety-net fallback uses the most recent prior image / a track ID / a category.)
+If the user says "annotate the previous image" / "the second one" / "the one with the backpack", the router resolves it from a numbered list of **prior image URLs** (built from `conversation_history`) and calls `annotate_image` with that exact `image_url`. This replaces brittle regex matching. (If the router blanks on an explicit annotation request, a safety-net fallback uses the most recent prior image / an object id / a category.)
 
 ### Limitations (be aware)
 
-- **No within-turn dependency.** The router can't do "find track X, then look up what's near X's coordinates" in one turn, because it doesn't see `get_object_*`'s result before planning. Workarounds: ask the user for the ID up front, or split across turns (turn 1 reveals the ID, turn 2 uses it — the second turn sees the first via history).
+- **No within-turn dependency.** The router can't do "find object X, then look up what's near X's coordinates" in one turn, because it doesn't see `get_object_*`'s result before planning. Workarounds: ask the user for the ID up front, or split across turns (turn 1 reveals the ID, turn 2 uses it — the second turn sees the first via history).
 - **`run_sql_query` / `query_database` are the escape hatch** for anything the fixed tools can't express (aggregations, custom joins, multi-category summaries with `GROUP BY`).
 - **Router disabled or returns nothing → no DB context.** With `tool_router_enabled=false` (or an empty tool list), `lookup` returns `None`; the answerer replies from general knowledge/history. There is no keyword fallback.
 
@@ -186,6 +199,7 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 | `app/services/db_service.py` | `InspectionDBClient.lookup` → router → `_execute_tool` per tool → join. All SQL query methods + `_format_*` formatters. `_parse_time_string` for clock/ns/ISO times. `annotate_image` orchestration. |
 | `app/services/report_service.py` | `InspectionReportClient` — reads `.txt`/`.pdf` (via `pdftotext`) reports, lists `extracted_images`. Loaded only when `get_report_summary` was selected. |
 | `app/services/vision_service.py` | `VisionAnnotator.annotate` — sends image to the **base LLM** (multimodal), strict-JSON parsing with retries, normalizes coords, draws annotations with OpenCV. |
+| `app/services/rerun_service.py` | `RerunVisualizer.highlight` — pushes 3D object centroids/bboxes + raw coordinates to a running Rerun viewer over TCP. Lazy `rerun` import, tolerant of a missing SDK / disabled flag / unreachable viewer. Called by the `highlight_in_rerun` tool. |
 | `app/services/llm_service.py` | `LocalLLM.stream_reply` (call #2): gather context, `_build_messages`, stream via Ollama/vLLM, strip `thinking`. `preload_model`, `runtime_status`. |
 | `app/services/tts_service.py` | `PiperTTS` — voice selection per language, streaming WAV chunks, Python API + CLI fallback. |
 | `app/services/runtime_status.py` | `nvidia-smi` VRAM snapshot. |
@@ -201,61 +215,92 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 
 ---
 
-## Tool reference (32 tools)
+## Tool reference (~38 tools)
 
-Each maps to an `InspectionDBClient` method; the router's system prompt describes each with expected output and example queries.
+Each maps to an `InspectionDBClient` method; the router's system prompt describes each with expected output and example queries. Most tools take an optional `inspection_id` to scope to one inspection — omit it to query across all inspections.
 
 | Tool | Args | Use case |
 |------|------|----------|
-| `get_summary` | — | "What did you find?", overall counts |
-| `get_observation_counts_by_category` | — | "How many times were lights detected?" |
-| `get_objects_by_category` | `category`, `limit` | "Tell me about the lights" |
-| `get_object_by_track_id` | `track_id` | "Tell me about track 218" |
-| `get_top_objects` | `n` | "Biggest objects?" |
-| `get_recent_objects` | `limit` | "Most recently seen?" |
-| `get_object_timeline` | `track_id` | "When was track 218 seen?" |
-| `get_object_image_paths` | `track_id` | "Show me images of track 218" |
-| `get_category_timeline` | `category` | "When were the lights detected?" |
-| `get_category_windows` | `categories[]` | "When were lights and gates detected?" |
-| `get_category_objects_coordinates` | `category` | "Coordinates of the ticket gates?" |
-| `get_category_objects_with_images` | `category`, `limit` | "Exit signs with IDs, coords, and images" |
-| `get_category_proximity` | `target_category`, `other_categories[]`, `radius_m` | "What's close to ticket gates?" |
-| `get_inspection_timeline` | — | "Walk me through the inspection" |
-| `get_temporal_clusters` | `window_ms`, `top_n` | "Busiest moments?" |
-| `get_category_cooccurrence` | `window_ms`, `top_n` | "Which objects appear together?" |
-| `get_objects_in_temporal_cluster` | `center_time`, `window_ms`, `limit` | "Where was the 4:51 PM cluster?" |
-| `get_objects_in_time_range` | `start_time`, `end_time`, `limit` | "What happened between 4:51 and 4:52?" |
-| `get_observations_in_time_range` | `start_time`, `end_time`, `limit` | "Detections around 16:53:45" |
-| `get_objects_by_category_in_time_range` | `category`, `start_time`, `end_time`, `limit` | "Ticket gates after 4:53?" |
-| `get_category_observation_timeline` | `category`, `bucket_seconds` | "When were most lights seen?" |
-| `get_objects_near_position` | `x`, `y`, `z`, `radius_m`, `category?` | "What's near (-18, 32, -6)?" |
-| `get_nearest_objects_to_track` | `track_id`, `radius_m` | "What was near track 218?" |
-| `get_object_distance` | `track_id_a`, `track_id_b` | "How far apart are tracks 218 and 165?" |
-| `get_object_movement` | `track_id` | "Did track 218 move?" |
-| `get_category_bounding_box` | `category` | "What area do the ticket gates occupy?" |
-| `get_images_in_time_range` | `start_time`, `end_time`, `category?`, `limit` | "What did the camera see at 4:51?" |
-| `get_category_sample_images` | `category`, `limit` | "Show me some advertisement boards" |
-| `get_inspection_poses` | `limit` | "What poses did the camera have?" |
-| `get_filtered_objects` | `limit` | "What was filtered out?" |
-| `get_report_summary` | — | "What anomalies did you find?" (loads report context) |
+| `get_inspections` | — | List inspections (id, started_at, is_gt, counts). Call first when you need an `inspection_id`. |
+| `get_summary` | `inspection_id?` | "What did you find?", overall counts + category breakdown |
 | `get_categories` | — | "What categories exist?" |
+| `get_object_by_id` | `object_id` | "Tell me about object 109" |
+| `get_objects_by_category` | `category`, `limit?`, `inspection_id?` | "Tell me about the lights" |
+| `get_top_objects` | `n?`, `inspection_id?` | "Most-detected objects?" |
+| `get_recent_objects` | `limit?`, `inspection_id?` | "Most recently seen?" |
+| `get_object_timeline` | `object_id` | "When was object 109 seen?" |
+| `get_object_image_paths` | `object_id` | "Show me images of object 109" |
+| `get_category_timeline` | `category`, `inspection_id?` | "When were the lights detected?" |
+| `get_category_windows` | `categories[]`, `inspection_id?` | "When were lights and gates detected?" |
+| `get_category_objects_coordinates` | `category`, `inspection_id?` | "Coordinates of the ticket gates?" |
+| `get_category_objects_with_images` | `category`, `limit?`, `inspection_id?` | "Exit signs with IDs, coords, and images" |
+| `get_category_proximity` | `target_category`, `other_categories[]`, `radius_m?`, `inspection_id?` | "What's close to ticket gates?" |
+| `get_inspection_timeline` | `inspection_id?` | "Walk me through the inspection" |
+| `get_temporal_clusters` | `window_ms?`, `top_n?`, `inspection_id?` | "Busiest moments?" |
+| `get_category_cooccurrence` | `window_ms?`, `top_n?`, `inspection_id?` | "Which objects appear together?" |
+| `get_objects_in_temporal_cluster` | `center_time`, `window_ms?`, `limit?`, `inspection_id?` | "Where was the 4:51 PM cluster?" |
+| `get_objects_in_time_range` | `start_time`, `end_time`, `limit?`, `inspection_id?` | "What happened between 4:51 and 4:52?" |
+| `get_detections_in_time_range` | `start_time`, `end_time`, `limit?`, `inspection_id?` | "Detections around 16:53:45" |
+| `get_objects_by_category_in_time_range` | `category`, `start_time`, `end_time`, `limit?`, `inspection_id?` | "Ticket gates after 4:53?" |
+| `get_detection_counts_by_category` | `inspection_id?` | "How many times were lights detected?" |
+| `get_category_detection_timeline` | `category`, `bucket_seconds?`, `inspection_id?` | "When were most lights seen?" |
+| `get_objects_near_position` | `x`, `y`, `z`, `radius_m?`, `category?`, `inspection_id?` | "What's near (-18, 32, -6)?" |
+| `get_nearest_objects_to_object` | `object_id`, `radius_m?`, `inspection_id?` | "What was near object 109?" |
+| `get_object_distance` | `object_id_a`, `object_id_b` | "How far apart are objects 109 and 110?" |
+| `get_object_movement` | `object_id` | "Did object 109 move?" |
+| `get_category_bounding_box` | `category`, `inspection_id?` | "What area do the ticket gates occupy?" |
+| `get_images_in_time_range` | `start_time`, `end_time`, `category?`, `limit?`, `inspection_id?` | "What did the camera see at 4:51?" |
+| `get_category_sample_images` | `category`, `limit?`, `inspection_id?` | "Show me some advertisement boards" |
+| `get_inspection_poses` | `limit?`, `inspection_id?` | "What poses did the camera have?" (reads `images.tf_*`) |
+| `get_anomaly_types` | — | "What kinds of anomalies exist?" |
+| `get_anomaly_summary` | `inspection_id?` | "How many anomalies were found?" (counts by type / inspection) |
+| `get_anomalies` | `anomaly_type?`, `inspection_id?`, `limit?` | "Show me the anomalies" (typed abnormalities + image-pair links) |
+| `get_report_summary` | — | "What anomalies did you find?" (loads prose report context) |
+| `highlight_in_rerun` | `object_ids[]?`, `coordinates[]?`, `category?`, `inspection_id?`, `label?` | "Show me where the ticket gates are" (pushes 3D highlights to the Rerun viewer) |
 | `run_sql_query` / `query_database` | `query` (SELECT), `limit` | Escape hatch for ad-hoc/aggregation SQL |
-| `annotate_image` | `image_url` XOR `track_id` XOR `category`, `question?`, `limit` | "Highlight anomalies on track 218's image" (base LLM vision) |
+| `annotate_image` | `image_url` XOR `object_id` XOR `category`, `question?`, `limit` | "Highlight anomalies on object 109's image" (base LLM vision) |
 
-Times accept ISO datetimes, clock strings (`"16:51:45"`, `"4:51 PM"`), or nanosecond integers; bare "at 4:53" is read as a one-minute window.
+Times accept ISO datetimes, clock strings (`"16:51:45"`, `"4:51 PM"`), or nanosecond integers; bare "at 4:53" is read as a one-minute window. The old `get_filtered_objects` tool is gone (the `filtered_objects` table no longer exists); `track_id` is now `object_id` (the `objects.id` column).
+
+---
+
+## Rerun 3D highlighting
+
+When the AI's answer involves coordinates or specific objects, the assistant can push those 3D positions into a running [Rerun](https://www.rerun.io) viewer so the inspector can *see* where things are in the station, alongside the spoken answer. Highlights share the **grounding pipeline's** Rerun app id (`inspection_grounding_rerun`) and world frame, so they overlay the grounding map/bboxes rather than appearing in a disconnected scene.
+
+1. Start the viewer in a separate terminal (or replay the grounding `.rrd` recording in it):
+   ```bash
+   pip install rerun-sdk        # already in backend/requirements.txt
+   rerun                        # listens on 127.0.0.1:9876 by default
+   ```
+2. Ask a coordinate/visualization question, e.g. *"What are the coordinates of the ticket gates? Show me where they are."* The router calls `get_category_objects_coordinates` **and** `highlight_in_rerun`.
+3. `RerunVisualizer.highlight` connects to the viewer over TCP (`rr.connect_tcp` to `RERUN_VIEWER_ADDR`), sets `world` to `RIGHT_HAND_Z_UP` (matching the grounding bridge), logs a faint context cloud of all object centroids (by category) plus the camera trajectory, then logs the highlighted set as bright red points + 3D bboxes with per-object labels. Each call uses a fresh `turn` time-sequence so repeated highlights are separate frames.
+4. **Frame alignment:** the DB stores object centroids/bboxes in the tilted `camera_init` frame. `RerunVisualizer` pre-rotates every point by the leveling matrix (`RERUN_LEVELING_RPY_DEG`, default `0.0,20.0,0.0` — the 20° pitch used by the 2026-06-11 inspection run, mirroring the grounding `rerun_bridge_node` `leveling_rpy_deg`), so highlights land level on the grounding map — the same convention the bridge uses for `world/bboxes3d`.
+5. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer at 127.0.0.1:9876 (grounding world frame)") that the answerer cites; the spoken answer still gives the (x, y, z) coordinates.
+
+It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer that is not running all degrade to a friendly status string — the chat turn never fails because of Rerun. Highlight by `object_ids`, by raw `coordinates` (`{x, y, z, label?}`), or by `category`, optionally scoped to one `inspection_id`.
+
+> **Multi-recording caveat:** Rerun treats each `rr.init(...)` + `connect_tcp` as a separate recording. The chatbot's highlights and the grounding pipeline's live scene are therefore two recordings in the same viewer — both in the same world coordinates (same app id + leveling), so you can view them side by side or toggle between them, but they are not composited into a single 3D view automatically. To see the grounding map, replay its `.rrd` in the same viewer (the grounding bridge writes one when `rrd_path` is set).
 
 ---
 
 ## Database schema
 
-`inspection_mtr.db`:
+`MTR_Database/inspection_v2.db` (new multi-inspection schema, written by the `inspection_grounding` pipeline):
 
-- **`objects`** — one row per tracked object: `track_id` (PK), `category`, `observation_count`, `total_point_count`, `centroid_x/y/z`, `bbox3d_min/max_x/y/z`, `first_seen_ns`, `last_seen_ns`, `aggregated_pcd_path`.
-- **`observations`** — one row per per-frame detection: `timestamp_ns`, `track_id`, `category`, `image_file_name`, `image_path`, `centroid_x/y/z`, `point_count`, `pcd_path`, `mask_path`.
-- **`inspection_poses`** — camera pose per image: `image_path`, `tf_translation_x/y/z`, `tf_rotation_x/y/z/w`.
-- **`filtered_objects`** — audit of dropped tracks: `track_id`, `category`, `reason`, `point_count`, `first/last_seen_ns`, `created_at`.
+- **`categories`** — `id`, `name`. Fixed set: Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
+- **`inspections`** — `id`, `started_at`, `is_gt`. **Multiple inspections** can coexist; scope tools with `inspection_id`.
+- **`images`** — `id`, `inspection_id`, `timestamp_ns`, `tf_translation_x/y/z`, `tf_rotation_x/y/z/w`, `filename`. Camera pose lives here (no separate poses table). `filename` (e.g. `14.jpg`) is served at `/inspection/images/<filename>`.
+- **`objects`** — one row per tracked object: `id` (the object id — there is no `track_id`), `category_id` (→ `categories.name`), `centroid_x/y/z`, `min_x/y/z`, `max_x/y/z`, `is_gt`, `created_at`. An object has ONE centroid + 3D bbox; it does **not** store `first_seen`/`last_seen` or a detection count — those are **derived** from `detections`.
+- **`detections`** — one row per per-frame detection: `id`, `image_id` (→ `images`), `object_id` (→ `objects`), `centroid_x/y/z`, `min/max_x/y/z`. An object's detection count = `COUNT(detections)`; first/last seen = `MIN/MAX(images.timestamp_ns)` over its detections→images.
 
-Categories: Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
+Anomaly tables (added by the writer later; the tools no-op cleanly until then):
+
+- **`anomaly_types`** — `id`, `name`.
+- **`abnormal_detections`** — `id`, `gt_image` (→ `images.id`), `inspection_image` (→ `images.id`). An abnormal **image pair** (ground truth vs inspection).
+- **`abnormalities`** — `id`, `pair` (→ `abnormal_detections.id`), `type` (→ `anomaly_types.id`), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
+
+Derived columns the tools compute: `detection_count` = `COUNT(detections)` per object; `first_seen_ns` / `last_seen_ns` = `MIN/MAX(images.timestamp_ns)` over an object's detections→images. The old `observations`, `inspection_poses`, and `filtered_objects` tables and the `track_id` / `observation_count` / `total_point_count` / `aggregated_pcd_path` / `point_count` / `pcd_path` / `mask_path` columns are gone.
 
 ---
 
@@ -272,7 +317,9 @@ Key env vars (see `backend/.env.example` for the full list):
 | `TOOL_ROUTER_MODEL` | `gemma4:26b` | Model for tool selection (call #1) |
 | `STT_BACKEND` | `sensevoice` | `sensevoice` or `whisper` |
 | `VISION_*` | — | `VISION_MAX_TOKENS`, `VISION_TEMPERATURE`, `VISION_REQUEST_TIMEOUT_S` — tune the annotation task only |
-| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | — | SQLite DB + source camera frames |
+| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR_Database/inspection_v2.db` / `../MTR_Database/outputs/images` | SQLite DB + source camera frames |
+| `RERUN_ENABLED` / `RERUN_VIEWER_ADDR` | `true` / `127.0.0.1:9876` | Push 3D highlights to a running `rerun` viewer over TCP |
+| `RERUN_APP_ID` / `RERUN_LEVELING_RPY_DEG` | `inspection_grounding_rerun` / `0.0,20.0,0.0` | Match the grounding scene's app id + leveling rotation so highlights overlay the grounding map |
 | `REPORTS_DIR` / `ANNOTATED_IMAGE_CACHE_DIR` | `../reports` / `./annotated_images` | Reports + annotated-image cache |
 | `PIPER_*` | — | Piper voice/model paths |
 
@@ -309,7 +356,9 @@ docker compose logs -f backend
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/status
 curl -X POST "http://localhost:8000/annotate-image" -F "image=@frame.jpg" -F "question=What anomalies are in this image?"
-sqlite3 /home/wangyiming/code/object_detection_app/output/inspection_mtr.db
+rerun                                            # start the 3D viewer (for highlight_in_rerun)
+sqlite3 MTR_Database/inspection_v2.db
 #   .tables
-#   SELECT category, COUNT(*) FROM objects GROUP BY category ORDER BY COUNT(*) DESC;
+#   SELECT c.name AS category, COUNT(*) AS objects FROM objects o JOIN categories c ON c.id=o.category_id GROUP BY c.name ORDER BY objects DESC;
+#   SELECT id, started_at, is_gt FROM inspections;
 ```

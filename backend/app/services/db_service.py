@@ -19,13 +19,18 @@ logger = logging.getLogger(__name__)
 
 
 class InspectionDBClient:
-    """SQLite client for the MTR inspection object database.
+    """SQLite client for the MTR inspection object database (new multi-inspection schema).
 
-    Provides structured queries and a simple keyword-based natural language
-    lookup so the voice assistant can answer questions about detected objects.
+    Schema: ``categories``, ``inspections``, ``images``, ``objects``, ``detections``
+    (plus ``anomaly_types`` / ``abnormal_detections`` / ``abnormalities``, added by the
+    grounding writer later). An object has a category, centroid and 3D bbox, and appears
+    in one or more per-frame ``detections`` linked to ``images`` (which carry the camera
+    pose and timestamp). Detection counts and first/last-seen timestamps are derived via
+    those joins. Tools accept an optional ``inspection_id`` so the assistant can reason
+    across inspections.
     """
 
-    # Category aliases map colloquial terms to the category strings stored in DB.
+    # Category aliases map colloquial terms to the category names stored in `categories`.
     _CATEGORY_ALIASES: dict[str, str] = {
         "advertisement board": "Advertisement Board",
         "ad board": "Advertisement Board",
@@ -65,7 +70,6 @@ class InspectionDBClient:
         key = name.strip().lower()
         if key in cls._CATEGORY_ALIASES:
             return cls._CATEGORY_ALIASES[key]
-        # Exact case-insensitive match against DB values.
         for alias, canonical in cls._CATEGORY_ALIASES.items():
             if canonical.lower() == key:
                 return canonical
@@ -77,16 +81,22 @@ class InspectionDBClient:
         router: ToolRouter | None = None,
         settings: Settings | None = None,
         vision_annotator: VisionAnnotator | None = None,
+        rerun_visualizer: Any | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.router = router
         self.settings = settings or (router.settings if router else None)
         self.vision_annotator = vision_annotator
+        self.rerun_visualizer = rerun_visualizer
         self._conn: sqlite3.Connection | None = None
         self._last_tool_calls: list[dict[str, Any]] = []
         self._last_tool_results: list[dict[str, Any]] = []
         self._last_query: str = ""
         self._last_chat_history: list[tuple[str, str]] = []
+
+    # ------------------------------------------------------------------
+    # Timestamp / image helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _format_timestamp(ns: int | None) -> str:
@@ -94,8 +104,6 @@ class InspectionDBClient:
             return "unknown"
         try:
             dt = datetime.fromtimestamp(ns / 1e9)
-            # Include an explicit 12-hour AM/PM rendering so the LLM does not have to
-            # convert 24-hour times itself (it was mis-reading 16:58 as "6:58 PM").
             base = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             ampm = dt.strftime("%I:%M %p").lstrip("0").replace(" AM", "am").replace(" PM", "pm")
             return f"{base} ({ampm})"
@@ -112,6 +120,7 @@ class InspectionDBClient:
 
     @staticmethod
     def _image_url(image_path: str | None) -> str | None:
+        """Map a filename (or path) to the frontend image URL `/inspection/images/<name>`."""
         if not image_path:
             return None
         name = Path(image_path).name
@@ -119,30 +128,30 @@ class InspectionDBClient:
             return None
         return f"/inspection/images/{name}"
 
-    def _image_track_info(self, image_path: str) -> str:
-        """Compact 'Track <id> (<category>)' summary of every object seen in one frame.
+    def _image_objects_info(self, filename: str) -> str:
+        """Compact 'Object <id> (<category>)' summary of every object seen in one frame.
 
-        Used to annotate image links with the track IDs they contain, so the LLM can
-        answer 'which track ID' questions even when the user only asked for images.
+        Used to annotate image links with the object IDs they contain, so the LLM can
+        answer 'which object ID' questions even when the user only asked for images.
         """
-        if not image_path:
+        if not filename:
             return ""
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT DISTINCT track_id, category
-            FROM observations
-            WHERE image_path = ? AND track_id IS NOT NULL
-            ORDER BY track_id ASC
+            SELECT DISTINCT o.id, c.name AS category
+            FROM detections d
+            JOIN images i ON i.id = d.image_id
+            JOIN objects o ON o.id = d.object_id
+            JOIN categories c ON c.id = o.category_id
+            WHERE i.filename = ? AND o.id IS NOT NULL
+            ORDER BY o.id ASC
             """,
-            (image_path,),
+            (filename,),
         ).fetchall()
         if not rows:
             return ""
-        parts = []
-        for row in rows:
-            cat = row["category"] or "unknown"
-            parts.append(f"Track {row['track_id']} ({cat})")
+        parts = [f"Object {row['id']} ({row['category'] or 'unknown'})" for row in rows]
         return ", ".join(parts)
 
     _IMAGE_URL_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
@@ -190,12 +199,10 @@ class InspectionDBClient:
 
         q = query.lower()
 
-        # Explicit URL in the query wins.
         url_match = cls._PLAIN_IMAGE_RE.search(q)
         if url_match:
             return url_match.group(1)
 
-        # Ordinal numbers.
         ordinal_match = re.search(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\s+image\b", q)
         if ordinal_match:
             word = ordinal_match.group(1)
@@ -212,7 +219,6 @@ class InspectionDBClient:
             if word == "last":
                 return urls[-1]
 
-        # Numeric "image 1", "image 2".
         numeric_match = re.search(r"\bimage\s+(\d+)\b", q)
         if numeric_match:
             idx = int(numeric_match.group(1)) - 1
@@ -220,7 +226,6 @@ class InspectionDBClient:
                 return urls[idx]
             return urls[-1]
 
-        # Generic references like 'that image', 'this image', 'the image', 'it'.
         if re.search(r"\b(that|this|the|it)\s+image\b|\bthat image\b|\bthis image\b|\bthe image\b|\bdraw (?:on|over) it\b|\bon it\b", q):
             return urls[-1]
 
@@ -238,147 +243,205 @@ class InspectionDBClient:
             self._conn = None
 
     # ------------------------------------------------------------------
+    # Reusable query helpers
+    # ------------------------------------------------------------------
+
+    def _category_id(self, name: str) -> int | None:
+        conn = self._connect()
+        row = conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()
+        return int(row["id"]) if row else None
+
+    def _anomaly_tables_exist(self) -> bool:
+        """True if the writer has added the anomaly tables to this database."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('anomaly_types','abnormal_detections','abnormalities')"
+        ).fetchall()
+        return len(rows) == 3
+
+    def _object_rows(
+        self,
+        where_sql: str = "",
+        params: Sequence[Any] = (),
+        *,
+        order: str = "o.id",
+        limit: int | None = None,
+        inspection_id: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return object rows with derived detection_count / first_seen_ns / last_seen_ns.
+
+        ``where_sql`` is appended after ``WHERE`` (joined with AND to the inspection
+        scope clause when present). ``params`` bind to ``where_sql`` only; the
+        inspection_id parameter is bound last.
+        """
+        conn = self._connect()
+        clauses: list[str] = []
+        if where_sql:
+            clauses.append(where_sql)
+        if inspection_id is not None:
+            clauses.append(
+                "o.id IN (SELECT d.object_id FROM detections d "
+                "JOIN images i ON i.id=d.image_id WHERE i.inspection_id=?)"
+            )
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        order_clause = f" ORDER BY {order}" if order else ""
+        limit_clause = f" LIMIT {int(limit)}" if limit else ""
+        sql = (
+            "SELECT o.id, c.name AS category, "
+            "o.centroid_x, o.centroid_y, o.centroid_z, "
+            "o.min_x, o.min_y, o.min_z, o.max_x, o.max_y, o.max_z, "
+            "o.is_gt, o.created_at, "
+            "(SELECT COUNT(*) FROM detections d WHERE d.object_id=o.id) AS detection_count, "
+            "(SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) AS first_seen_ns, "
+            "(SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) AS last_seen_ns "
+            "FROM objects o JOIN categories c ON c.id=o.category_id"
+            + where + order_clause + limit_clause
+        )
+        all_params = list(params)
+        if inspection_id is not None:
+            all_params.append(inspection_id)
+        return conn.execute(sql, tuple(all_params)).fetchall()
+
+    # ------------------------------------------------------------------
     # Structured queries
     # ------------------------------------------------------------------
 
-    def get_summary(self, top_n: int = 5) -> dict[str, Any]:
-        """Overall counts, category breakdown, and a few notable track IDs."""
+    def get_summary(self, inspection_id: int | None = None, top_n: int = 5) -> dict[str, Any]:
+        """Overall counts, category breakdown, and a few notable objects."""
         conn = self._connect()
-        total_objects = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
-        categories = conn.execute(
-            "SELECT category, COUNT(*) AS count FROM objects GROUP BY category ORDER BY count DESC"
-        ).fetchall()
-        objects = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            ORDER BY total_point_count DESC
-            LIMIT ?
-            """,
-            (top_n,),
-        ).fetchall()
+        if inspection_id is None:
+            total_objects = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        else:
+            total_objects = conn.execute(
+                "SELECT COUNT(DISTINCT o.id) FROM objects o "
+                "JOIN detections d ON d.object_id=o.id JOIN images i ON i.id=d.image_id "
+                "WHERE i.inspection_id=?",
+                (inspection_id,),
+            ).fetchone()[0]
+
+        categories = self._category_counts(inspection_id)
+        objects = self._object_rows(order="detection_count DESC", limit=top_n, inspection_id=inspection_id)
         return {
             "total_objects": total_objects,
-            "categories": [{"category": row["category"], "count": row["count"]} for row in categories],
+            "categories": categories,
             "objects": [dict(row) for row in objects],
+            "inspection_id": inspection_id,
         }
 
+    def _category_counts(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        conn = self._connect()
+        if inspection_id is None:
+            rows = conn.execute(
+                "SELECT c.name AS category, COUNT(*) AS count "
+                "FROM objects o JOIN categories c ON c.id=o.category_id "
+                "GROUP BY c.name ORDER BY count DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT c.name AS category, COUNT(DISTINCT o.id) AS count "
+                "FROM objects o JOIN categories c ON c.id=o.category_id "
+                "WHERE o.id IN (SELECT d.object_id FROM detections d JOIN images i ON i.id=d.image_id WHERE i.inspection_id=?) "
+                "GROUP BY c.name ORDER BY count DESC",
+                (inspection_id,),
+            ).fetchall()
+        return [{"category": row["category"], "count": row["count"]} for row in rows]
+
     def get_categories(self) -> list[str]:
-        """Return the distinct category names present in the objects table."""
+        """Return the distinct category names present in the categories table."""
+        conn = self._connect()
+        rows = conn.execute("SELECT name FROM categories ORDER BY name").fetchall()
+        return [row["name"] for row in rows]
+
+    def get_inspections(self) -> list[dict[str, Any]]:
+        """List inspections with per-inspection object and detection counts."""
         conn = self._connect()
         rows = conn.execute(
-            "SELECT DISTINCT category FROM objects WHERE category IS NOT NULL ORDER BY category"
+            """
+            SELECT ins.id, ins.started_at, ins.is_gt,
+                   (SELECT COUNT(DISTINCT d.object_id) FROM detections d
+                    JOIN images i ON i.id=d.image_id WHERE i.inspection_id=ins.id) AS object_count,
+                   (SELECT COUNT(*) FROM detections d
+                    JOIN images i ON i.id=d.image_id WHERE i.inspection_id=ins.id) AS detection_count
+            FROM inspections ins
+            ORDER BY ins.id
+            """
         ).fetchall()
-        return [row["category"] for row in rows]
+        return [dict(row) for row in rows]
 
     def query_database(self, sql_query: str, limit: int = 100) -> dict[str, Any]:
         """Execute a read-only SELECT query and return the results."""
         return self.run_sql_query(sql_query, limit)
 
-    def get_objects_by_category(self, category: str, limit: int = 20) -> list[dict[str, Any]]:
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   bbox3d_min_x, bbox3d_min_y, bbox3d_min_z,
-                   bbox3d_max_x, bbox3d_max_y, bbox3d_max_z,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            WHERE category = ?
-            ORDER BY total_point_count DESC
-            LIMIT ?
-            """,
-            (category, limit),
-        ).fetchall()
+    def get_objects_by_category(self, category: str, limit: int = 20, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        rows = self._object_rows(
+            "c.name = ?", (category,), order="detection_count DESC", limit=limit, inspection_id=inspection_id
+        )
         return [dict(row) for row in rows]
 
-    def get_category_objects_with_coordinates(self, category: str) -> list[dict[str, Any]]:
-        """Return every object in a category with centroid and bounding-box coordinates."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   bbox3d_min_x, bbox3d_min_y, bbox3d_min_z,
-                   bbox3d_max_x, bbox3d_max_y, bbox3d_max_z,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            WHERE category = ?
-            ORDER BY first_seen_ns
-            """,
-            (category,),
-        ).fetchall()
+    def get_category_objects_with_coordinates(self, category: str, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        rows = self._object_rows("c.name = ?", (category,), order="first_seen_ns", inspection_id=inspection_id)
         return [dict(row) for row in rows]
 
     def get_category_objects_with_images(
-        self, category: str, limit: int = 5
+        self, category: str, limit: int = 5, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
-        """Return objects in a category with centroid and one sample image path each."""
+        """Return objects in a category with centroid and one sample image filename each."""
+        rows = self._object_rows(
+            "c.name = ?", (category,), order="first_seen_ns", limit=limit, inspection_id=inspection_id
+        )
         conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT
-                o.track_id,
-                o.centroid_x, o.centroid_y, o.centroid_z,
-                o.first_seen_ns,
-                (SELECT image_path
-                 FROM observations
-                 WHERE track_id = o.track_id AND image_path IS NOT NULL
-                 ORDER BY timestamp_ns
-                 LIMIT 1) AS sample_image_path
-            FROM objects o
-            WHERE o.category = ?
-            ORDER BY o.first_seen_ns
-            LIMIT ?
-            """,
-            (category, limit),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            sample = conn.execute(
+                "SELECT i.filename FROM detections d JOIN images i ON i.id=d.image_id "
+                "WHERE d.object_id=? AND i.filename IS NOT NULL ORDER BY i.timestamp_ns LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            out.append({**dict(row), "sample_image_path": sample["filename"] if sample else None})
+        return out
 
     def get_category_proximity(
         self,
         target_category: str,
         other_categories: list[str],
         radius_m: float = 2.0,
+        inspection_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """For each object in *target_category*, count how many objects from
-        *other_categories* have centroids within *radius_m* meters.
-        """
-        targets = self.get_category_objects_with_coordinates(target_category)
+        *other_categories* have centroids within *radius_m* meters."""
+        targets = self._object_rows(
+            "c.name = ?", (target_category,), inspection_id=inspection_id
+        )
         if not targets or not other_categories:
             return []
-
-        conn = self._connect()
         placeholders = ",".join("?" for _ in other_categories)
-        others = conn.execute(
-            f"""
-            SELECT track_id, category, centroid_x, centroid_y, centroid_z
-            FROM objects
-            WHERE category IN ({placeholders})
-            """,
-            other_categories,
-        ).fetchall()
+        others = self._object_rows(
+            f"c.name IN ({placeholders})", tuple(other_categories), inspection_id=inspection_id
+        )
 
         results = []
         for target in targets:
             tx, ty, tz = target["centroid_x"], target["centroid_y"], target["centroid_z"]
+            if tx is None or ty is None or tz is None:
+                continue
             nearby: dict[str, int] = {}
             for row in others:
-                if row["track_id"] == target["track_id"]:
+                if row["id"] == target["id"]:
                     continue
-                dx = row["centroid_x"] - tx
-                dy = row["centroid_y"] - ty
-                dz = row["centroid_z"] - tz
+                ox, oy, oz = row["centroid_x"], row["centroid_y"], row["centroid_z"]
+                if ox is None or oy is None or oz is None:
+                    continue
+                dx, dy, dz = ox - tx, oy - ty, oz - tz
                 dist = (dx * dx + dy * dy + dz * dz) ** 0.5
                 if dist <= radius_m:
                     cat = row["category"]
                     nearby[cat] = nearby.get(cat, 0) + 1
             results.append(
                 {
-                    "track_id": target["track_id"],
+                    "object_id": target["id"],
                     "centroid_x": tx,
                     "centroid_y": ty,
                     "centroid_z": tz,
@@ -387,152 +450,135 @@ class InspectionDBClient:
             )
         return results
 
-    def get_object_by_track_id(self, track_id: int) -> dict[str, Any] | None:
+    def get_object_by_id(self, object_id: int) -> dict[str, Any] | None:
         conn = self._connect()
         row = conn.execute(
             """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   bbox3d_min_x, bbox3d_min_y, bbox3d_min_z,
-                   bbox3d_max_x, bbox3d_max_y, bbox3d_max_z,
-                   first_seen_ns, last_seen_ns, aggregated_pcd_path
-            FROM objects
-            WHERE track_id = ?
+            SELECT o.id, c.name AS category,
+                   o.centroid_x, o.centroid_y, o.centroid_z,
+                   o.min_x, o.min_y, o.min_z, o.max_x, o.max_y, o.max_z,
+                   o.is_gt, o.created_at,
+                   (SELECT COUNT(*) FROM detections d WHERE d.object_id=o.id) AS detection_count,
+                   (SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id
+                    WHERE d.object_id=o.id) AS first_seen_ns,
+                   (SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id
+                    WHERE d.object_id=o.id) AS last_seen_ns
+            FROM objects o JOIN categories c ON c.id=o.category_id
+            WHERE o.id = ?
             """,
-            (track_id,),
+            (object_id,),
         ).fetchone()
         if row is None:
             return None
         obj = dict(row)
-        obj["observations"] = conn.execute(
+        obj["detections"] = conn.execute(
             """
-            SELECT timestamp_ns, image_file_name, point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   pcd_path, mask_path, image_path
-            FROM observations
-            WHERE track_id = ?
-            ORDER BY timestamp_ns
+            SELECT d.id, i.timestamp_ns, i.filename, i.inspection_id,
+                   d.centroid_x, d.centroid_y, d.centroid_z,
+                   d.min_x, d.min_y, d.min_z, d.max_x, d.max_y, d.max_z
+            FROM detections d JOIN images i ON i.id=d.image_id
+            WHERE d.object_id = ?
+            ORDER BY i.timestamp_ns
             """,
-            (track_id,),
+            (object_id,),
         ).fetchall()
         return obj
 
-    def get_top_objects(self, n: int = 5) -> list[dict[str, Any]]:
+    def get_top_objects(self, n: int = 5, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        rows = self._object_rows(order="detection_count DESC", limit=n, inspection_id=inspection_id)
+        return [dict(row) for row in rows]
+
+    def get_recent_objects(self, limit: int = 5, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        rows = self._object_rows(order="last_seen_ns DESC", limit=limit, inspection_id=inspection_id)
+        return [dict(row) for row in rows]
+
+    def get_object_timeline(self, object_id: int) -> list[dict[str, Any]]:
+        """Return every detection for an object, ordered by timestamp."""
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z
-            FROM objects
-            ORDER BY total_point_count DESC
-            LIMIT ?
+            SELECT i.timestamp_ns, i.filename, d.centroid_x, d.centroid_y, d.centroid_z
+            FROM detections d JOIN images i ON i.id=d.image_id
+            WHERE d.object_id = ?
+            ORDER BY i.timestamp_ns
             """,
-            (n,),
+            (object_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_recent_objects(self, limit: int = 5) -> list[dict[str, Any]]:
+    def get_object_image_paths(self, object_id: int) -> list[str]:
+        """Return distinct image URLs for an object."""
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z, last_seen_ns
-            FROM objects
-            ORDER BY last_seen_ns DESC
-            LIMIT ?
+            SELECT DISTINCT i.filename
+            FROM detections d JOIN images i ON i.id=d.image_id
+            WHERE d.object_id = ? AND i.filename IS NOT NULL
+            ORDER BY i.timestamp_ns
             """,
-            (limit,),
+            (object_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._image_url(row["filename"]) for row in rows if row["filename"]]
 
-    def get_object_timeline(self, track_id: int) -> list[dict[str, Any]]:
-        """Return every observation for a track, ordered by timestamp."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT timestamp_ns, image_file_name, image_path, point_count,
-                   centroid_x, centroid_y, centroid_z
-            FROM observations
-            WHERE track_id = ?
-            ORDER BY timestamp_ns
-            """,
-            (track_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_object_image_paths(self, track_id: int) -> list[str]:
-        """Return distinct image paths for a track."""
-        conn = self._connect()
-        rows = conn.execute(
-            "SELECT DISTINCT image_path FROM observations WHERE track_id = ? AND image_path IS NOT NULL",
-            (track_id,),
-        ).fetchall()
-        return [row["image_path"] for row in rows if row["image_path"]]
-
-    def get_category_timeline(self, category: str) -> list[dict[str, Any]]:
+    def get_category_timeline(self, category: str, inspection_id: int | None = None) -> list[dict[str, Any]]:
         """Return first/last seen timestamps for every object in a category."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            WHERE category = ?
-            ORDER BY first_seen_ns
-            """,
-            (category,),
-        ).fetchall()
+        rows = self._object_rows("c.name = ?", (category,), order="first_seen_ns", inspection_id=inspection_id)
         return [dict(row) for row in rows]
 
-    def get_inspection_timeline(self) -> list[dict[str, Any]]:
-        """Return first/last seen timestamps for every object, ordered by first_seen."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            ORDER BY first_seen_ns
-            """,
-        ).fetchall()
+    def get_inspection_timeline(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """Return every object ordered by first-seen timestamp."""
+        rows = self._object_rows(order="first_seen_ns", inspection_id=inspection_id)
         return [dict(row) for row in rows]
 
-    def get_category_windows(self, categories: list[str]) -> list[dict[str, Any]]:
+    def get_category_windows(self, categories: list[str], inspection_id: int | None = None) -> list[dict[str, Any]]:
         """Return first/last detection windows for one or more categories."""
         if not categories:
             return []
-        placeholders = ",".join("?" for _ in categories)
         conn = self._connect()
+        placeholders = ",".join("?" for _ in categories)
+        scope = ""
+        params: list[Any] = list(categories)
+        if inspection_id is not None:
+            scope = " AND i.inspection_id=?"
+            params.append(inspection_id)
         rows = conn.execute(
             f"""
-            SELECT category,
-                   MIN(first_seen_ns) AS first_seen_ns,
-                   MAX(last_seen_ns) AS last_seen_ns,
-                   COUNT(*) AS object_count
-            FROM objects
-            WHERE category IN ({placeholders})
-            GROUP BY category
+            SELECT c.name AS category,
+                   MIN(i.timestamp_ns) AS first_seen_ns,
+                   MAX(i.timestamp_ns) AS last_seen_ns,
+                   COUNT(DISTINCT o.id) AS object_count
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE c.name IN ({placeholders}){scope}
+            GROUP BY c.name
             ORDER BY first_seen_ns
             """,
-            categories,
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_temporal_clusters(self, window_ms: int = 500, top_n: int = 20) -> list[dict[str, Any]]:
-        """Group objects into time-window clusters and count categories in each.
+    def get_temporal_clusters(self, window_ms: int = 500, top_n: int = 20, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """Group detections into time-window clusters and count categories in each.
 
-        A cluster is a consecutive run of object first-seen timestamps that are
-        within *window_ms* of each other. This reveals which kinds of objects were
-        seen together at a given moment. Uses the `objects` table, not `observations`.
+        A cluster is a consecutive run of detection timestamps within *window_ms* of
+        each other, revealing which kinds of objects were seen together at a moment.
         """
         conn = self._connect()
+        scope = " WHERE i.inspection_id=?" if inspection_id is not None else ""
+        params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
         rows = conn.execute(
-            """
-            SELECT first_seen_ns, category
-            FROM objects
-            WHERE category IS NOT NULL AND first_seen_ns IS NOT NULL
-            ORDER BY first_seen_ns
-            """
+            f"""
+            SELECT i.timestamp_ns, c.name AS category
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE i.timestamp_ns IS NOT NULL{scope}
+            ORDER BY i.timestamp_ns
+            """,
+            params,
         ).fetchall()
 
         if not rows:
@@ -541,48 +587,38 @@ class InspectionDBClient:
         window_ns = window_ms * 1_000_000
         clusters: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
-
         for row in rows:
-            ts = row["first_seen_ns"]
+            ts = row["timestamp_ns"]
             category = row["category"]
             if current is None or ts - current["end_ns"] > window_ns:
                 if current is not None:
                     clusters.append(current)
-                current = {
-                    "start_ns": ts,
-                    "end_ns": ts,
-                    "categories": {},
-                    "object_count": 0,
-                }
+                current = {"start_ns": ts, "end_ns": ts, "categories": {}, "detection_count": 0}
             current["end_ns"] = ts
             current["categories"][category] = current["categories"].get(category, 0) + 1
-            current["object_count"] += 1
-
+            current["detection_count"] += 1
         if current is not None:
             clusters.append(current)
 
-        # Sort by total object count so the busiest moments come first.
-        clusters.sort(key=lambda c: c["object_count"], reverse=True)
+        clusters.sort(key=lambda c: c["detection_count"], reverse=True)
         return clusters[:top_n]
 
     # ------------------------------------------------------------------
-    # Additional spatial / temporal / audit helpers
+    # Additional spatial / temporal helpers
     # ------------------------------------------------------------------
 
     def _get_inspection_base_date(self) -> datetime.date:
-        """Return the date of the earliest observation, or today if none."""
+        """Return the date of the earliest image, or today if none."""
         conn = self._connect()
-        row = conn.execute("SELECT MIN(timestamp_ns) FROM observations").fetchone()
+        row = conn.execute("SELECT MIN(timestamp_ns) FROM images").fetchone()
         if row and row[0]:
             return datetime.fromtimestamp(row[0] / 1e9).date()
         return datetime.now().date()
 
     def _get_inspection_time_range_ns(self) -> tuple[int, int]:
-        """Return (min_timestamp_ns, max_timestamp_ns) from observations."""
+        """Return (min_timestamp_ns, max_timestamp_ns) from images."""
         conn = self._connect()
-        row = conn.execute(
-            "SELECT MIN(timestamp_ns), MAX(timestamp_ns) FROM observations"
-        ).fetchone()
+        row = conn.execute("SELECT MIN(timestamp_ns), MAX(timestamp_ns) FROM images").fetchone()
         if row and row[0] and row[1]:
             return int(row[0]), int(row[1])
         return 0, 0
@@ -590,11 +626,8 @@ class InspectionDBClient:
     def _parse_time_string(self, value: str | int | float) -> int | None:
         """Convert a time string or integer into nanoseconds since epoch.
 
-        Supports:
-        - integer/float nanoseconds
-        - ISO datetime strings
-        - clock-only strings (e.g. '16:51:45', '4:51 PM'), interpreted on the
-          inspection date
+        Supports integer/float nanoseconds, ISO datetime strings, and clock-only
+        strings (e.g. '16:51:45', '4:51 PM') interpreted on the inspection date.
         """
         if isinstance(value, (int, float)):
             return int(value)
@@ -623,8 +656,6 @@ class InspectionDBClient:
                 t = datetime.strptime(s, fmt).time()
                 dt = datetime.combine(base, t)
                 ns = int(dt.timestamp() * 1e9)
-                # If the bare time falls outside the recorded inspection window,
-                # try shifting by 12 hours to handle colloquial AM/PM omission.
                 if min_ns and max_ns and not (min_ns <= ns <= max_ns):
                     shifted = ns + int(12 * 3600 * 1e9)
                     if min_ns <= shifted <= max_ns:
@@ -639,62 +670,71 @@ class InspectionDBClient:
         logger.warning("Could not parse time string: %r", s)
         return None
 
-    def get_observation_counts_by_category(self) -> list[dict[str, Any]]:
-        """Per-frame observation counts by category."""
+    def get_detection_counts_by_category(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """Per-frame detection counts by category."""
         conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT category, COUNT(*) AS count
-            FROM observations
-            WHERE category IS NOT NULL
-            GROUP BY category
-            ORDER BY count DESC
-            """
-        ).fetchall()
+        if inspection_id is None:
+            rows = conn.execute(
+                "SELECT c.name AS category, COUNT(*) AS count "
+                "FROM detections d JOIN objects o ON o.id=d.object_id "
+                "JOIN categories c ON c.id=o.category_id "
+                "GROUP BY c.name ORDER BY count DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT c.name AS category, COUNT(*) AS count "
+                "FROM detections d JOIN images i ON i.id=d.image_id "
+                "JOIN objects o ON o.id=d.object_id JOIN categories c ON c.id=o.category_id "
+                "WHERE i.inspection_id=? GROUP BY c.name ORDER BY count DESC",
+                (inspection_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_objects_in_time_range(
-        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50
+        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
         """Objects whose detection span overlaps [start, end]."""
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return []
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            WHERE first_seen_ns <= ? AND last_seen_ns >= ?
-            ORDER BY first_seen_ns
-            LIMIT ?
-            """,
-            (end_ns, start_ns, limit),
-        ).fetchall()
+        where = (
+            "(SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) <= ? AND "
+            "(SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) >= ?"
+        )
+        rows = self._object_rows(
+            where, (end_ns, start_ns), order="first_seen_ns", limit=limit, inspection_id=inspection_id
+        )
         return [dict(row) for row in rows]
 
-    def get_observations_in_time_range(
-        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50
+    def get_detections_in_time_range(
+        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
-        """Per-frame observations captured within [start, end]."""
+        """Per-frame detections captured within [start, end]."""
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return []
         conn = self._connect()
+        scope = " AND i.inspection_id=?" if inspection_id is not None else ""
+        params: list[Any] = [start_ns, end_ns]
+        if inspection_id is not None:
+            params.append(inspection_id)
         rows = conn.execute(
-            """
-            SELECT timestamp_ns, track_id, category, image_file_name, point_count,
-                   centroid_x, centroid_y, centroid_z, image_path
-            FROM observations
-            WHERE timestamp_ns >= ? AND timestamp_ns <= ?
-            ORDER BY timestamp_ns
+            f"""
+            SELECT i.timestamp_ns, d.object_id, c.name AS category, i.filename,
+                   d.centroid_x, d.centroid_y, d.centroid_z
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE i.timestamp_ns >= ? AND i.timestamp_ns <= ?{scope}
+            ORDER BY i.timestamp_ns
             LIMIT ?
             """,
-            (start_ns, end_ns, limit),
+            tuple(params + [limit]),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -705,16 +745,15 @@ class InspectionDBClient:
         z: float,
         radius_m: float = 2.0,
         category: str | None = None,
+        inspection_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Objects whose centroid is within radius_m of (x, y, z)."""
-        conn = self._connect()
-        sql = "SELECT track_id, category, centroid_x, centroid_y, centroid_z FROM objects"
+        where = "o.centroid_x IS NOT NULL"
         params: list[Any] = []
         if category:
-            sql += " WHERE category = ?"
+            where += " AND c.name = ?"
             params.append(category)
-        rows = conn.execute(sql, params).fetchall()
-
+        rows = self._object_rows(where, tuple(params), inspection_id=inspection_id)
         results = []
         for row in rows:
             dx = row["centroid_x"] - x
@@ -726,63 +765,56 @@ class InspectionDBClient:
         results.sort(key=lambda r: r["distance_m"])
         return results
 
-    def get_category_sample_images(self, category: str, limit: int = 5) -> list[str]:
-        """Distinct image paths for a category, sampled randomly."""
+    def get_category_sample_images(self, category: str, limit: int = 5, inspection_id: int | None = None) -> list[str]:
+        """Distinct image URLs for a category, sampled randomly."""
         conn = self._connect()
+        scope = " AND i.inspection_id=?" if inspection_id is not None else ""
+        params: list[Any] = [category]
+        if inspection_id is not None:
+            params.append(inspection_id)
+        params.append(limit)
         rows = conn.execute(
-            """
-            SELECT DISTINCT image_path
-            FROM observations
-            WHERE category = ? AND image_path IS NOT NULL
+            f"""
+            SELECT DISTINCT i.filename
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE c.name = ? AND i.filename IS NOT NULL{scope}
             ORDER BY RANDOM()
             LIMIT ?
             """,
-            (category, limit),
+            tuple(params),
         ).fetchall()
-        return [row["image_path"] for row in rows if row["image_path"]]
+        return [self._image_url(row["filename"]) for row in rows if row["filename"]]
 
-    def get_inspection_poses(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Camera/robot poses from the inspection_poses table."""
+    def get_inspection_poses(self, limit: int = 20, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """Camera/robot poses (one per image), now stored on the images table."""
         conn = self._connect()
+        scope = " WHERE inspection_id=?" if inspection_id is not None else ""
+        params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
         rows = conn.execute(
-            """
-            SELECT image_path,
+            f"""
+            SELECT id, inspection_id, filename,
                    tf_translation_x, tf_translation_y, tf_translation_z,
                    tf_rotation_x, tf_rotation_y, tf_rotation_z, tf_rotation_w
-            FROM inspection_poses
+            FROM images{scope}
             LIMIT ?
             """,
-            (limit,),
+            params + (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_filtered_objects(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Tracks/objects dropped by the merge/filter layer."""
+    def get_object_distance(self, object_id_a: int, object_id_b: int) -> dict[str, Any] | None:
+        """Distance between the centroids of two objects."""
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT track_id, category, reason, point_count,
-                   bbox3d_min_x, bbox3d_min_y, bbox3d_min_z,
-                   bbox3d_max_x, bbox3d_max_y, bbox3d_max_z,
-                   first_seen_ns, last_seen_ns
-            FROM filtered_objects
-            ORDER BY created_at DESC
-            LIMIT ?
+            SELECT o.id, c.name AS category, o.centroid_x, o.centroid_y, o.centroid_z
+            FROM objects o JOIN categories c ON c.id=o.category_id
+            WHERE o.id IN (?, ?)
             """,
-            (limit,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_object_distance(self, track_id_a: int, track_id_b: int) -> dict[str, Any] | None:
-        """Distance between the centroids of two tracks."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT track_id, category, centroid_x, centroid_y, centroid_z
-            FROM objects
-            WHERE track_id IN (?, ?)
-            """,
-            (track_id_a, track_id_b),
+            (object_id_a, object_id_b),
         ).fetchall()
         if len(rows) != 2:
             return None
@@ -791,49 +823,61 @@ class InspectionDBClient:
         dy = a["centroid_y"] - b["centroid_y"]
         dz = a["centroid_z"] - b["centroid_z"]
         return {
-            "track_id_a": a["track_id"],
+            "object_id_a": a["id"],
             "category_a": a["category"],
-            "track_id_b": b["track_id"],
+            "object_id_b": b["id"],
             "category_b": b["category"],
             "distance_m": round((dx * dx + dy * dy + dz * dz) ** 0.5, 3),
         }
 
-    def get_category_bounding_box(self, category: str) -> dict[str, Any] | None:
+    def get_category_bounding_box(self, category: str, inspection_id: int | None = None) -> dict[str, Any] | None:
         """Axis-aligned 3D bounding box of all objects in a category."""
         conn = self._connect()
+        scope = ""
+        params: list[Any] = [category]
+        if inspection_id is not None:
+            scope = " AND o.id IN (SELECT d.object_id FROM detections d JOIN images i ON i.id=d.image_id WHERE i.inspection_id=?)"
+            params.append(inspection_id)
         row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count,
-                   MIN(centroid_x) AS min_cx, MAX(centroid_x) AS max_cx,
-                   MIN(centroid_y) AS min_cy, MAX(centroid_y) AS max_cy,
-                   MIN(centroid_z) AS min_cz, MAX(centroid_z) AS max_cz,
-                   MIN(bbox3d_min_x) AS min_x, MAX(bbox3d_max_x) AS max_x,
-                   MIN(bbox3d_min_y) AS min_y, MAX(bbox3d_max_y) AS max_y,
-                   MIN(bbox3d_min_z) AS min_z, MAX(bbox3d_max_z) AS max_z
-            FROM objects
-            WHERE category = ?
+                   MIN(o.centroid_x) AS min_cx, MAX(o.centroid_x) AS max_cx,
+                   MIN(o.centroid_y) AS min_cy, MAX(o.centroid_y) AS max_cy,
+                   MIN(o.centroid_z) AS min_cz, MAX(o.centroid_z) AS max_cz,
+                   MIN(o.min_x) AS min_x, MAX(o.max_x) AS max_x,
+                   MIN(o.min_y) AS min_y, MAX(o.max_y) AS max_y,
+                   MIN(o.min_z) AS min_z, MAX(o.max_z) AS max_z
+            FROM objects o JOIN categories c ON c.id=o.category_id
+            WHERE c.name = ?{scope}
             """,
-            (category,),
+            tuple(params),
         ).fetchone()
         if row is None or row["count"] == 0:
             return None
         return dict(row)
 
-    def get_category_observation_timeline(
-        self, category: str, bucket_seconds: int = 60
+    def get_category_detection_timeline(
+        self, category: str, bucket_seconds: int = 60, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
-        """Per-time-bucket observation counts for a category."""
+        """Per-time-bucket detection counts for a category."""
         conn = self._connect()
         bucket_ns = int(bucket_seconds * 1e9)
+        scope = " AND i.inspection_id=?" if inspection_id is not None else ""
+        params: list[Any] = [bucket_ns, bucket_ns, category]
+        if inspection_id is not None:
+            params.append(inspection_id)
         rows = conn.execute(
-            """
-            SELECT (timestamp_ns / ?) * ? AS bucket_ns, COUNT(*) AS count
-            FROM observations
-            WHERE category = ? AND timestamp_ns IS NOT NULL
+            f"""
+            SELECT (i.timestamp_ns / ?) * ? AS bucket_ns, COUNT(*) AS count
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE c.name = ? AND i.timestamp_ns IS NOT NULL{scope}
             GROUP BY bucket_ns
             ORDER BY bucket_ns
             """,
-            (bucket_ns, bucket_ns, category),
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -843,59 +887,56 @@ class InspectionDBClient:
         start_time: str | int | float,
         end_time: str | int | float,
         limit: int = 50,
+        inspection_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Objects of a category whose detection span overlaps a time window."""
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return []
+        where = (
+            "c.name = ? AND "
+            "(SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) <= ? AND "
+            "(SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) >= ?"
+        )
+        rows = self._object_rows(
+            where, (category, end_ns, start_ns), order="first_seen_ns", limit=limit, inspection_id=inspection_id
+        )
+        return [dict(row) for row in rows]
+
+    def get_object_movement(self, object_id: int) -> list[dict[str, Any]]:
+        """Centroid path of an object across its detections."""
         conn = self._connect()
         rows = conn.execute(
             """
-            SELECT track_id, category, observation_count, total_point_count,
-                   centroid_x, centroid_y, centroid_z,
-                   first_seen_ns, last_seen_ns
-            FROM objects
-            WHERE category = ? AND first_seen_ns <= ? AND last_seen_ns >= ?
-            ORDER BY first_seen_ns
-            LIMIT ?
+            SELECT i.timestamp_ns, d.centroid_x, d.centroid_y, d.centroid_z, i.filename
+            FROM detections d JOIN images i ON i.id=d.image_id
+            WHERE d.object_id = ?
+            ORDER BY i.timestamp_ns
             """,
-            (category, end_ns, start_ns, limit),
+            (object_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_object_movement(self, track_id: int) -> list[dict[str, Any]]:
-        """Centroid path of a track across its observations."""
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT timestamp_ns, centroid_x, centroid_y, centroid_z, point_count, image_path
-            FROM observations
-            WHERE track_id = ?
-            ORDER BY timestamp_ns
-            """,
-            (track_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_nearest_objects_to_track(
-        self, track_id: int, radius_m: float = 2.0
+    def get_nearest_objects_to_object(
+        self, object_id: int, radius_m: float = 2.0, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
-        """Other objects within radius_m of a track's centroid."""
+        """Other objects within radius_m of an object's centroid."""
         conn = self._connect()
         target = conn.execute(
-            "SELECT category, centroid_x, centroid_y, centroid_z FROM objects WHERE track_id = ?",
-            (track_id,),
+            "SELECT centroid_x, centroid_y, centroid_z FROM objects WHERE id=?",
+            (object_id,),
         ).fetchone()
-        if target is None:
+        if target is None or target["centroid_x"] is None:
             return []
         tx, ty, tz = target["centroid_x"], target["centroid_y"], target["centroid_z"]
-        rows = conn.execute(
-            "SELECT track_id, category, centroid_x, centroid_y, centroid_z FROM objects WHERE track_id != ?",
-            (track_id,),
-        ).fetchall()
+        rows = self._object_rows("o.id != ?", (object_id,), inspection_id=inspection_id)
         results = []
         for row in rows:
+            if row["centroid_x"] is None:
+                continue
             dx = row["centroid_x"] - tx
             dy = row["centroid_y"] - ty
             dz = row["centroid_z"] - tz
@@ -911,35 +952,34 @@ class InspectionDBClient:
         end_time: str | int | float,
         category: str | None = None,
         limit: int = 5,
+        inspection_id: int | None = None,
     ) -> list[str]:
-        """Representative image paths captured in a time window, optionally filtered by category.
-
-        Returns up to *limit* images spread evenly across the requested window rather
-        than a random handful, so the raw output reflects the full interval.
-        """
+        """Representative image URLs captured in a time window, optionally filtered by category."""
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return []
         conn = self._connect()
         sql = """
-            SELECT image_path, MIN(timestamp_ns) AS first_seen
-            FROM observations
-            WHERE timestamp_ns >= ? AND timestamp_ns <= ? AND image_path IS NOT NULL
+            SELECT i.filename, MIN(i.timestamp_ns) AS first_seen
+            FROM images i
+            WHERE i.timestamp_ns >= ? AND i.timestamp_ns <= ? AND i.filename IS NOT NULL
         """
         params: list[Any] = [start_ns, end_ns]
         if category:
-            sql += " AND category = ?"
+            sql += " AND i.id IN (SELECT d.image_id FROM detections d JOIN objects o ON o.id=d.object_id JOIN categories c ON c.id=o.category_id WHERE c.name=?)"
             params.append(category)
-        sql += " GROUP BY image_path ORDER BY first_seen ASC"
-        rows = conn.execute(sql, params).fetchall()
-        distinct = [row["image_path"] for row in rows if row["image_path"]]
+        if inspection_id is not None:
+            sql += " AND i.inspection_id=?"
+            params.append(inspection_id)
+        sql += " GROUP BY i.filename ORDER BY first_seen ASC"
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        distinct = [self._image_url(row["filename"]) for row in rows if row["filename"]]
+        distinct = [d for d in distinct if d]
         if not distinct:
             return []
         if len(distinct) <= limit:
             return distinct
-
-        # Evenly sample *limit* frames across the interval.
         step = max(1, (len(distinct) - 1) / (limit - 1))
         sampled: list[str] = []
         seen: set[str] = set()
@@ -952,15 +992,15 @@ class InspectionDBClient:
         return sampled
 
     def get_category_cooccurrence(
-        self, window_ms: int = 500, top_n: int = 10
+        self, window_ms: int = 500, top_n: int = 10, inspection_id: int | None = None
     ) -> list[dict[str, Any]]:
         """Count how often pairs of categories appear in the same temporal cluster."""
-        clusters = self.get_temporal_clusters(window_ms=window_ms, top_n=10000)
+        clusters = self.get_temporal_clusters(window_ms=window_ms, top_n=10000, inspection_id=inspection_id)
         pair_counts: dict[tuple[str, str], int] = {}
         for cluster in clusters:
             cats = sorted(cluster["categories"].keys())
             for i, a in enumerate(cats):
-                for b in cats[i + 1 :]:
+                for b in cats[i + 1:]:
                     key = (a, b)
                     pair_counts[key] = pair_counts.get(key, 0) + 1
         sorted_pairs = sorted(pair_counts.items(), key=lambda item: -item[1])[:top_n]
@@ -971,43 +1011,48 @@ class InspectionDBClient:
         center_time: str | int | float,
         window_ms: int = 500,
         limit: int = 50,
+        inspection_id: int | None = None,
     ) -> dict[str, Any]:
         """Objects with coordinates detected around a specific time."""
         center_ns = self._parse_time_string(center_time)
         if center_ns is None:
-            return {"center_time": center_time, "objects": [], "observations": [], "category_counts": {}}
+            return {"center_time": center_time, "objects": [], "detections": [], "category_counts": {}}
         window_ns = window_ms * 1_000_000
         start_ns = center_ns - window_ns // 2
         end_ns = center_ns + window_ns // 2
         conn = self._connect()
-        obs_rows = conn.execute(
-            """
-            SELECT timestamp_ns, track_id, category, centroid_x, centroid_y, centroid_z, image_path
-            FROM observations
-            WHERE timestamp_ns >= ? AND timestamp_ns <= ?
-            ORDER BY timestamp_ns
+        scope = " AND i.inspection_id=?" if inspection_id is not None else ""
+        det_params: list[Any] = [start_ns, end_ns]
+        if inspection_id is not None:
+            det_params.append(inspection_id)
+        det_rows = conn.execute(
+            f"""
+            SELECT i.timestamp_ns, d.object_id, c.name AS category,
+                   d.centroid_x, d.centroid_y, d.centroid_z, i.filename
+            FROM detections d
+            JOIN images i ON i.id=d.image_id
+            JOIN objects o ON o.id=d.object_id
+            JOIN categories c ON c.id=o.category_id
+            WHERE i.timestamp_ns >= ? AND i.timestamp_ns <= ?{scope}
+            ORDER BY i.timestamp_ns
             LIMIT ?
             """,
-            (start_ns, end_ns, limit),
+            tuple(det_params + [limit]),
         ).fetchall()
-        observations = [dict(row) for row in obs_rows]
+        detections = [dict(row) for row in det_rows]
 
-        obj_rows = conn.execute(
-            """
-            SELECT track_id, category, centroid_x, centroid_y, centroid_z,
-                   first_seen_ns, last_seen_ns, observation_count
-            FROM objects
-            WHERE first_seen_ns <= ? AND last_seen_ns >= ?
-            ORDER BY first_seen_ns
-            LIMIT ?
-            """,
-            (end_ns, start_ns, limit),
-        ).fetchall()
+        where = (
+            "(SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) <= ? AND "
+            "(SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) >= ?"
+        )
+        obj_rows = self._object_rows(where, (end_ns, start_ns), order="first_seen_ns", limit=limit, inspection_id=inspection_id)
         objects = [dict(row) for row in obj_rows]
 
         category_counts: dict[str, int] = {}
-        for obs in observations:
-            cat = obs.get("category")
+        for det in detections:
+            cat = det.get("category")
             if cat:
                 category_counts[cat] = category_counts.get(cat, 0) + 1
 
@@ -1018,8 +1063,101 @@ class InspectionDBClient:
             "end_time_ns": end_ns,
             "category_counts": category_counts,
             "objects": objects,
-            "observations": observations,
+            "detections": detections,
         }
+
+    # ------------------------------------------------------------------
+    # Anomaly queries (guarded — tables are added by the writer later)
+    # ------------------------------------------------------------------
+
+    def get_anomaly_types(self) -> list[str]:
+        if not self._anomaly_tables_exist():
+            return []
+        conn = self._connect()
+        rows = conn.execute("SELECT name FROM anomaly_types ORDER BY name").fetchall()
+        return [row["name"] for row in rows]
+
+    def get_anomaly_summary(self, inspection_id: int | None = None) -> dict[str, Any]:
+        if not self._anomaly_tables_exist():
+            return {"available": False}
+        conn = self._connect()
+        scope = " WHERE i.inspection_id=?" if inspection_id is not None else ""
+        scope_params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
+        total_pairs = conn.execute(
+            "SELECT COUNT(*) FROM abnormal_detections"
+            + (" WHERE inspection_image IN (SELECT id FROM images WHERE inspection_id=?)"
+               if inspection_id is not None else ""),
+            scope_params,
+        ).fetchone()[0]
+        by_type = conn.execute(
+            f"""
+            SELECT t.name AS type, COUNT(ab.id) AS count
+            FROM abnormalities ab
+            JOIN anomaly_types t ON t.id=ab.type
+            JOIN abnormal_detections ad ON ad.id=ab.pair
+            JOIN images i ON i.id=ad.inspection_image
+            {scope}
+            GROUP BY t.name ORDER BY count DESC
+            """,
+            scope_params,
+        ).fetchall()
+        by_inspection = conn.execute(
+            """
+            SELECT i.inspection_id, COUNT(ab.id) AS count
+            FROM abnormalities ab
+            JOIN abnormal_detections ad ON ad.id=ab.pair
+            JOIN images i ON i.id=ad.inspection_image
+            GROUP BY i.inspection_id ORDER BY i.inspection_id
+            """
+        ).fetchall()
+        return {
+            "available": True,
+            "total_pairs": total_pairs,
+            "total_abnormalities": sum(r["count"] for r in by_type),
+            "by_type": [{"type": r["type"], "count": r["count"]} for r in by_type],
+            "by_inspection": [{"inspection_id": r["inspection_id"], "count": r["count"]} for r in by_inspection],
+        }
+
+    def get_anomalies(
+        self, anomaly_type: str | None = None, inspection_id: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        if not self._anomaly_tables_exist():
+            return []
+        conn = self._connect()
+        clauses = []
+        params: list[Any] = []
+        if anomaly_type:
+            clauses.append("t.name = ?")
+            params.append(anomaly_type)
+        if inspection_id is not None:
+            clauses.append("ii.inspection_id = ?")
+            params.append(inspection_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT ab.id, t.name AS type, ab.min_x, ab.min_y, ab.max_x, ab.max_y, ab.note,
+                   ad.id AS pair_id, ad.gt_image, ad.inspection_image,
+                   gi.filename AS gt_filename, ii.filename AS inspection_filename,
+                   ii.inspection_id
+            FROM abnormalities ab
+            JOIN anomaly_types t ON t.id=ab.type
+            JOIN abnormal_detections ad ON ad.id=ab.pair
+            JOIN images gi ON gi.id=ad.gt_image
+            JOIN images ii ON ii.id=ad.inspection_image
+            {where}
+            ORDER BY ab.id
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            d["gt_image_url"] = self._image_url(row["gt_filename"])
+            d["inspection_image_url"] = self._image_url(row["inspection_filename"])
+            out.append(d)
+        return out
 
     def run_sql_query(self, query: str, limit: int = 100) -> dict[str, Any]:
         """Execute a read-only SELECT query and return the results."""
@@ -1065,11 +1203,6 @@ class InspectionDBClient:
         if not query.strip():
             return None
 
-        # Formatting is function-driven, not keyword-driven: the LLM router selects
-        # which functions to call, and _execute_tool formats each function's result.
-        # When the router is disabled or returns no tools, there is no DB context
-        # (no keyword fallback that guesses a formatter); the answerer replies from
-        # general knowledge / chat history instead.
         if self.router is None:
             return None
         try:
@@ -1101,11 +1234,15 @@ class InspectionDBClient:
     ) -> str | None:
         """Execute a tool selected by the LLM router and return its formatted result."""
         try:
+            def _inspection_id() -> int | None:
+                v = args.get("inspection_id")
+                return int(v) if v is not None else None
+
             if tool_name == "annotate_image":
                 image_url = args.get("image_url") or self._resolve_image_reference(
                     self._last_query, chat_history
                 )
-                track_id = int(args["track_id"]) if args.get("track_id") is not None else None
+                object_id = int(args["object_id"]) if args.get("object_id") is not None else None
                 category = (
                     self._canonical_category(args["category"])
                     if args.get("category") and image_url is None
@@ -1113,43 +1250,54 @@ class InspectionDBClient:
                 )
                 result = await self.annotate_image(
                     image_url=image_url,
-                    track_id=track_id,
+                    object_id=object_id,
                     category=category,
                     question=args.get("question") or self._last_query,
                     limit=int(args["limit"]) if args.get("limit") is not None else 5,
                 )
                 return self._format_annotate_image(result)
+            if tool_name == "highlight_in_rerun":
+                return self._highlight_in_rerun(args)
             if tool_name == "get_summary":
-                return self._format_summary()
+                return self._format_summary(inspection_id=_inspection_id())
             if tool_name == "get_categories":
                 return self._format_categories()
+            if tool_name == "get_inspections":
+                return self._format_inspections()
             if tool_name == "query_database":
                 return self._format_query_database(args["sql_query"], limit=int(args.get("limit", 100)))
-            if tool_name == "get_object_by_track_id":
-                return self._format_object(int(args["track_id"]))
+            if tool_name == "get_object_by_id":
+                return self._format_object(int(args["object_id"]))
             if tool_name == "get_objects_by_category":
-                return self._format_category(self._canonical_category(args["category"]), limit=int(args.get("limit", 10)))
+                return self._format_category(
+                    self._canonical_category(args["category"]),
+                    limit=int(args.get("limit", 10)),
+                    inspection_id=_inspection_id(),
+                )
             if tool_name == "get_top_objects":
-                return self._format_top_objects(n=int(args.get("n", 5)))
+                return self._format_top_objects(n=int(args.get("n", 5)), inspection_id=_inspection_id())
             if tool_name == "get_recent_objects":
-                return self._format_recent_objects(limit=int(args.get("limit", 5)))
+                return self._format_recent_objects(limit=int(args.get("limit", 5)), inspection_id=_inspection_id())
             if tool_name == "get_object_timeline":
-                return self._format_object_timeline(int(args["track_id"]))
+                return self._format_object_timeline(int(args["object_id"]))
             if tool_name == "get_object_image_paths":
-                return self._format_object_images(int(args["track_id"]))
+                return self._format_object_images(int(args["object_id"]))
             if tool_name == "get_category_timeline":
-                return self._format_category_timeline(self._canonical_category(args["category"]))
+                return self._format_category_timeline(self._canonical_category(args["category"]), inspection_id=_inspection_id())
             if tool_name == "get_category_windows":
                 categories = args.get("categories", [])
                 if isinstance(categories, str):
                     categories = [categories]
-                return self._format_category_windows([self._canonical_category(c) for c in categories])
+                return self._format_category_windows(
+                    [self._canonical_category(c) for c in categories], inspection_id=_inspection_id()
+                )
             if tool_name == "get_category_objects_coordinates":
-                return self._format_category_coordinates(self._canonical_category(args["category"]))
+                return self._format_category_coordinates(self._canonical_category(args["category"]), inspection_id=_inspection_id())
             if tool_name == "get_category_objects_with_images":
                 return self._format_category_objects_with_images(
                     self._canonical_category(args["category"]),
                     limit=int(args.get("limit", 5)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_category_proximity":
                 target = self._canonical_category(args["target_category"])
@@ -1157,23 +1305,26 @@ class InspectionDBClient:
                 if isinstance(others, str):
                     others = [others]
                 radius = float(args.get("radius_m", 2.0))
-                return self._format_category_proximity(target, [self._canonical_category(c) for c in others], radius)
+                return self._format_category_proximity(
+                    target, [self._canonical_category(c) for c in others], radius, inspection_id=_inspection_id()
+                )
             if tool_name == "get_inspection_timeline":
-                return self._format_inspection_timeline()
+                return self._format_inspection_timeline(inspection_id=_inspection_id())
             if tool_name == "get_temporal_clusters":
                 return self._format_temporal_clusters(
                     window_ms=int(args.get("window_ms", 500)),
                     top_n=int(args.get("top_n", 10)),
+                    inspection_id=_inspection_id(),
                 )
-            if tool_name == "get_observation_counts_by_category":
-                return self._format_observation_counts_by_category()
+            if tool_name == "get_detection_counts_by_category":
+                return self._format_detection_counts_by_category(inspection_id=_inspection_id())
             if tool_name == "get_objects_in_time_range":
                 return self._format_objects_in_time_range(
-                    args["start_time"], args["end_time"], limit=int(args.get("limit", 50))
+                    args["start_time"], args["end_time"], limit=int(args.get("limit", 50)), inspection_id=_inspection_id()
                 )
-            if tool_name == "get_observations_in_time_range":
-                return self._format_observations_in_time_range(
-                    args["start_time"], args["end_time"], limit=int(args.get("limit", 50))
+            if tool_name == "get_detections_in_time_range":
+                return self._format_detections_in_time_range(
+                    args["start_time"], args["end_time"], limit=int(args.get("limit", 50)), inspection_id=_inspection_id()
                 )
             if tool_name == "get_objects_near_position":
                 return self._format_objects_near_position(
@@ -1182,23 +1333,23 @@ class InspectionDBClient:
                     z=float(args["z"]),
                     radius_m=float(args.get("radius_m", 2.0)),
                     category=self._canonical_category(args["category"]) if args.get("category") else None,
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_category_sample_images":
                 return self._format_category_sample_images(
-                    self._canonical_category(args["category"]), limit=int(args.get("limit", 5))
+                    self._canonical_category(args["category"]), limit=int(args.get("limit", 5)), inspection_id=_inspection_id()
                 )
             if tool_name == "get_inspection_poses":
-                return self._format_inspection_poses(limit=int(args.get("limit", 20)))
-            if tool_name == "get_filtered_objects":
-                return self._format_filtered_objects(limit=int(args.get("limit", 50)))
+                return self._format_inspection_poses(limit=int(args.get("limit", 20)), inspection_id=_inspection_id())
             if tool_name == "get_object_distance":
-                return self._format_object_distance(int(args["track_id_a"]), int(args["track_id_b"]))
+                return self._format_object_distance(int(args["object_id_a"]), int(args["object_id_b"]))
             if tool_name == "get_category_bounding_box":
-                return self._format_category_bounding_box(self._canonical_category(args["category"]))
-            if tool_name == "get_category_observation_timeline":
-                return self._format_category_observation_timeline(
+                return self._format_category_bounding_box(self._canonical_category(args["category"]), inspection_id=_inspection_id())
+            if tool_name == "get_category_detection_timeline":
+                return self._format_category_detection_timeline(
                     self._canonical_category(args["category"]),
                     bucket_seconds=int(args.get("bucket_seconds", 60)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_objects_by_category_in_time_range":
                 return self._format_objects_by_category_in_time_range(
@@ -1206,13 +1357,15 @@ class InspectionDBClient:
                     args["start_time"],
                     args["end_time"],
                     limit=int(args.get("limit", 50)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_object_movement":
-                return self._format_object_movement(int(args["track_id"]))
-            if tool_name == "get_nearest_objects_to_track":
-                return self._format_nearest_objects_to_track(
-                    int(args["track_id"]),
+                return self._format_object_movement(int(args["object_id"]))
+            if tool_name == "get_nearest_objects_to_object":
+                return self._format_nearest_objects_to_object(
+                    int(args["object_id"]),
                     radius_m=float(args.get("radius_m", 2.0)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_images_in_time_range":
                 return self._format_images_in_time_range(
@@ -1220,28 +1373,123 @@ class InspectionDBClient:
                     args["end_time"],
                     category=self._canonical_category(args["category"]) if args.get("category") else None,
                     limit=int(args.get("limit", 5)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_category_cooccurrence":
                 return self._format_category_cooccurrence(
                     window_ms=int(args.get("window_ms", 500)),
                     top_n=int(args.get("top_n", 10)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_objects_in_temporal_cluster":
                 return self._format_objects_in_temporal_cluster(
                     args["center_time"],
                     window_ms=int(args.get("window_ms", 500)),
                     limit=int(args.get("limit", 50)),
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "run_sql_query":
-                return self._format_sql_query_result(
-                    args["query"],
-                    limit=int(args.get("limit", 100)),
-                )
+                return self._format_sql_query_result(args["query"], limit=int(args.get("limit", 100)))
             if tool_name == "get_report_summary":
                 # Report context is fetched and injected by the LLM service.
                 return None
+            if tool_name == "get_anomaly_types":
+                return self._format_anomaly_types()
+            if tool_name == "get_anomaly_summary":
+                return self._format_anomaly_summary(inspection_id=_inspection_id())
+            if tool_name == "get_anomalies":
+                return self._format_anomalies(
+                    anomaly_type=args.get("anomaly_type"),
+                    inspection_id=_inspection_id(),
+                    limit=int(args.get("limit", 50)),
+                )
         except Exception as exc:
             logger.warning("Tool execution failed for %s with args %s: %s", tool_name, args, exc)
+        return None
+
+    def _highlight_in_rerun(self, args: dict[str, Any]) -> str:
+        if self.rerun_visualizer is None:
+            return "Rerun visualization is not configured on this backend."
+        object_ids = args.get("object_ids") or []
+        if isinstance(object_ids, (int, float)):
+            object_ids = [int(object_ids)]
+        object_ids = [int(o) for o in object_ids if o is not None]
+        coords = args.get("coordinates") or []
+        category = self._canonical_category(args["category"]) if args.get("category") else None
+        return self.rerun_visualizer.highlight(
+            object_ids=object_ids or None,
+            coordinates=coords or None,
+            category=category,
+            inspection_id=int(args["inspection_id"]) if args.get("inspection_id") is not None else None,
+            label=args.get("label"),
+        )
+
+    # ------------------------------------------------------------------
+    # Automatic Rerun highlighting (no explicit tool call required)
+    # ------------------------------------------------------------------
+
+    # Matches 3D coordinate tuples the formatters emit, e.g. "(-18.22, 32.17, -6.85)".
+    _COORD_RE = re.compile(
+        r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+    )
+    # Matches "Object 109" / "object_id 109" references in tool output.
+    _OBJECT_ID_RE = re.compile(r"\bObject\s+(\d+)\b", re.IGNORECASE)
+
+    @classmethod
+    def _extract_coordinates(cls, text: str, *, limit: int = 100) -> list[dict[str, float]]:
+        """Pull (x, y, z) tuples out of tool-output text, as highlight coordinate dicts."""
+        coords: list[dict[str, float]] = []
+        for m in cls._COORD_RE.finditer(text or ""):
+            coords.append({
+                "x": float(m.group(1)),
+                "y": float(m.group(2)),
+                "z": float(m.group(3)),
+            })
+            if len(coords) >= limit:
+                break
+        return coords
+
+    @classmethod
+    def _extract_object_ids(cls, text: str, *, limit: int = 100) -> list[int]:
+        """Pull distinct object ids out of tool-output text (e.g. "Object 109")."""
+        ids: list[int] = []
+        seen: set[int] = set()
+        for m in cls._OBJECT_ID_RE.finditer(text or ""):
+            oid = int(m.group(1))
+            if oid not in seen:
+                seen.add(oid)
+                ids.append(oid)
+                if len(ids) >= limit:
+                    break
+        return ids
+
+    def auto_highlight(self, context_text: str) -> str | None:
+        """Auto-push coordinates/object ids found in tool output to the Rerun viewer.
+
+        Called by the answerer after the tools run, so any coordinate-bearing answer is
+        visualized automatically — no explicit ``highlight_in_rerun`` tool call needed.
+        Returns a short success status string when something was highlighted, or ``None``
+        when there was nothing to visualize / Rerun is unavailable (so the answerer stays
+        quiet about it). Never raises.
+        """
+        if self.rerun_visualizer is None or not context_text:
+            return None
+        coords = self._extract_coordinates(context_text)
+        object_ids = self._extract_object_ids(context_text)
+        if not coords and not object_ids:
+            return None
+        try:
+            status = self.rerun_visualizer.highlight(
+                object_ids=object_ids or None,
+                coordinates=coords or None,
+                inspection_id=None,
+                label="auto",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Auto Rerun highlight failed: %s", exc)
+            return None
+        if isinstance(status, str) and status.startswith("Highlighted"):
+            return status
         return None
 
     # ------------------------------------------------------------------
@@ -1251,18 +1499,18 @@ class InspectionDBClient:
     async def annotate_image(
         self,
         image_url: str | None = None,
-        track_id: int | None = None,
+        object_id: int | None = None,
         category: str | None = None,
         question: str | None = None,
         limit: int = 5,
     ) -> dict[str, Any] | None:
         """Run vision annotation on one or more inspection images and cache results.
 
-        Resolves *image_url* (a single image), *track_id* (all distinct frames for
-        the track, up to ``limit``), or *category* (up to ``limit`` random samples)
-        into local image paths, asks the vision model to mark anomalies on each,
-        and saves every annotated PNG to the configured cache directory so the
-        frontend can request it.
+        Resolves *image_url* (a single image), *object_id* (all distinct frames for the
+        object, up to ``limit``), or *category* (up to ``limit`` random samples) into
+        local image paths, asks the vision model to mark anomalies on each, and saves
+        every annotated PNG to the configured cache directory so the frontend can
+        request it.
         """
         if not self.vision_annotator:
             return {"error": "Vision annotator is not configured."}
@@ -1271,12 +1519,11 @@ class InspectionDBClient:
         if image_url:
             resolved = self._resolve_image_path(image_url)
             raw_paths = [str(resolved)] if resolved else []
-        elif track_id is not None:
-            raw_paths = self.get_object_image_paths(track_id)[:limit]
+        elif object_id is not None:
+            raw_paths = self.get_object_image_paths(object_id)[:limit]
         elif category:
             raw_paths = self.get_category_sample_images(category, limit=limit)
 
-        # Resolve to local paths and deduplicate while preserving order.
         image_paths: list[Path] = []
         seen: set[str] = set()
         for path_str in raw_paths:
@@ -1290,7 +1537,7 @@ class InspectionDBClient:
             image_paths.append(resolved)
 
         if not image_paths:
-            return {"error": f"Could not locate images for annotation from image_url={image_url}, track_id={track_id}, category={category}"}
+            return {"error": f"Could not locate images for annotation from image_url={image_url}, object_id={object_id}, category={category}"}
 
         q = question or "What anomalies are in this image?"
         cache_dir = self._annotated_image_cache_dir()
@@ -1338,33 +1585,26 @@ class InspectionDBClient:
         if not image_url:
             return None
 
-        # Strip scheme/host if a full URL was pasted (e.g. http://localhost:8000/inspection/images/...).
         if image_url.startswith("http://") or image_url.startswith("https://"):
             image_url = urlparse(image_url).path
 
-        # URL prefixes served by the backend.
         if image_url.startswith("/inspection/images/"):
             if not self.settings:
                 return None
             return Path(self.settings.inspection_image_dir) / Path(image_url).name
         if image_url.startswith("/reports/extracted_images/") or image_url.startswith("/reports/images/"):
-            # /reports/images is a legacy alias for the extracted_images dir.
             if not self.settings:
                 return None
             return Path(self.settings.reports_dir) / "extracted_images" / Path(image_url).name
         if image_url.startswith("/annotated/images/"):
-            # A previously annotated image (output of annotate_image). Allow
-            # re-annotating it by mapping to the annotated-image cache dir.
             if not self.settings:
                 return None
             return Path(self.settings.annotated_image_cache_dir) / Path(image_url).name
 
-        # Already an absolute local path.
         raw = Path(image_url)
         if raw.is_absolute() and raw.exists():
             return raw
 
-        # Relative path: try the inspection image directory and report extracted images.
         if self.settings:
             candidates = [
                 Path(self.settings.inspection_image_dir) / raw,
@@ -1421,23 +1661,22 @@ class InspectionDBClient:
     # Formatters
     # ------------------------------------------------------------------
 
-    def _format_summary(self) -> str:
-        data = self.get_summary()
-        lines = [
-            f"Total aggregated objects: {data['total_objects']}",
-        ]
+    def _format_summary(self, inspection_id: int | None = None) -> str:
+        data = self.get_summary(inspection_id=inspection_id)
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [f"Total objects{scope}: {data['total_objects']}"]
         if data["categories"]:
             lines.append("Objects by category:")
             for row in data["categories"]:
                 lines.append(f"- {row['category']}: {row['count']}")
         if data.get("objects"):
-            lines.append("Notable tracks:")
+            lines.append("Notable objects (by detection count):")
             for obj in data["objects"][:5]:
                 lines.append(
-                    f"- Track {obj['track_id']} ({obj['category']}): "
-                    f"{obj['observation_count']} observations"
+                    f"- Object {obj['id']} ({obj['category']}): "
+                    f"{obj['detection_count']} detections"
                 )
-        lines.append("You can ask me about any track ID to see its frames.")
+        lines.append("You can ask me about any object ID to see its frames.")
         return "\n".join(lines)
 
     def _format_categories(self) -> str:
@@ -1446,97 +1685,111 @@ class InspectionDBClient:
             return "No categories found in the database."
         return "Known categories:\n" + "\n".join(f"- {c}" for c in categories)
 
+    def _format_inspections(self) -> str:
+        inspections = self.get_inspections()
+        if not inspections:
+            return "No inspections found in the database."
+        lines = [f"{len(inspections)} inspection(s):"]
+        for ins in inspections:
+            gt = " (ground truth)" if ins["is_gt"] else ""
+            lines.append(
+                f"- Inspection {ins['id']}: started {ins['started_at']}{gt}, "
+                f"{ins['object_count']} object(s), {ins['detection_count']} detection(s)"
+            )
+        lines.append("Pass inspection_id to scope any other tool to a specific inspection.")
+        return "\n".join(lines)
+
     def _format_query_database(self, sql_query: str, limit: int = 100) -> str:
         return self._format_sql_query_result(sql_query, limit)
 
-    def _format_category(self, category: str) -> str:
-        objects = self.get_objects_by_category(category, limit=10)
+    def _format_category(self, category: str, limit: int = 10, inspection_id: int | None = None) -> str:
+        objects = self.get_objects_by_category(category, limit=limit, inspection_id=inspection_id)
         if not objects:
             return f"No objects found in category '{category}'."
-        lines = [f"Found {len(objects)} object(s) in category '{category}'. Track IDs:"]
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [f"Found {len(objects)} object(s) in category '{category}'{scope}. Object IDs:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']}: {obj['observation_count']} observations, "
-                f"{obj['total_point_count']} points, "
+                f"- Object {obj['id']}: {obj['detection_count']} detections, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
-        lines.append(f"To see frames, say: 'show me images of track {objects[0]['track_id']}'.")
+        lines.append(f"To see frames, say: 'show me images of object {objects[0]['id']}'.")
         return "\n".join(lines)
 
-    def _format_object(self, track_id: int) -> str:
-        obj = self.get_object_by_track_id(track_id)
+    def _format_object(self, object_id: int) -> str:
+        obj = self.get_object_by_id(object_id)
         if obj is None:
-            return f"No object found with track ID {track_id}."
+            return f"No object found with object ID {object_id}."
         lines = [
-            f"Track ID: {obj['track_id']}",
+            f"Object ID: {obj['id']}",
             f"Category: {obj['category']}",
-            f"Observations: {obj['observation_count']}",
-            f"Total points: {obj['total_point_count']}",
+            f"Detections: {obj['detection_count']}",
             f"Centroid: ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})",
+            f"First seen: {self._format_timestamp(obj.get('first_seen_ns'))}",
+            f"Last seen: {self._format_timestamp(obj.get('last_seen_ns'))}",
         ]
-        obs_count = len(obj.get("observations", []))
-        if obs_count:
-            lines.append(f"Per-frame observation rows: {obs_count}")
+        det_count = len(obj.get("detections", []))
+        if det_count:
+            lines.append(f"Per-frame detection rows: {det_count}")
         return "\n".join(lines)
 
-    def _format_top_objects(self, n: int = 5) -> str:
-        objects = self.get_top_objects(n)
+    def _format_top_objects(self, n: int = 5, inspection_id: int | None = None) -> str:
+        objects = self.get_top_objects(n, inspection_id=inspection_id)
         if not objects:
             return "No objects found in the database."
-        lines = [f"Top {len(objects)} objects by total point count. Track IDs:"]
+        lines = [f"Top {len(objects)} objects by detection count. Object IDs:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): "
-                f"{obj['total_point_count']} points, "
-                f"{obj['observation_count']} observations"
+                f"- Object {obj['id']} ({obj['category']}): "
+                f"{obj['detection_count']} detections"
             )
-        lines.append("To see frames for a track, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames for an object, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_recent_objects(self, limit: int = 5) -> str:
-        objects = self.get_recent_objects(limit)
+    def _format_recent_objects(self, limit: int = 5, inspection_id: int | None = None) -> str:
+        objects = self.get_recent_objects(limit, inspection_id=inspection_id)
         if not objects:
             return "No objects found in the database."
-        lines = [f"{len(objects)} most recently seen object(s). Track IDs:"]
+        lines = [f"{len(objects)} most recently seen object(s). Object IDs:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): "
+                f"- Object {obj['id']} ({obj['category']}): "
                 f"last seen at {self._format_timestamp(obj['last_seen_ns'])}"
             )
-        lines.append("To see frames, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_category_coordinates(self, category: str) -> str:
-        objects = self.get_category_objects_with_coordinates(category)
+    def _format_category_coordinates(self, category: str, inspection_id: int | None = None) -> str:
+        objects = self.get_category_objects_with_coordinates(category, inspection_id=inspection_id)
         if not objects:
             return f"No objects found in category '{category}'."
-        lines = [f"Objects in category '{category}' with coordinates (ordered by first appearance). Track IDs:"]
+        lines = [f"Objects in category '{category}' with coordinates (ordered by first appearance). Object IDs:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']}: first seen {self._format_timestamp(obj['first_seen_ns'])}, "
+                f"- Object {obj['id']}: first seen {self._format_timestamp(obj['first_seen_ns'])}, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
-        lines.append("Ask: 'show me images of track [ID]' to view frames.")
+        lines.append("Ask: 'show me images of object [ID]' to view frames.")
         return "\n".join(lines)
 
-    def _format_category_objects_with_images(self, category: str, limit: int = 5) -> str:
-        objects = self.get_category_objects_with_images(category, limit)
+    def _format_category_objects_with_images(self, category: str, limit: int = 5, inspection_id: int | None = None) -> str:
+        objects = self.get_category_objects_with_images(category, limit, inspection_id=inspection_id)
         if not objects:
             return f"No objects found in category '{category}'."
         lines = [
-            f"Objects in category '{category}' with track IDs, coordinates, and sample images "
+            f"Objects in category '{category}' with object IDs, coordinates, and sample images "
             f"(showing {len(objects)} of up to {limit}):"
         ]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']}: "
+                f"- Object {obj['id']}: "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f}), "
                 f"first seen {self._format_timestamp(obj['first_seen_ns'])}"
             )
             sample_url = self._image_url(obj.get("sample_image_path"))
             if sample_url:
                 lines.append(f"  ![sample frame]({sample_url})")
-        lines.append("To see more frames for a track, ask: 'show me images of track [ID]'.")
+        lines.append("To see more frames for an object, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
     def _format_category_proximity(
@@ -1544,12 +1797,12 @@ class InspectionDBClient:
         target_category: str,
         other_categories: list[str],
         radius_m: float = 2.0,
+        inspection_id: int | None = None,
     ) -> str:
-        results = self.get_category_proximity(target_category, other_categories, radius_m)
+        results = self.get_category_proximity(target_category, other_categories, radius_m, inspection_id=inspection_id)
         if not results:
             return f"No proximity data found for '{target_category}' near {other_categories}."
 
-        # Aggregate across all target objects.
         aggregate: dict[str, int] = {}
         detailed_lines = []
         for r in results:
@@ -1558,91 +1811,89 @@ class InspectionDBClient:
                 aggregate[cat] = aggregate.get(cat, 0) + cnt
             nearby_str = ", ".join(f"{cnt} x {cat}" for cat, cnt in sorted(nearby.items(), key=lambda x: -x[1]))
             detailed_lines.append(
-                f"- Track {r['track_id']} at ({r['centroid_x']:.2f}, {r['centroid_y']:.2f}, {r['centroid_z']:.2f}): "
+                f"- Object {r['object_id']} at ({r['centroid_x']:.2f}, {r['centroid_y']:.2f}, {r['centroid_z']:.2f}): "
                 f"within {radius_m} m — {nearby_str or 'nothing nearby'}"
             )
 
         summary = ", ".join(f"{cnt} x {cat}" for cat, cnt in sorted(aggregate.items(), key=lambda x: -x[1]))
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
         lines = [
-            f"Proximity summary for '{target_category}' within {radius_m} m of {', '.join(other_categories)}:",
+            f"Proximity summary for '{target_category}'{scope} within {radius_m} m of {', '.join(other_categories)}:",
             f"Total nearby objects: {summary or 'none'}",
             "Per-target breakdown:",
         ]
         lines.extend(detailed_lines)
         return "\n".join(lines)
 
-    def _format_object_timeline(self, track_id: int) -> str:
-        obj = self.get_object_by_track_id(track_id)
+    def _format_object_timeline(self, object_id: int) -> str:
+        obj = self.get_object_by_id(object_id)
         if obj is None:
-            return f"No object found with track ID {track_id}."
+            return f"No object found with object ID {object_id}."
 
         first_ns = obj.get("first_seen_ns")
         last_ns = obj.get("last_seen_ns")
         duration_s = ((last_ns - first_ns) / 1e9) if first_ns and last_ns else 0.0
 
         lines = [
-            f"Track {obj['track_id']} ({obj['category']}) timeline:",
+            f"Object {obj['id']} ({obj['category']}) timeline:",
             f"- First seen: {self._format_timestamp(first_ns)}",
             f"- Last seen:  {self._format_timestamp(last_ns)}",
-            f"- Observations: {obj['observation_count']}",
+            f"- Detections: {obj['detection_count']}",
             f"- Visible for about {self._format_duration(duration_s)}",
         ]
 
-        observations = obj.get("observations", [])
-        if observations:
+        detections = obj.get("detections", [])
+        if detections:
             lines.append("Key moments:")
-            step = max(1, len(observations) // 5)
-            for i, obs in enumerate(observations):
-                if i % step == 0 or i == len(observations) - 1:
-                    lines.append(
-                        f"  - {self._format_timestamp(obs['timestamp_ns'])}: "
-                        f"{obs['point_count']} points"
-                    )
+            step = max(1, len(detections) // 5)
+            for i, det in enumerate(detections):
+                if i % step == 0 or i == len(detections) - 1:
+                    lines.append(f"  - {self._format_timestamp(det['timestamp_ns'])}: frame {det['filename']}")
 
-        image_urls = self.get_object_image_paths(track_id)
+        image_urls = self.get_object_image_paths(object_id)
         if image_urls:
             lines.append("Object frames:")
             for url in image_urls[:10]:
-                lines.append(f"![frame]({self._image_url(url)})")
-            lines.append(f"To view all frames for this object, ask: 'show me all images of track {track_id}'.")
+                lines.append(f"![frame]({url})")
+            lines.append(f"To view all frames for this object, ask: 'show me all images of object {object_id}'.")
         return "\n".join(lines)
 
-    def _format_object_images(self, track_id: int, limit: int = 10) -> str:
-        obj = self.get_object_by_track_id(track_id)
+    def _format_object_images(self, object_id: int, limit: int = 10) -> str:
+        obj = self.get_object_by_id(object_id)
         if obj is None:
-            return f"No object found with track ID {track_id}."
+            return f"No object found with object ID {object_id}."
 
-        image_urls = self.get_object_image_paths(track_id)
+        image_urls = self.get_object_image_paths(object_id)
         if not image_urls:
-            return f"No images are stored for track {track_id}."
+            return f"No images are stored for object {object_id}."
 
         lines = [
-            f"Track {track_id} ({obj['category']}): showing {min(len(image_urls), limit)} of {len(image_urls)} frames:",
+            f"Object {object_id} ({obj['category']}): showing {min(len(image_urls), limit)} of {len(image_urls)} frames:",
         ]
         for url in image_urls[:limit]:
-            lines.append(f"![frame]({self._image_url(url)})")
+            lines.append(f"![frame]({url})")
         return "\n".join(lines)
 
-    def _format_category_timeline(self, category: str) -> str:
-        objects = self.get_category_timeline(category)
+    def _format_category_timeline(self, category: str, inspection_id: int | None = None) -> str:
+        objects = self.get_category_timeline(category, inspection_id=inspection_id)
         if not objects:
             return f"No objects found in category '{category}'."
 
-        lines = [f"Timeline for category '{category}' ({len(objects)} object(s)). Track IDs:"]
+        lines = [f"Timeline for category '{category}' ({len(objects)} object(s)). Object IDs:"]
         for obj in objects:
             first_ns = obj.get("first_seen_ns")
             last_ns = obj.get("last_seen_ns")
             duration_s = ((last_ns - first_ns) / 1e9) if first_ns and last_ns else 0.0
             lines.append(
-                f"- Track {obj['track_id']}: first seen {self._format_timestamp(first_ns)}, "
+                f"- Object {obj['id']}: first seen {self._format_timestamp(first_ns)}, "
                 f"last seen {self._format_timestamp(last_ns)}, "
-                f"{obj['observation_count']} observations over {self._format_duration(duration_s)}"
+                f"{obj['detection_count']} detections over {self._format_duration(duration_s)}"
             )
-        lines.append("To see frames, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_category_windows(self, categories: list[str]) -> str:
-        windows = self.get_category_windows(categories)
+    def _format_category_windows(self, categories: list[str], inspection_id: int | None = None) -> str:
+        windows = self.get_category_windows(categories, inspection_id=inspection_id)
         if not windows:
             return f"No data found for categories: {', '.join(categories)}."
         lines = [f"Detection windows for {len(windows)} category/categories:"]
@@ -1656,88 +1907,90 @@ class InspectionDBClient:
             )
         return "\n".join(lines)
 
-    def _format_inspection_timeline(self) -> str:
-        objects = self.get_inspection_timeline()
+    def _format_inspection_timeline(self, inspection_id: int | None = None) -> str:
+        objects = self.get_inspection_timeline(inspection_id=inspection_id)
         if not objects:
             return "No objects found in the database."
 
         first_ns = objects[0].get("first_seen_ns")
         last_ns = objects[-1].get("last_seen_ns")
         duration_s = ((last_ns - first_ns) / 1e9) if first_ns and last_ns else 0.0
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
 
         lines = [
-            f"Full inspection timeline: {len(objects)} objects from {self._format_timestamp(first_ns)} to {self._format_timestamp(last_ns)} "
-            f"({self._format_duration(duration_s)}).",
+            f"Full inspection timeline{scope}: {len(objects)} objects from {self._format_timestamp(first_ns)} "
+            f"to {self._format_timestamp(last_ns)} ({self._format_duration(duration_s)}).",
             "Chronological object log:",
         ]
         for obj in objects[:50]:
             lines.append(
-                f"- {self._format_timestamp(obj.get('first_seen_ns'))}: Track {obj['track_id']} ({obj['category']}), "
-                f"{obj['observation_count']} observations"
+                f"- {self._format_timestamp(obj.get('first_seen_ns'))}: Object {obj['id']} ({obj['category']}), "
+                f"{obj['detection_count']} detections"
             )
         if len(objects) > 50:
             lines.append(f"... and {len(objects) - 50} more objects.")
         return "\n".join(lines)
 
-    def _format_temporal_clusters(self, window_ms: int = 500, top_n: int = 10) -> str:
-        clusters = self.get_temporal_clusters(window_ms=window_ms, top_n=top_n)
+    def _format_temporal_clusters(self, window_ms: int = 500, top_n: int = 10, inspection_id: int | None = None) -> str:
+        clusters = self.get_temporal_clusters(window_ms=window_ms, top_n=top_n, inspection_id=inspection_id)
         if not clusters:
-            return "No objects found in the database."
+            return "No detections found in the database."
 
         lines = [
-            f"Top {len(clusters)} busiest moments (objects grouped within {window_ms} ms):",
+            f"Top {len(clusters)} busiest moments (detections grouped within {window_ms} ms):",
         ]
         for idx, cluster in enumerate(clusters, start=1):
             start = self._format_timestamp(cluster["start_ns"])
             end = self._format_timestamp(cluster["end_ns"])
             counts = ", ".join(f"{cnt} x {cat}" for cat, cnt in sorted(cluster["categories"].items(), key=lambda x: -x[1]))
             lines.append(
-                f"{idx}. {start} to {end}: {cluster['object_count']} total objects — {counts}"
+                f"{idx}. {start} to {end}: {cluster['detection_count']} total detections — {counts}"
             )
         return "\n".join(lines)
 
-    def _format_observation_counts_by_category(self) -> str:
-        rows = self.get_observation_counts_by_category()
+    def _format_detection_counts_by_category(self, inspection_id: int | None = None) -> str:
+        rows = self.get_detection_counts_by_category(inspection_id=inspection_id)
         if not rows:
-            return "No observations found in the database."
-        lines = ["Per-frame observation counts by category:"]
+            return "No detections found in the database."
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [f"Per-frame detection counts by category{scope}:"]
         for row in rows:
-            lines.append(f"- {row['category']}: {row['count']} observations")
+            lines.append(f"- {row['category']}: {row['count']} detections")
         return "\n".join(lines)
 
     def _format_objects_in_time_range(
-        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50
+        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50, inspection_id: int | None = None
     ) -> str:
-        objects = self.get_objects_in_time_range(start_time, end_time, limit)
+        objects = self.get_objects_in_time_range(start_time, end_time, limit, inspection_id=inspection_id)
         start_str = self._format_timestamp(self._parse_time_string(start_time))
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not objects:
             return f"No objects found between {start_str} and {end_str}."
-        lines = [f"{len(objects)} object(s) detected between {start_str} and {end_str}. Track IDs:"]
+        lines = [f"{len(objects)} object(s) detected between {start_str} and {end_str}. Object IDs:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): "
-                f"{obj['observation_count']} observations, "
+                f"- Object {obj['id']} ({obj['category']}): "
+                f"{obj['detection_count']} detections, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
-        lines.append("To see frames, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_observations_in_time_range(
-        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50
+    def _format_detections_in_time_range(
+        self, start_time: str | int | float, end_time: str | int | float, limit: int = 50, inspection_id: int | None = None
     ) -> str:
-        observations = self.get_observations_in_time_range(start_time, end_time, limit)
+        detections = self.get_detections_in_time_range(start_time, end_time, limit, inspection_id=inspection_id)
         start_str = self._format_timestamp(self._parse_time_string(start_time))
         end_str = self._format_timestamp(self._parse_time_string(end_time))
-        if not observations:
-            return f"No observations found between {start_str} and {end_str}."
-        lines = [f"{len(observations)} observation(s) between {start_str} and {end_str}. Track IDs:"]
-        for obs in observations:
+        if not detections:
+            return f"No detections found between {start_str} and {end_str}."
+        lines = [f"{len(detections)} detection(s) between {start_str} and {end_str}. Object IDs:"]
+        for det in detections:
             lines.append(
-                f"- {self._format_timestamp(obs['timestamp_ns'])}: Track {obs['track_id']} ({obs['category']}), "
-                f"{obs['point_count']} points"
+                f"- {self._format_timestamp(det['timestamp_ns'])}: Object {det['object_id']} ({det['category']}), "
+                f"frame {det['filename']}"
             )
-        lines.append("To see frames, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
     def _format_objects_near_position(
@@ -1747,74 +2000,62 @@ class InspectionDBClient:
         z: float,
         radius_m: float = 2.0,
         category: str | None = None,
+        inspection_id: int | None = None,
     ) -> str:
-        objects = self.get_objects_near_position(x, y, z, radius_m, category)
+        objects = self.get_objects_near_position(x, y, z, radius_m, category, inspection_id=inspection_id)
         if not objects:
             cat_str = f" of category '{category}'" if category else ""
             return f"No objects{cat_str} found within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f})."
         lines = [
-            f"{len(objects)} object(s) within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f}). Track IDs:"
+            f"{len(objects)} object(s) within {radius_m} m of ({x:.2f}, {y:.2f}, {z:.2f}). Object IDs:"
         ]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): "
+                f"- Object {obj['id']} ({obj['category']}): "
                 f"distance {obj['distance_m']:.2f} m"
             )
-        lines.append("To see frames, ask: 'show me images of track [ID]'.")
+        lines.append("To see frames, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_category_sample_images(self, category: str, limit: int = 5) -> str:
-        image_urls = self.get_category_sample_images(category, limit)
+    def _format_category_sample_images(self, category: str, limit: int = 5, inspection_id: int | None = None) -> str:
+        image_urls = self.get_category_sample_images(category, limit, inspection_id=inspection_id)
         if not image_urls:
             return f"No sample images found for category '{category}'."
-        lines = [f"Sample images for category '{category}'. Track IDs visible in each frame are listed below the image:"]
-        for path in image_urls:
-            track_info = self._image_track_info(path)
-            lines.append(f"![frame]({self._image_url(path)})")
-            if track_info:
-                lines.append(f"Objects in this frame: {track_info}")
-        lines.append("To see more frames for a track, ask: 'show me images of track [ID]'.")
+        lines = [f"Sample images for category '{category}'. Object IDs visible in each frame are listed below the image:"]
+        for url in image_urls:
+            filename = Path(url).name
+            obj_info = self._image_objects_info(filename)
+            lines.append(f"![frame]({url})")
+            if obj_info:
+                lines.append(f"Objects in this frame: {obj_info}")
+        lines.append("To see more frames for an object, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
-    def _format_inspection_poses(self, limit: int = 20) -> str:
-        poses = self.get_inspection_poses(limit)
+    def _format_inspection_poses(self, limit: int = 20, inspection_id: int | None = None) -> str:
+        poses = self.get_inspection_poses(limit, inspection_id=inspection_id)
         if not poses:
             return "No inspection poses are recorded yet."
         lines = [f"First {len(poses)} inspection pose(s):"]
         for pose in poses:
             lines.append(
-                f"- {pose['image_path']}: translation "
+                f"- {pose['filename']} (inspection {pose['inspection_id']}): translation "
                 f"({pose['tf_translation_x']:.2f}, {pose['tf_translation_y']:.2f}, {pose['tf_translation_z']:.2f}), "
                 f"rotation ({pose['tf_rotation_x']:.2f}, {pose['tf_rotation_y']:.2f}, {pose['tf_rotation_z']:.2f}, {pose['tf_rotation_w']:.2f})"
             )
         return "\n".join(lines)
 
-    def _format_filtered_objects(self, limit: int = 50) -> str:
-        objects = self.get_filtered_objects(limit)
-        if not objects:
-            return "No filtered objects recorded."
-        lines = [f"Most recent {len(objects)} filtered object(s):"]
-        for obj in objects:
-            lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): reason='{obj['reason']}', "
-                f"{obj['point_count']} points, "
-                f"first seen {self._format_timestamp(obj['first_seen_ns'])}, "
-                f"last seen {self._format_timestamp(obj['last_seen_ns'])}"
-            )
-        return "\n".join(lines)
-
-    def _format_object_distance(self, track_id_a: int, track_id_b: int) -> str:
-        result = self.get_object_distance(track_id_a, track_id_b)
+    def _format_object_distance(self, object_id_a: int, object_id_b: int) -> str:
+        result = self.get_object_distance(object_id_a, object_id_b)
         if result is None:
-            return f"Could not find both tracks {track_id_a} and {track_id_b}."
+            return f"Could not find both objects {object_id_a} and {object_id_b}."
         return (
-            f"Distance between Track {result['track_id_a']} ({result['category_a']}) "
-            f"and Track {result['track_id_b']} ({result['category_b']}): "
+            f"Distance between Object {result['object_id_a']} ({result['category_a']}) "
+            f"and Object {result['object_id_b']} ({result['category_b']}): "
             f"{result['distance_m']:.2f} m"
         )
 
-    def _format_category_bounding_box(self, category: str) -> str:
-        bbox = self.get_category_bounding_box(category)
+    def _format_category_bounding_box(self, category: str, inspection_id: int | None = None) -> str:
+        bbox = self.get_category_bounding_box(category, inspection_id=inspection_id)
         if bbox is None:
             return f"No objects found in category '{category}'."
         lines = [
@@ -1827,18 +2068,18 @@ class InspectionDBClient:
         ]
         return "\n".join(lines)
 
-    def _format_category_observation_timeline(
-        self, category: str, bucket_seconds: int = 60
+    def _format_category_detection_timeline(
+        self, category: str, bucket_seconds: int = 60, inspection_id: int | None = None
     ) -> str:
-        rows = self.get_category_observation_timeline(category, bucket_seconds)
+        rows = self.get_category_detection_timeline(category, bucket_seconds, inspection_id=inspection_id)
         if not rows:
-            return f"No observations found for category '{category}'."
+            return f"No detections found for category '{category}'."
         lines = [
-            f"Observation timeline for '{category}' ({bucket_seconds}s buckets):"
+            f"Detection timeline for '{category}' ({bucket_seconds}s buckets):"
         ]
         for row in rows:
             lines.append(
-                f"- {self._format_timestamp(row['bucket_ns'])}: {row['count']} observations"
+                f"- {self._format_timestamp(row['bucket_ns'])}: {row['count']} detections"
             )
         return "\n".join(lines)
 
@@ -1848,8 +2089,9 @@ class InspectionDBClient:
         start_time: str | int | float,
         end_time: str | int | float,
         limit: int = 50,
+        inspection_id: int | None = None,
     ) -> str:
-        objects = self.get_objects_by_category_in_time_range(category, start_time, end_time, limit)
+        objects = self.get_objects_by_category_in_time_range(category, start_time, end_time, limit, inspection_id=inspection_id)
         start_str = self._format_timestamp(self._parse_time_string(start_time))
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not objects:
@@ -1857,15 +2099,15 @@ class InspectionDBClient:
         lines = [f"{len(objects)} '{category}' object(s) between {start_str} and {end_str}:"]
         for obj in objects:
             lines.append(
-                f"- Track {obj['track_id']}: {obj['observation_count']} observations, "
+                f"- Object {obj['id']}: {obj['detection_count']} detections, "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
             )
         return "\n".join(lines)
 
-    def _format_object_movement(self, track_id: int) -> str:
-        points = self.get_object_movement(track_id)
+    def _format_object_movement(self, object_id: int) -> str:
+        points = self.get_object_movement(object_id)
         if not points:
-            return f"No movement data found for track {track_id}."
+            return f"No movement data found for object {object_id}."
         start = points[0]
         end = points[-1]
         dx = end["centroid_x"] - start["centroid_x"]
@@ -1873,7 +2115,7 @@ class InspectionDBClient:
         dz = end["centroid_z"] - start["centroid_z"]
         displacement = (dx * dx + dy * dy + dz * dz) ** 0.5
         lines = [
-            f"Movement path for track {track_id} ({len(points)} observations):",
+            f"Movement path for object {object_id} ({len(points)} detections):",
             f"- Start: {self._format_timestamp(start['timestamp_ns'])} at ({start['centroid_x']:.2f}, {start['centroid_y']:.2f}, {start['centroid_z']:.2f})",
             f"- End:   {self._format_timestamp(end['timestamp_ns'])} at ({end['centroid_x']:.2f}, {end['centroid_y']:.2f}, {end['centroid_z']:.2f})",
             f"- Displacement: {displacement:.2f} m",
@@ -1889,14 +2131,14 @@ class InspectionDBClient:
                 )
         return "\n".join(lines)
 
-    def _format_nearest_objects_to_track(self, track_id: int, radius_m: float = 2.0) -> str:
-        results = self.get_nearest_objects_to_track(track_id, radius_m)
+    def _format_nearest_objects_to_object(self, object_id: int, radius_m: float = 2.0, inspection_id: int | None = None) -> str:
+        results = self.get_nearest_objects_to_object(object_id, radius_m, inspection_id=inspection_id)
         if not results:
-            return f"No objects found within {radius_m} m of track {track_id}."
-        lines = [f"Objects within {radius_m} m of track {track_id}:"]
+            return f"No objects found within {radius_m} m of object {object_id}."
+        lines = [f"Objects within {radius_m} m of object {object_id}:"]
         for r in results:
             lines.append(
-                f"- Track {r['track_id']} ({r['category']}): "
+                f"- Object {r['id']} ({r['category']}): "
                 f"{r['distance_m']:.2f} m away at "
                 f"({r['centroid_x']:.2f}, {r['centroid_y']:.2f}, {r['centroid_z']:.2f})"
             )
@@ -1908,9 +2150,10 @@ class InspectionDBClient:
         end_time: str | int | float,
         category: str | None = None,
         limit: int = 5,
+        inspection_id: int | None = None,
     ) -> str:
-        total_images = self._count_images_in_time_range(start_time, end_time, category)
-        image_urls = self.get_images_in_time_range(start_time, end_time, category, limit)
+        total_images = self._count_images_in_time_range(start_time, end_time, category, inspection_id=inspection_id)
+        image_urls = self.get_images_in_time_range(start_time, end_time, category, limit, inspection_id=inspection_id)
         start_str = self._format_timestamp(self._parse_time_string(start_time))
         end_str = self._format_timestamp(self._parse_time_string(end_time))
         if not image_urls:
@@ -1919,13 +2162,14 @@ class InspectionDBClient:
         cat_str = f" ({category})" if category else ""
         lines = [
             f"{total_images} distinct images were captured between {start_str} and {end_str}{cat_str}. "
-            f"Showing {len(image_urls)} representative frames. Track IDs visible in each frame are listed below the image:"
+            f"Showing {len(image_urls)} representative frames. Object IDs visible in each frame are listed below the image:"
         ]
-        for path in image_urls:
-            track_info = self._image_track_info(path)
-            lines.append(f"![frame]({self._image_url(path)})")
-            if track_info:
-                lines.append(f"Objects in this frame: {track_info}")
+        for url in image_urls:
+            filename = Path(url).name
+            obj_info = self._image_objects_info(filename)
+            lines.append(f"![frame]({url})")
+            if obj_info:
+                lines.append(f"Objects in this frame: {obj_info}")
         return "\n".join(lines)
 
     def _count_images_in_time_range(
@@ -1933,27 +2177,31 @@ class InspectionDBClient:
         start_time: str | int | float,
         end_time: str | int | float,
         category: str | None = None,
+        inspection_id: int | None = None,
     ) -> int:
         start_ns = self._parse_time_string(start_time)
         end_ns = self._parse_time_string(end_time)
         if start_ns is None or end_ns is None:
             return 0
         sql = """
-            SELECT COUNT(DISTINCT image_path) AS c
-            FROM observations
-            WHERE timestamp_ns >= ? AND timestamp_ns <= ? AND image_path IS NOT NULL
+            SELECT COUNT(DISTINCT i.filename) AS c
+            FROM images i
+            WHERE i.timestamp_ns >= ? AND i.timestamp_ns <= ? AND i.filename IS NOT NULL
         """
         params: list[Any] = [start_ns, end_ns]
         if category:
-            sql += " AND category = ?"
+            sql += " AND i.id IN (SELECT d.image_id FROM detections d JOIN objects o ON o.id=d.object_id JOIN categories c ON c.id=o.category_id WHERE c.name=?)"
             params.append(category)
-        row = self._connect().execute(sql, params).fetchone()
+        if inspection_id is not None:
+            sql += " AND i.inspection_id=?"
+            params.append(inspection_id)
+        row = self._connect().execute(sql, tuple(params)).fetchone()
         return int(row["c"] or 0) if row else 0
 
     def _format_category_cooccurrence(
-        self, window_ms: int = 500, top_n: int = 10
+        self, window_ms: int = 500, top_n: int = 10, inspection_id: int | None = None
     ) -> str:
-        pairs = self.get_category_cooccurrence(window_ms, top_n)
+        pairs = self.get_category_cooccurrence(window_ms, top_n, inspection_id=inspection_id)
         if not pairs:
             return "No category co-occurrence data found."
         lines = [f"Top {len(pairs)} category pairs seen together (within {window_ms} ms clusters):"]
@@ -1966,28 +2214,85 @@ class InspectionDBClient:
         center_time: str | int | float,
         window_ms: int = 500,
         limit: int = 50,
+        inspection_id: int | None = None,
     ) -> str:
-        data = self.get_objects_in_temporal_cluster(center_time, window_ms, limit)
+        data = self.get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id=inspection_id)
         start_str = self._format_timestamp(data["start_time_ns"])
         end_str = self._format_timestamp(data["end_time_ns"])
-        if not data["objects"] and not data["observations"]:
+        if not data["objects"] and not data["detections"]:
             return f"No objects detected around {self._format_timestamp(data['center_time_ns'])}."
         lines = [
             f"Objects detected around {self._format_timestamp(data['center_time_ns'])} "
             f"({start_str} to {end_str}):",
-            "Observation counts by category:",
+            "Detection counts by category:",
         ]
         for cat, cnt in sorted(data["category_counts"].items(), key=lambda x: -x[1]):
             lines.append(f"- {cat}: {cnt}")
         lines.append("Objects with coordinates:")
         for obj in data["objects"][:20]:
             lines.append(
-                f"- Track {obj['track_id']} ({obj['category']}): "
+                f"- Object {obj['id']} ({obj['category']}): "
                 f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f}), "
-                f"{obj['observation_count']} observations"
+                f"{obj['detection_count']} detections"
             )
         if len(data["objects"]) > 20:
             lines.append(f"... and {len(data['objects']) - 20} more objects.")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Anomaly formatters
+    # ------------------------------------------------------------------
+
+    def _format_anomaly_types(self) -> str:
+        if not self._anomaly_tables_exist():
+            return "Anomaly tables (anomaly_types, abnormal_detections, abnormalities) are not yet populated in this database."
+        types = self.get_anomaly_types()
+        if not types:
+            return "No anomaly types are defined yet."
+        return "Known anomaly types:\n" + "\n".join(f"- {t}" for t in types)
+
+    def _format_anomaly_summary(self, inspection_id: int | None = None) -> str:
+        if not self._anomaly_tables_exist():
+            return "Anomaly tables (anomaly_types, abnormal_detections, abnormalities) are not yet populated in this database."
+        data = self.get_anomaly_summary(inspection_id=inspection_id)
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [
+            f"Anomaly summary{scope}: {data['total_abnormalities']} abnormalit(ies) across {data['total_pairs']} image pair(s)."
+        ]
+        if data["by_type"]:
+            lines.append("By type:")
+            for row in data["by_type"]:
+                lines.append(f"- {row['type']}: {row['count']}")
+        if data["by_inspection"]:
+            lines.append("By inspection:")
+            for row in data["by_inspection"]:
+                lines.append(f"- Inspection {row['inspection_id']}: {row['count']}")
+        lines.append("Use get_anomalies for the individual abnormalities with their image pairs.")
+        return "\n".join(lines)
+
+    def _format_anomalies(
+        self, anomaly_type: str | None = None, inspection_id: int | None = None, limit: int = 50
+    ) -> str:
+        if not self._anomaly_tables_exist():
+            return "Anomaly tables (anomaly_types, abnormal_detections, abnormalities) are not yet populated in this database."
+        rows = self.get_anomalies(anomaly_type=anomaly_type, inspection_id=inspection_id, limit=limit)
+        if not rows:
+            return "No abnormalities found matching the filter."
+        lines = [f"{len(rows)} abnormalit(ies):"]
+        for r in rows:
+            bbox = (
+                f"bbox ({r['min_x']}, {r['min_y']})-({r['max_x']}, {r['max_y']})"
+                if r["min_x"] is not None else "no bbox"
+            )
+            lines.append(
+                f"- Abnormality {r['id']} (inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
+            )
+            if r.get("note"):
+                lines.append(f"  note: {r['note']}")
+            if r.get("inspection_image_url"):
+                lines.append(f"  inspection frame: ![inspection frame]({r['inspection_image_url']})")
+            if r.get("gt_image_url"):
+                lines.append(f"  ground-truth frame: ![gt frame]({r['gt_image_url']})")
         return "\n".join(lines)
 
     def _format_sql_query_result(self, query: str, limit: int = 100) -> str:
@@ -1995,7 +2300,7 @@ class InspectionDBClient:
         if "error" in result:
             return f"SQL query failed: {result['error']}\nQuery: {result['query']}"
 
-        timestamp_cols = {"first_seen_ns", "last_seen_ns", "timestamp_ns", "bucket_ns", "first_seen", "last_seen"}
+        timestamp_cols = {"first_seen_ns", "last_seen_ns", "timestamp_ns", "bucket_ns", "started_at"}
 
         def _format_row_value(key: str, value: Any) -> Any:
             if key in timestamp_cols and isinstance(value, (int, float)) and value > 1e12:
