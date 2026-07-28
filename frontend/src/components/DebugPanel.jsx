@@ -1,4 +1,7 @@
 import { useState } from "react";
+import MarkdownImageText from "./MarkdownImageText";
+
+const IMAGE_LINK_RE = /!\[[^\]]*\]\([^)]+\)/;
 
 /**
  * Displays the database tool calls the LLM router selected for the current / latest turn,
@@ -47,7 +50,11 @@ export default function DebugPanel({ toolCalls, toolRouterRaw }) {
                 {turn.requestId ? ` · ${turn.requestId.slice(0, 8)}` : ""}
               </p>
               <ul className="debug-call-list">
-                {turn.calls.map((call, cidx) => (
+                {turn.calls.map((call, cidx) => {
+                  if (!call || typeof call !== "object" || typeof call.name !== "string") {
+                    return null;
+                  }
+                  return (
                   <li key={cidx} className="debug-call">
                     <code className="debug-call-name">{call.name}</code>
                     <pre className="debug-call-args">
@@ -63,6 +70,13 @@ export default function DebugPanel({ toolCalls, toolRouterRaw }) {
                         </pre>
                       </details>
                     )}
+                    {typeof call.output === "string" &&
+                      IMAGE_LINK_RE.test(call.output) && (
+                        <details className="debug-call-output" open>
+                          <summary>Rendered output</summary>
+                          <MarkdownImageText text={call.output} />
+                        </details>
+                      )}
                     {call.name === "annotate_image" &&
                       typeof call.output === "string" &&
                       call.output.includes("--- Vision model raw output ---") && (
@@ -74,7 +88,8 @@ export default function DebugPanel({ toolCalls, toolRouterRaw }) {
                         </details>
                       )}
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             </div>
           ))}

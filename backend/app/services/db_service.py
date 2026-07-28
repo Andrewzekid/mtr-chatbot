@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -519,6 +521,27 @@ class InspectionDBClient:
             (object_id,),
         ).fetchall()
         return [self._image_url(row["filename"]) for row in rows if row["filename"]]
+
+    def get_objects_in_image(self, filename: str) -> list[dict[str, Any]]:
+        """Return every object detected in a single image frame."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT DISTINCT o.id AS object_id, c.name AS category,
+                   o.centroid_x, o.centroid_y, o.centroid_z,
+                   d.centroid_x AS det_centroid_x,
+                   d.centroid_y AS det_centroid_y,
+                   d.centroid_z AS det_centroid_z
+            FROM detections d
+            JOIN images i ON i.id = d.image_id
+            JOIN objects o ON o.id = d.object_id
+            JOIN categories c ON c.id = o.category_id
+            WHERE i.filename = ?
+            ORDER BY o.id
+            """,
+            (Path(filename).name,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_category_timeline(self, category: str, inspection_id: int | None = None) -> list[dict[str, Any]]:
         """Return first/last seen timestamps for every object in a category."""
@@ -1195,8 +1218,10 @@ class InspectionDBClient:
         """Return a text summary for DB-related queries, or None if unrelated.
 
         The router LLM is the sole gatekeeper: every non-empty query reaches it, and it
-        decides which tools to call (or none, for off-topic chat). There is no keyword
-        gate and no keyword-based formatting — _execute_tool formats each chosen tool.
+        decides which tools to call (or none, for off-topic chat). Tool calling can run
+        for multiple rounds: after each batch of tools executes, the router sees the
+        formatted results and may decide to call additional tools, until it has enough
+        information or the configured round limit is reached.
         """
         self._last_query = query
         self._last_chat_history = list(chat_history) if chat_history else []
@@ -1205,26 +1230,67 @@ class InspectionDBClient:
 
         if self.router is None:
             return None
+
+        max_rounds = getattr(self.settings, "tool_router_max_rounds", 1) if self.settings else 1
+        max_rounds = max(1, int(max_rounds))
+
+        all_tool_calls: list[tuple[str, dict[str, Any]]] = []
+        all_tool_results: list[dict[str, Any]] = []
+        prior_results: list[str] = []
+
         try:
-            tool_calls = self.router.select_tool(
-                query, chat_history=chat_history, tool_history=tool_history
-            )
-            self._record_tool_calls(tool_calls)
-            if not tool_calls:
-                self._record_tool_results([])
-                return None
-            results: list[str] = []
-            tool_results: list[dict[str, Any]] = []
-            for tool_name, args in tool_calls:
-                result = await self._execute_tool(tool_name, args, chat_history=chat_history)
-                tool_results.append({"name": tool_name, "args": args, "output": result})
-                if result:
-                    results.append(result)
-            self._record_tool_results(tool_results)
-            return "\n\n".join(results) if results else None
+            for round_idx in range(max_rounds):
+                # Run the router in a thread so multi-round router calls don't block the
+                # event loop for the entire sequence.
+                tool_calls = await asyncio.to_thread(
+                    self.router.select_tool,
+                    query,
+                    chat_history,
+                    tool_history,
+                    prior_results,
+                )
+
+                # Filter out calls we already executed this turn (name + normalized args).
+                new_calls: list[tuple[str, dict[str, Any]]] = []
+                seen_keys = {
+                    self._tool_call_key(name, args) for name, args in all_tool_calls
+                }
+                for name, args in tool_calls:
+                    key = self._tool_call_key(name, args)
+                    if key not in seen_keys:
+                        new_calls.append((name, args))
+                        seen_keys.add(key)
+
+                if not new_calls:
+                    # Router stopped, repeated calls, or returned nothing actionable.
+                    break
+
+                # Execute the new batch of tools.
+                round_results: list[str] = []
+                for tool_name, args in new_calls:
+                    result = await self._execute_tool(tool_name, args, chat_history=chat_history)
+                    all_tool_results.append({"name": tool_name, "args": args, "output": result})
+                    all_tool_calls.append((tool_name, args))
+                    if result:
+                        round_results.append(result)
+
+                if not round_results:
+                    break
+                prior_results.extend(round_results)
+
+            self._record_tool_calls(all_tool_calls)
+            self._record_tool_results(all_tool_results)
+            return "\n\n".join(
+                str(r.get("output", "")) for r in all_tool_results if r.get("output")
+            ) if all_tool_results else None
         except Exception as exc:
             logger.warning("LLM router execution failed: %s", exc)
             return None
+
+    @staticmethod
+    def _tool_call_key(name: str, args: dict[str, Any]) -> str:
+        """Stable string key for deduplicating tool calls within a turn."""
+        return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
 
     async def _execute_tool(
         self,
@@ -1264,8 +1330,6 @@ class InspectionDBClient:
                 return self._format_categories()
             if tool_name == "get_inspections":
                 return self._format_inspections()
-            if tool_name == "query_database":
-                return self._format_query_database(args["sql_query"], limit=int(args.get("limit", 100)))
             if tool_name == "get_object_by_id":
                 return self._format_object(int(args["object_id"]))
             if tool_name == "get_objects_by_category":
@@ -1326,6 +1390,8 @@ class InspectionDBClient:
                 return self._format_detections_in_time_range(
                     args["start_time"], args["end_time"], limit=int(args.get("limit", 50)), inspection_id=_inspection_id()
                 )
+            if tool_name == "get_objects_in_image":
+                return self._format_objects_in_image(args.get("filename") or "")
             if tool_name == "get_objects_near_position":
                 return self._format_objects_near_position(
                     x=float(args["x"]),
@@ -1388,8 +1454,9 @@ class InspectionDBClient:
                     limit=int(args.get("limit", 50)),
                     inspection_id=_inspection_id(),
                 )
-            if tool_name == "run_sql_query":
-                return self._format_sql_query_result(args["query"], limit=int(args.get("limit", 100)))
+            if tool_name in {"run_sql_query", "query_database"}:
+                sql = args.get("query") or args.get("sql_query") or ""
+                return self._format_sql_query_result(sql, limit=int(args.get("limit", 100)))
             if tool_name == "get_report_summary":
                 # Report context is fetched and injected by the LLM service.
                 return None
@@ -1872,6 +1939,19 @@ class InspectionDBClient:
         ]
         for url in image_urls[:limit]:
             lines.append(f"![frame]({url})")
+        return "\n".join(lines)
+
+    def _format_objects_in_image(self, filename: str) -> str:
+        objects = self.get_objects_in_image(filename)
+        if not objects:
+            return f"No objects detected in image '{filename}'."
+        count = len(objects)
+        lines = [f"Objects detected in image '{filename}' ({count} total):"]
+        for obj in objects:
+            lines.append(
+                f"- Object {obj['object_id']} ({obj['category']}): "
+                f"centroid ({obj['centroid_x']:.2f}, {obj['centroid_y']:.2f}, {obj['centroid_z']:.2f})"
+            )
         return "\n".join(lines)
 
     def _format_category_timeline(self, category: str, inspection_id: int | None = None) -> str:

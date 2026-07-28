@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     tool_router_model: str = "gemma4:26b"
     tool_router_temperature: float = 0.0
     tool_router_n_ctx: int = 16384
+    # Maximum sequential rounds of tool calls per turn. In each round the router sees
+    # the results of all previous rounds and may call additional tools. Set to 1 to
+    # restore the original single-pass behavior.
+    tool_router_max_rounds: int = 3
 
     # Speech-to-text backend: "sensevoice" (FunASR, default) or "whisper" (faster-whisper).
     stt_backend: str = "sensevoice"
@@ -78,6 +82,9 @@ class Settings(BaseSettings):
     # Source camera images referenced by images.filename (served at /inspection/images).
     inspection_image_dir: str = "../MTR_Database/outputs/images"
 
+    # Annotated image cache (annotate_image tool draws bounding boxes here).
+    annotated_image_cache_dir: str = "./data/annotated_images"
+
     # Rerun 3D visualization. The chatbot pushes highlighted coordinates/objects to a
     # separately-running Rerun viewer (start it with `rerun`) over TCP. Disabled or
     # unreachable viewers degrade to a friendly status string, never a failed turn.
@@ -98,8 +105,17 @@ class Settings(BaseSettings):
     # require a manually-started `rerun` viewer (the earlier "connect to running viewer" mode).
     rerun_auto_spawn: bool = True
 
-    # Cache directory for vision-annotated images served under /annotated/images
-    annotated_image_cache_dir: str = "./annotated_images"
+    # Station map overlay: a downsampled FastLIO point cloud logged as a static
+    # `world/map` entity in the chatbot's OWN Rerun recording, so highlights land
+    # directly on the station map (highlights + map share one recording and thus
+    # always composite, unlike a separately-opened .rrd). Points and per-point
+    # RGBA colors are stored in the raw camera_init frame (same frame as DB object
+    # centroids); the chatbot pre-rotates them by rerun_leveling_rpy_deg at log
+    # time. Generate the .npz with scripts/extract_station_map.py from the grounding
+    # pipeline's .rrd. A missing file or rerun_map_enabled=false just skips the
+    # map (highlights still work).
+    rerun_map_enabled: bool = True
+    rerun_map_points_path: str = "./data/station_map.npz"
 
     # WebSocket keep-alive (Uvicorn/websockets protocol pings). Increase these if you
     # see reconnects behind proxies or on idle connections. The frontend also sends an
@@ -126,6 +142,7 @@ class Settings(BaseSettings):
         self.reports_dir = self._resolve_backend_path(self.reports_dir)
         self.inspection_db_path = self._resolve_backend_path(self.inspection_db_path)
         self.inspection_image_dir = self._resolve_backend_path(self.inspection_image_dir)
+        self.rerun_map_points_path = self._resolve_backend_path(self.rerun_map_points_path)
         self.annotated_image_cache_dir = self._resolve_backend_path(self.annotated_image_cache_dir)
         self.piper_exe_path = self._resolve_backend_path(self.piper_exe_path)
         self.piper_voices_dir = self._resolve_backend_path(self.piper_voices_dir)

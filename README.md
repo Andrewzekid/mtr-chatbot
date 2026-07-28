@@ -42,10 +42,11 @@ Every turn is **two LLM calls** plus streaming TTS — not an agentic loop. The 
 1. **Capture** — Frontend records audio via `MediaRecorder` (Space = push-to-talk), base64-encodes it, sends `{"type":"user_audio", audio_base64, mime_type}` over the WebSocket.
 2. **STT** — `VoicePipeline.handle_audio` runs SenseVoice (or Whisper) → returns transcript text, a language tag (`en`/`zh`/`yue`/…), and an emotion tag. Yields a `transcript` message to the client.
 3. **Router — LLM call #1 (tool selection)** — `LocalLLM.stream_reply` calls `InspectionDBClient.lookup`, which calls `ToolRouter.select_tool`. The router sends the transcript + a system prompt (DB schema + all ~38 tool descriptions + multi-tool rules + prior-images/prior-tools context) to Ollama with native `tools`. It returns a list of `(tool_name, args)` — possibly several — and nothing else.
-4. **Tool execution** — `lookup` loops over the selected tools and runs `_execute_tool` for each. Each tool runs a SQL query (or vision annotation, or returns `None` for `get_report_summary`), and its result is formatted to text by a `_format_*` method. All formatted outputs are joined with `\n\n` into one `db_context` string. No re-prompting happens between tools.
-5. **Report (conditional)** — If the router selected `get_report_summary`, `get_anomaly_summary`, or `get_anomalies`, `report_needed` is true and `InspectionReportClient.get_context()` (+ anomaly image URLs) is loaded as `report_context`, so the prose report coexists with the structured anomaly-table output. The report is lazy-loaded only on anomaly/findings intent — the router's decision, not a keyword gate. If `highlight_in_rerun` ran, a note is prepended to `db_context` telling the answerer the highlights are shown in the external Rerun viewer.
-6. **Debug + image-link handling** — The selected tool calls (and the router's raw response) are sent to the frontend as a `tool_calls` message (debug panel). If `annotate_image` ran, its markdown image links are pulled *out* of `db_context` (so the model can't duplicate them) and the backend re-emits them as the first tokens of the reply to guarantee display.
-7. **Answerer — LLM call #2 (synthesis, streamed)** — `_build_messages` assembles:
+4. **Tool execution (multi-round)** — `lookup` runs the selected tools and appends their formatted outputs to a `prior_results` list. It then re-prompts the router with those results, allowing it to call additional tools in subsequent rounds (up to `TOOL_ROUTER_MAX_ROUNDS`). Once the router returns no further tools (or the round limit is reached), all formatted outputs are joined with `\n\n` into one `db_context` string.
+5. **Report (conditional)** — If the router selected `get_report_summary`, `get_anomaly_summary`, or `get_anomalies`, `report_needed` is true and `InspectionReportClient.get_context()` (+ anomaly image URLs) is loaded as `report_context`, so the prose report coexists with the structured anomaly-table output. The report is lazy-loaded only on anomaly/findings intent — the router's decision, not a keyword gate.
+6. **Rerun auto-highlight / station map overlay** — If the router called `highlight_in_rerun`, a note is prepended to `db_context` telling the answerer the highlights are shown in the Rerun viewer. Otherwise, if the tool results contain coordinates or object ids, `InspectionDBClient.auto_highlight` pushes them to the Rerun viewer automatically (no explicit tool call) and a similar note is prepended. `RerunVisualizer` also logs the pre-extracted downsampled station map as a static `world/map` entity the first time it connects, so highlights appear directly on the station map. See *Rerun 3D highlighting* below.
+7. **Debug + image-link handling** — The selected tool calls (and the router's raw response) are sent to the frontend as a `tool_calls` message (debug panel). If `annotate_image` ran, its markdown image links are pulled *out* of `db_context` (so the model can't duplicate them) and the backend re-emits them as the first tokens of the reply to guarantee display.
+8. **Answerer — LLM call #2 (synthesis, streamed)** — `_build_messages` assembles:
    - `system`: the assistant persona + style/coordinate/image-link rules
    - `system`: prior tool-call history (image links stripped)
    - `system`: `db_context` (the merged tool outputs)
@@ -54,9 +55,9 @@ Every turn is **two LLM calls** plus streaming TTS — not an agentic loop. The 
    - `user`: the transcript
 
    The answering LLM streams tokens. ` authDomain` thinking tags are stripped in-flight so only the visible answer streams out.
-8. **Streaming TTS** — As tokens accumulate, `handle_audio` splits the text at sentence boundaries, cleans markdown/URLs/punctuation via `_clean_for_tts`, and feeds each sentence to Piper, which yields WAV chunks streamed back to the client as `tts_audio_chunk` messages. Speech therefore begins before the LLM finishes generating.
-9. **Playback** — The frontend plays chunks in order via the Web Audio API, renders the full text as a chat card, and inlines any `![...](/...images/...)` links as clickable thumbnails (lightbox). Cantonese with no matching Piper voice falls back to `window.speechSynthesis`.
-10. **History** — After the turn completes, the `(transcript, reply)` pair is appended to `conversation_history` (capped 12) and the tool-call payload to `tool_call_history` (capped 6) — both fed back into the next turn so the router can detect changed parameters and reference prior images.
+9. **Streaming TTS** — As tokens accumulate, `handle_audio` splits the text at sentence boundaries, cleans markdown/URLs/punctuation via `_clean_for_tts`, and feeds each sentence to Piper, which yields WAV chunks streamed back to the client as `tts_audio_chunk` messages. Speech therefore begins before the LLM finishes generating.
+10. **Playback** — The frontend plays chunks in order via the Web Audio API, renders the full text as a chat card, and inlines any `![...](/...images/...)` links as clickable thumbnails (lightbox). Cantonese with no matching Piper voice falls back to `window.speechSynthesis`.
+11. **History** — After the turn completes, the `(transcript, reply)` pair is appended to `conversation_history` (capped 12) and the tool-call payload to `tool_call_history` (capped 6) — both fed back into the next turn so the router can detect changed parameters and reference prior images.
 
 > **Key design point:** tool results reach the answerer as plain-text **system messages**, never as OpenAI-style `tool`/`function` messages. The backend pre-fetches and formats everything; the answerer just reads context and writes the answer.
 
@@ -64,31 +65,40 @@ Every turn is **two LLM calls** plus streaming TTS — not an agentic loop. The 
 
 ## How multiple tools are chained together
 
-### The mechanism (what "chaining" actually means here)
+### The mechanism
 
-When a question needs more than one piece of data, the router returns **multiple tool calls in a single response**. The backend runs **all of them in one pass** and **merges** their formatted outputs into one `db_context`, which is injected as a single system message for the answerer.
+The router can run for **up to `TOOL_ROUTER_MAX_ROUNDS` rounds per turn** (default 3). In each round, the router returns one or more tool calls; the backend executes them, formats the outputs, and **feeds those results back** to the router. The router then decides whether it has enough information or whether to call additional tools in the next round.
 
 ```
-transcript ──► ToolRouter.select_tool()  ──►  tool_calls = [
-                                                  ("get_summary", {}),
-                                                  ("get_category_objects_coordinates", {"category":"Ticket Gate"}),
-                                                  ("get_category_proximity", {"target_category":"Ticket Gate", ...}),
-                                                ]
-                        │  (one LLM round-trip; no intermediate results seen by the model)
+transcript ──► ToolRouter.select_tool()  ──►  round 1 tool_calls
+                        │
                         ▼
               for name, args in tool_calls:
-                  results.append(_execute_tool(name, args))   # SQL → _format_* → text
-              db_context = "\n\n".join(results)
+                  results.append(_execute_tool(name, args))
+                        │
+                        ▼
+              prior_results = formatted outputs from round 1
+                        │
+                        ▼
+              ToolRouter.select_tool(query, prior_results)  ──►  round 2 tool_calls
+                        │
+                        ▼
+              ... repeat until router returns no tools or max rounds ...
+                        │
+                        ▼
+              db_context = "\n\n".join(all_results)
                         │
                         ▼
               [system: db_context]  →  Answering LLM (streams synthesis)
 ```
 
-Three things follow from this:
+Key points:
 
-- **Tools are selected in parallel, not by output-dependency.** The router picks every tool up front using only what the user said (track IDs, categories, coordinates, times, radii). It cannot call tool A, read A's result, then decide to call B in the same turn. If an answer genuinely needs B's output to form B's arguments, the system can't do it in one turn (see *Limitations* below).
-- **The merge is textual.** Each tool's output is independently formatted (`get_summary`→`_format_summary`, `get_category_proximity`→`_format_category_proximity`, …) and concatenated. The answerer does the cross-tool synthesis in prose.
-- **Cross-turn "chaining" is real and supported** in two ways: (a) **re-calling with changed parameters**, and (b) **referencing previously shown images** ("annotate the previous image"). Both rely on `tool_call_history` / `conversation_history` injected into the router prompt.
+- **Tools are selected in parallel within a round** — whenever the user's question requires more than one piece of data, return multiple tool calls in one response.
+- **Tools can also be selected sequentially across rounds** — if a result is needed to decide the next tool's arguments (e.g. looking up `inspection_id`s before fetching coordinates), the router sees the prior round's output and can issue more calls.
+- **The merge is textual.** Each tool's output is independently formatted (`get_summary`→`_format_summary`, `get_category_proximity`→`_format_category_proximity`, …) and concatenated. The answerer synthesizes the merged context in prose.
+- **Duplicate calls are deduplicated.** The backend tracks which (tool, args) pairs have already run this turn and skips reruns, preventing infinite loops.
+- **Cross-turn context** (re-calling with changed parameters, referencing previously shown images) still relies on `tool_call_history` / `conversation_history` injected into the router prompt.
 
 ### Worked example A — counts + coordinates + proximity (three tools, one turn)
 
@@ -148,9 +158,8 @@ annotate_image {category: "Exit Sign", question: "highlight any anomalies"}   # 
 Router returns:
 ```
 get_category_objects_coordinates {category: "Ticket Gate"}
-highlight_in_rerun {category: "Ticket Gate", label: "ticket gates"}
 ```
-`get_category_objects_coordinates` returns the gate centroids + 3D bboxes as text for the answerer to speak. `highlight_in_rerun` resolves the same objects from the DB and pushes their centroids (bright red points) and 3D bboxes to the user's separately-running **Rerun viewer** over TCP (`rr.connect_tcp` to `127.0.0.1:9876`), alongside a faint context cloud of all object centroids and the camera trajectory. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer") that the answerer cites. It is fully tolerant: a missing `rerun-sdk`, `RERUN_ENABLED=false`, or a viewer that is not running all degrade to a friendly status string — the chat turn never fails because of Rerun.
+`get_category_objects_coordinates` returns the gate centroids + 3D bboxes as text for the answerer to speak. Because those results contain `(x, y, z)` coordinates, the answerer's **auto-highlight** then pushes the gate centroids (bright red points) + 3D bboxes to the Rerun viewer automatically — no `highlight_in_rerun` call needed. (The explicit `highlight_in_rerun` tool is only required for pure-visualization requests that produce no coordinates in the tool output.) Rerun I/O runs on a background thread so the chat turn never blocks; if no viewer is running and `RERUN_AUTO_SPAWN=true`, the backend launches one. Highlights share the grounding scene's app id + leveling frame, so they overlay the grounding map. The answerer cites a short status string ("Highlighted 3 objects in the Rerun viewer (grounding world frame)").
 
 ### Worked example D — multi-hop temporal + spatial (one turn, parallel)
 
@@ -180,9 +189,9 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 
 ### Limitations (be aware)
 
-- **No within-turn dependency.** The router can't do "find object X, then look up what's near X's coordinates" in one turn, because it doesn't see `get_object_*`'s result before planning. Workarounds: ask the user for the ID up front, or split across turns (turn 1 reveals the ID, turn 2 uses it — the second turn sees the first via history).
 - **`run_sql_query` / `query_database` are the escape hatch** for anything the fixed tools can't express (aggregations, custom joins, multi-category summaries with `GROUP BY`).
 - **Router disabled or returns nothing → no DB context.** With `tool_router_enabled=false` (or an empty tool list), `lookup` returns `None`; the answerer replies from general knowledge/history. There is no keyword fallback.
+- **Multi-round depends on the model using prior results.** The backend exposes prior round outputs to the router and asks it to stop when satisfied, but the tool-calling model may still decide everything up front. `TOOL_ROUTER_MAX_ROUNDS` sets the ceiling; the model decides the actual number of rounds used.
 
 ---
 
@@ -199,7 +208,7 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 | `app/services/db_service.py` | `InspectionDBClient.lookup` → router → `_execute_tool` per tool → join. All SQL query methods + `_format_*` formatters. `_parse_time_string` for clock/ns/ISO times. `annotate_image` orchestration. |
 | `app/services/report_service.py` | `InspectionReportClient` — reads `.txt`/`.pdf` (via `pdftotext`) reports, lists `extracted_images`. Loaded only when `get_report_summary` was selected. |
 | `app/services/vision_service.py` | `VisionAnnotator.annotate` — sends image to the **base LLM** (multimodal), strict-JSON parsing with retries, normalizes coords, draws annotations with OpenCV. |
-| `app/services/rerun_service.py` | `RerunVisualizer.highlight` — pushes 3D object centroids/bboxes + raw coordinates to a running Rerun viewer over TCP. Lazy `rerun` import, tolerant of a missing SDK / disabled flag / unreachable viewer. Called by the `highlight_in_rerun` tool. |
+| `app/services/rerun_service.py` | `RerunVisualizer.highlight` — pushes 3D object centroids/bboxes + raw coordinates to a Rerun viewer, sharing the grounding scene's app id + leveling frame. Logs the station map (`world/map`) from a pre-extracted downsampled `.npy` so highlights land on the map. All Rerun I/O on a background daemon thread (never blocks the chat); auto-launches a viewer when `RERUN_AUTO_SPAWN=true`. Called by the `highlight_in_rerun` tool AND by `InspectionDBClient.auto_highlight` (coordinate-bearing answers). |
 | `app/services/llm_service.py` | `LocalLLM.stream_reply` (call #2): gather context, `_build_messages`, stream via Ollama/vLLM, strip `thinking`. `preload_model`, `runtime_status`. |
 | `app/services/tts_service.py` | `PiperTTS` — voice selection per language, streaming WAV chunks, Python API + CLI fallback. |
 | `app/services/runtime_status.py` | `nvidia-smi` VRAM snapshot. |
@@ -256,7 +265,7 @@ Each maps to an `InspectionDBClient` method; the router's system prompt describe
 | `get_anomaly_summary` | `inspection_id?` | "How many anomalies were found?" (counts by type / inspection) |
 | `get_anomalies` | `anomaly_type?`, `inspection_id?`, `limit?` | "Show me the anomalies" (typed abnormalities + image-pair links) |
 | `get_report_summary` | — | "What anomalies did you find?" (loads prose report context) |
-| `highlight_in_rerun` | `object_ids[]?`, `coordinates[]?`, `category?`, `inspection_id?`, `label?` | "Show me where the ticket gates are" (pushes 3D highlights to the Rerun viewer) |
+| `highlight_in_rerun` | `object_ids[]?`, `coordinates[]?`, `category?`, `inspection_id?`, `label?` | "Highlight objects 16 and 19 in the 3D viewer" (explicit push; coordinate-bearing answers auto-highlight without this tool) |
 | `run_sql_query` / `query_database` | `query` (SELECT), `limit` | Escape hatch for ad-hoc/aggregation SQL |
 | `annotate_image` | `image_url` XOR `object_id` XOR `category`, `question?`, `limit` | "Highlight anomalies on object 109's image" (base LLM vision) |
 
@@ -266,21 +275,36 @@ Times accept ISO datetimes, clock strings (`"16:51:45"`, `"4:51 PM"`), or nanose
 
 ## Rerun 3D highlighting
 
-When the AI's answer involves coordinates or specific objects, the assistant can push those 3D positions into a running [Rerun](https://www.rerun.io) viewer so the inspector can *see* where things are in the station, alongside the spoken answer. Highlights share the **grounding pipeline's** Rerun app id (`inspection_grounding_rerun`) and world frame, so they overlay the grounding map/bboxes rather than appearing in a disconnected scene.
+When the AI's answer involves coordinates or specific objects, the assistant **automatically** pushes those 3D positions into a [Rerun](https://www.rerun.io) viewer so the inspector can *see* where things are in the station, alongside the spoken answer — no explicit "show me in Rerun" request is needed. Highlights share the **grounding pipeline's** Rerun app id (`inspection_grounding_rerun`) and world frame, so they overlay the grounding map/bboxes rather than appearing in a disconnected scene.
 
-1. Start the viewer in a separate terminal (or replay the grounding `.rrd` recording in it):
+**Auto-highlight (the default behavior).** After the tools run, the answerer scans the tool results for `(x, y, z)` coordinate tuples and `Object N` ids. If it finds any, it pushes them to the Rerun viewer via `InspectionDBClient.auto_highlight` — so any coordinate-bearing answer ("what are the coordinates of the ticket gates", "what's near (-18, 32, -6)", "how far apart are objects 9 and 10") is visualized automatically. The router does **not** have to call a special tool for this. The explicit `highlight_in_rerun` tool still exists for pure-visualization requests that produce no coordinates in the tool output (e.g. "highlight objects 16 and 19 in the 3D viewer"), and to force a highlight by `category`.
+
+**Auto-launch.** If no viewer is reachable on `RERUN_VIEWER_ADDR` and `RERUN_AUTO_SPAWN=true` (default), the backend launches one itself (`rerun --port 9876`, detached) the first time it has something to visualize, then attaches. Set `RERUN_AUTO_SPAWN=false` to require a manually-started `rerun` viewer.
+
+1. (Optional) Start the viewer yourself:
    ```bash
    pip install rerun-sdk        # already in backend/requirements.txt
    rerun                        # listens on 127.0.0.1:9876 by default
    ```
-2. Ask a coordinate/visualization question, e.g. *"What are the coordinates of the ticket gates? Show me where they are."* The router calls `get_category_objects_coordinates` **and** `highlight_in_rerun`.
-3. `RerunVisualizer.highlight` connects to the viewer over TCP (`rr.connect_tcp` to `RERUN_VIEWER_ADDR`), sets `world` to `RIGHT_HAND_Z_UP` (matching the grounding bridge), logs a faint context cloud of all object centroids (by category) plus the camera trajectory, then logs the highlighted set as bright red points + 3D bboxes with per-object labels. Each call uses a fresh `turn` time-sequence so repeated highlights are separate frames.
-4. **Frame alignment:** the DB stores object centroids/bboxes in the tilted `camera_init` frame. `RerunVisualizer` pre-rotates every point by the leveling matrix (`RERUN_LEVELING_RPY_DEG`, default `0.0,20.0,0.0` — the 20° pitch used by the 2026-06-11 inspection run, mirroring the grounding `rerun_bridge_node` `leveling_rpy_deg`), so highlights land level on the grounding map — the same convention the bridge uses for `world/bboxes3d`.
-5. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer at 127.0.0.1:9876 (grounding world frame)") that the answerer cites; the spoken answer still gives the (x, y, z) coordinates.
+   With `RERUN_AUTO_SPAWN=true` you can skip this — the backend launches a viewer on first highlight.
+2. Ask a coordinate/visualization question, e.g. *"What are the coordinates of the ticket gates?"* The router calls `get_category_objects_coordinates`; the answerer's auto-highlight then pushes the gate centroids + 3D bboxes to the viewer.
+3. `RerunVisualizer.highlight` does a fast port probe, returns an optimistic status string immediately, and hands the actual Rerun I/O to a **background daemon thread** so the chat turn never blocks on the viewer. The worker attaches to a running viewer via gRPC (`rr.connect_grpc` to `rerun+http://<addr>/proxy`, the rerun 0.35 protocol) or spawns one, sets `world` to `RIGHT_HAND_Z_UP` (matching the grounding bridge), and logs everything as static entities in the chatbot's own recording.
+4. **Station map overlay.** The first time the worker connects, it loads a pre-extracted downsampled point cloud of the FastLIO-built station (`backend/data/station_map.npz`, generated from the grounding `.rrd` by `scripts/extract_station_map.py`) and logs it as a static `world/map` entity. The `.npz` stores both raw `camera_init`-frame point positions and the original per-point RGBA colors, so the chatbot logs a genuine colored point cloud, not a monochrome cloud. Highlights therefore sit on the full colored station map in the chatbot's own recording.
+5. **Frame alignment:** the DB stores object centroids/bboxes in the tilted `camera_init` frame. `RerunVisualizer` pre-rotates every point by the leveling matrix (`RERUN_LEVELING_RPY_DEG`, default `0.0,20.0,0.0` — the 20° pitch used by the 2026-06-11 inspection run, mirroring the grounding `rerun_bridge_node` `leveling_rpy_deg`), so highlights and the station map land level in the grounding world frame — the same convention the bridge uses for `world/bboxes3d`.
+6. **Static logging:** the station map, context cloud, trajectory, and highlights are all logged with `static=True` so they render immediately regardless of the viewer's timeline position (logging at a non-zero `set_time_sequence` tick was the cause of the "empty viewer" bug — a fresh viewer scrubbed to time 0 showed nothing).
+7. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer (grounding world frame)") that the answerer cites; the spoken answer still gives the (x, y, z) coordinates.
 
-It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer that is not running all degrade to a friendly status string — the chat turn never fails because of Rerun. Highlight by `object_ids`, by raw `coordinates` (`{x, y, z, label?}`), or by `category`, optionally scoped to one `inspection_id`.
+It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer that cannot be reached or spawned all degrade to a friendly status string — the chat turn never fails because of Rerun. Highlight by `object_ids`, by raw `coordinates` (`{x, y, z, label?}`), or by `category`, optionally scoped to one `inspection_id`.
 
-> **Multi-recording caveat:** Rerun treats each `rr.init(...)` + `connect_tcp` as a separate recording. The chatbot's highlights and the grounding pipeline's live scene are therefore two recordings in the same viewer — both in the same world coordinates (same app id + leveling), so you can view them side by side or toggle between them, but they are not composited into a single 3D view automatically. To see the grounding map, replay its `.rrd` in the same viewer (the grounding bridge writes one when `rrd_path` is set).
+> **Generating the station map.** `scripts/extract_station_map.py` reads the colored cumulative map out of the grounding `.rrd` and saves a compact downsampled `.npz` with both positions and per-point RGBA colors:
+> ```bash
+> cd backend
+> .venv/bin/python scripts/extract_station_map.py \
+>     --rrd /path/to/output_mtr.rrd \
+>     --out data/station_map.npz \
+>     --max-points 1500000
+> ```
+> The default `RERUN_MAP_POINTS_PATH=./data/station_map.npz` picks up that file. If the file is missing or `RERUN_MAP_ENABLED=false`, the chatbot simply skips the map overlay (highlights still work).
 
 ---
 
@@ -320,6 +344,8 @@ Key env vars (see `backend/.env.example` for the full list):
 | `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR_Database/inspection_v2.db` / `../MTR_Database/outputs/images` | SQLite DB + source camera frames |
 | `RERUN_ENABLED` / `RERUN_VIEWER_ADDR` | `true` / `127.0.0.1:9876` | Push 3D highlights to a running `rerun` viewer over TCP |
 | `RERUN_APP_ID` / `RERUN_LEVELING_RPY_DEG` | `inspection_grounding_rerun` / `0.0,20.0,0.0` | Match the grounding scene's app id + leveling rotation so highlights overlay the grounding map |
+| `RERUN_AUTO_SPAWN` | `true` | If no viewer is reachable, launch one on first highlight (else require a manually-started `rerun`) |
+| `RERUN_MAP_ENABLED` / `RERUN_MAP_POINTS_PATH` | `true` / `./data/station_map.npz` | Overlay a pre-extracted downsampled station map in the chatbot's own recording so highlights land on the map |
 | `REPORTS_DIR` / `ANNOTATED_IMAGE_CACHE_DIR` | `../reports` / `./annotated_images` | Reports + annotated-image cache |
 | `PIPER_*` | — | Piper voice/model paths |
 
@@ -356,7 +382,9 @@ docker compose logs -f backend
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/status
 curl -X POST "http://localhost:8000/annotate-image" -F "image=@frame.jpg" -F "question=What anomalies are in this image?"
-rerun                                            # start the 3D viewer (for highlight_in_rerun)
+rerun                                            # optional: start the 3D viewer (auto-launched on first highlight when RERUN_AUTO_SPAWN=true)
+# Generate the station map .npy from the grounding .rrd (one-time):
+.venv/bin/python scripts/extract_station_map.py --rrd /path/to/output_mtr.rrd --out data/station_map.npz --max-points 1500000
 sqlite3 MTR_Database/inspection_v2.db
 #   .tables
 #   SELECT c.name AS category, COUNT(*) AS objects FROM objects o JOIN categories c ON c.id=o.category_id GROUP BY c.name ORDER BY objects DESC;

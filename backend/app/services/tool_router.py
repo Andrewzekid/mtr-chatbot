@@ -58,12 +58,12 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_summary",
-        "description": "Overall object counts and category breakdown. Use ONLY for generic inspection-wide summaries such as 'what did you find' or 'how many objects overall'. Do NOT use for category-specific summaries; use run_sql_query with GROUP BY category instead.",
+        "description": "Overall object counts and category breakdown. Use ONLY for generic inspection-wide summaries such as 'what did you find' or 'how many objects overall'. Do NOT use for category-specific summaries; use get_objects_by_category, get_category_objects_with_images, or get_category_objects_coordinates instead.",
         "parameters": _params({}),
     },
     {
         "name": "get_categories",
-        "description": "Return the list of distinct object categories in the database. Use this when you need to know what categories exist before writing a SQL query.",
+        "description": "Return the list of distinct object categories in the database. Use this when you need to know what categories exist.",
         "parameters": {"type": "object", "properties": {}},
     },
     {
@@ -76,7 +76,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_objects_by_category",
-        "description": "List objects belonging to a category such as Lights, Advertisement Board, or Ticket Gate.",
+        "description": "List objects belonging to a category such as Lights, Advertisement Board, or Ticket Gate. Use this when the user asks for the count of objects in a category or for details about objects of a specific category.",
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Lights, Advertisement Board, Ticket Gate."},
@@ -200,6 +200,16 @@ TOOLS: list[dict[str, Any]] = [
                 "limit": {"type": "integer", "description": "Maximum detections to return.", "default": 50},
             },
             required=["start_time", "end_time"],
+        ),
+    },
+    {
+        "name": "get_objects_in_image",
+        "description": "List every object detected in one specific image frame. Use when the user names or links an image filename and asks what objects are in it.",
+        "parameters": _params(
+            {
+                "filename": {"type": "string", "description": "Image filename such as '1781168326856275000.jpg' or a full /inspection/images/ URL."},
+            },
+            required=["filename"],
         ),
     },
     {
@@ -356,7 +366,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "highlight_in_rerun",
-        "description": "Highlight 3D coordinates or objects in the running Rerun viewer so the user can see where they are in the station. Call this whenever the user asks to visualize, show, highlight, or see WHERE objects/coordinates are, or whenever the answer involves specific coordinates or object ids. Provide object_ids, coordinates, or a category (any combination). The viewer must be running separately (start with `rerun`).",
+        "description": "Highlight 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. NOTE: any (x, y, z) coordinates or object ids returned by OTHER tools are auto-highlighted in the Rerun viewer already, so you do NOT need this tool for coordinate questions. Only call this for explicit visualization requests that would NOT otherwise put coordinates in the tool output, e.g. 'highlight objects 16 and 19 in the 3D viewer' or 'show me where the ticket gates are in 3D' (without asking for their coordinate values). Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running.",
         "parameters": _params(
             {
                 "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
@@ -380,25 +390,13 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
-        "name": "run_sql_query",
-        "description": "Execute a read-only SQL SELECT query against the inspection database. Use ONLY when no other tool fits the user's question. The query must start with SELECT.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "A valid SELECT query."},
-                "limit": {"type": "integer", "default": 100},
-            },
-            "required": ["query"],
-        },
-    },
-    {
         "name": "annotate_image",
         "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, object_id, or category. For object_id or category, up to `limit` images are annotated (default 5). Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
         "parameters": {
             "type": "object",
             "properties": {
                 "image_url": {"type": "string", "description": "URL or path to a single image, e.g. /inspection/images/14.jpg or /reports/extracted_images/img-021.jpg."},
-                "object_id": {"type": "integer", "description": "Numeric object id. All frames this object was detected in (up to `limit`) will be annotated."},
+                "object_id": {"type": "integer", "description": "Numeric object id (also called track_id). All frames this object was detected in (up to `limit`) will be annotated."},
                 "category": {"type": "string", "description": "Category name. Up to `limit` sample images of this category will be annotated."},
                 "question": {"type": "string", "description": "What to look for or how to annotate. Defaults to the user's original question."},
                 "limit": {"type": "integer", "default": 5, "description": "Maximum number of images to annotate for an object_id or category. Default 5."},
@@ -406,23 +404,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "query_database",
-        "description": "Execute a read-only SQL SELECT query against the inspection database. This is the primary tool for answering object, coordinate, temporal, and counting questions. Use get_categories first if you are unsure of category names.",
+        "name": "run_sql_query",
+        "description": "Execute a read-only SQL SELECT query against the inspection database. Use ONLY when no other listed tool can answer the question. The query must start with SELECT.",
         "parameters": {
             "type": "object",
             "properties": {
-                "sql_query": {"type": "string", "description": "A valid read-only SELECT SQL query."},
+                "query": {"type": "string", "description": "A valid read-only SELECT SQL query."},
                 "limit": {"type": "integer", "default": 100, "description": "Maximum rows to return."},
             },
-            "required": ["sql_query"],
+            "required": ["query"],
         },
     },
 ]
 
-# Reduced tool set for testing a SQL-first, minimal-tool assistant.
+# Reduced tool set for testing with a minimal assistant.
 REDUCED_TOOLS: list[dict[str, Any]] = [
     next(t for t in TOOLS if t["name"] == "get_categories"),
-    next(t for t in TOOLS if t["name"] == "query_database"),
+    next(t for t in TOOLS if t["name"] == "run_sql_query"),
     next(t for t in TOOLS if t["name"] == "get_report_summary"),
 ]
 
@@ -453,8 +451,8 @@ class ToolRouter:
         self.settings = settings
         self.last_raw_response: dict[str, Any] | None = None
 
-    def _system_prompt(self) -> str:
-        return """\
+    def _system_prompt(self, *, max_rounds: int = 3) -> str:
+        return f"""\
 You are a tool planner for an MTR subway station inspection assistant.
 Your ONLY job is to select the right tools from the list below to gather the data needed to answer the user's question.
 Do not answer the user directly. Do not output any text other than the tool calls.
@@ -503,25 +501,26 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 17. get_detection_counts_by_category(inspection_id) — per-frame detection counts per category.
 18. get_objects_in_time_range(start_time, end_time, limit, inspection_id) — objects whose span overlaps a window.
 19. get_detections_in_time_range(start_time, end_time, limit, inspection_id) — per-frame detections in a window.
-20. get_objects_near_position(x, y, z, radius_m, category, inspection_id) — objects within radius of a 3D point.
-21. get_category_sample_images(category, limit, inspection_id) — a few example image links for a category.
-22. get_inspection_poses(limit, inspection_id) — camera poses (from the images table).
-23. get_object_distance(object_id_a, object_id_b) — centroid distance between two objects.
-24. get_category_bounding_box(category, inspection_id) — spatial extent of a category.
-25. get_category_detection_timeline(category, bucket_seconds, inspection_id) — per-bucket detection counts for a category.
-26. get_objects_by_category_in_time_range(category, start_time, end_time, limit, inspection_id) — one category's objects in a window.
-27. get_object_movement(object_id) — centroid path of one object across its detections.
-28. get_nearest_objects_to_object(object_id, radius_m, inspection_id) — objects within radius of an object.
-29. get_images_in_time_range(start_time, end_time, category, limit, inspection_id) — sample images in a window.
-30. get_category_cooccurrence(window_ms, top_n, inspection_id) — category pairs seen together.
-31. get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id) — objects/detections around a time.
-32. get_anomaly_types — anomaly type names.
-33. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
-34. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, 2D bbox, note, and gt/inspection image links.
-35. get_report_summary — the written anomaly report text + recommendations.
-36. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the running Rerun viewer.
-37. run_sql_query(query, limit) / query_database(sql_query, limit) — read-only SELECT escape hatch.
-38. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
+20. get_objects_in_image(filename) — every object detected in one specific image frame.
+21. get_objects_near_position(x, y, z, radius_m, category, inspection_id) — objects within radius of a 3D point.
+22. get_category_sample_images(category, limit, inspection_id) — a few example image links for a category.
+23. get_inspection_poses(limit, inspection_id) — camera poses (from the images table).
+24. get_object_distance(object_id_a, object_id_b) — centroid distance between two objects.
+25. get_category_bounding_box(category, inspection_id) — spatial extent of a category.
+26. get_category_detection_timeline(category, bucket_seconds, inspection_id) — per-bucket detection counts for a category.
+27. get_objects_by_category_in_time_range(category, start_time, end_time, limit, inspection_id) — one category's objects in a window.
+28. get_object_movement(object_id) — centroid path of one object across its detections.
+29. get_nearest_objects_to_object(object_id, radius_m, inspection_id) — objects within radius of an object.
+30. get_images_in_time_range(start_time, end_time, category, limit, inspection_id) — sample images in a window.
+31. get_category_cooccurrence(window_ms, top_n, inspection_id) — category pairs seen together.
+32. get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id) — objects/detections around a time.
+33. get_anomaly_types — anomaly type names.
+34. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
+35. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, 2D bbox, note, and gt/inspection image links.
+36. get_report_summary — the written anomaly report text + recommendations.
+37. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the Rerun viewer (only for explicit visual requests; coordinates from other tools auto-highlight).
+38. run_sql_query(query, limit) — read-only SELECT escape hatch. Use ONLY when no other tool fits.
+39. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
 
 ## Multi-tool flow examples
 
@@ -559,35 +558,29 @@ Plan:
 3. get_report_summary
 (Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report. If the anomaly tables are not yet populated, those tools return a clear message — still call them.)
 
-Example E (Rerun highlight):
+Example E (Rerun highlight — auto-highlight):
 User: "What are the coordinates of the ticket gates? Show me where they are."
 Plan:
 1. get_category_objects_coordinates(category="Ticket Gate")
-2. highlight_in_rerun(category="Ticket Gate", label="ticket gates")
-(The highlight tool pushes the gate centroids + bboxes to the Rerun viewer; the answerer describes the coordinates and notes they are highlighted in the viewer.)
+(The coordinates this tool returns are auto-highlighted in the Rerun viewer — no separate highlight_in_rerun call needed. The answerer describes the coordinates and notes they are shown in the viewer.)
 
-Example E2 (highlight specific objects from a prior answer):
+Example E2 (explicit highlight of specific objects):
 User: "Highlight objects 16 and 19 in the 3D viewer."
 Plan:
 1. highlight_in_rerun(object_ids=[16, 19], label="objects 16 and 19")
 
-Example F (cross-inspection):
-User: "Compare inspection 1 and inspection 2 — how many objects did each find?"
-Plan:
-1. get_inspections
-(The output gives per-inspection object and detection counts for all inspections, so the answerer can compare them directly. Only pass inspection_id to a tool when the user wants that single inspection's detail, e.g. get_summary(inspection_id=2).)
-
-Example G (SQL aggregation):
+Example F (category summary):
 User: "Give me a summary of all the lights and advertisement boards found."
 Plan:
-1. run_sql_query(query="SELECT c.name AS category, COUNT(*) AS object_count, MIN(i.timestamp_ns) AS first_seen, MAX(i.timestamp_ns) AS last_seen, AVG(o.centroid_x) AS avg_x, AVG(o.centroid_y) AS avg_y, AVG(o.centroid_z) AS avg_z FROM objects o JOIN categories c ON c.id=o.category_id JOIN detections d ON d.object_id=o.id JOIN images i ON i.id=d.image_id WHERE c.name IN ('Lights','Advertisement Board') GROUP BY c.name")
+1. get_objects_by_category(category="Lights", limit=20)
+2. get_objects_by_category(category="Advertisement Board", limit=20)
 
-Example H (annotation):
+Example G (annotation):
 User: "Highlight any anomalies on the image of object 16."
 Plan:
 1. annotate_image(object_id=16, question="highlight any anomalies")
 
-Example H2 (referencing a previously shown image):
+Example H (referencing a previously shown image):
 User: "Annotate the previous image for advertisement board defects."
 Context: prior images list ends with /inspection/images/14.jpg.
 Plan:
@@ -596,16 +589,18 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
 
 ## Rules
 
-- Call every tool that is needed in a single turn. Do not chain sequentially. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely; the backend runs all of them and merges their results.
-- Call highlight_in_rerun whenever the user asks to visualize/show/highlight/see WHERE things are, or whenever your answer will cite specific coordinates or object ids. It is cheap and the user watches the Rerun viewer.
+- In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely.
+- This is a multi-round router: after the backend executes your tool calls, it will show you the results and give you another chance to call more tools if you still need information. Up to {max_rounds} rounds are allowed. If the results from the current round are enough, stop — return no tool calls. Only call additional tools when you genuinely need their output.
+- Any (x, y, z) coordinates or object ids returned by a tool are AUTO-highlighted in the Rerun viewer — you do NOT need to call highlight_in_rerun for coordinate questions. Only call highlight_in_rerun for explicit visualization requests that would not otherwise put coordinates in the tool output.
 - A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
 - Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
 - For proximity questions, pass all other known categories as other_categories unless the user names a specific subset.
+- For questions about how many objects are in a specific category (e.g. "how many exit signs were found"), use get_objects_by_category(category), NOT get_summary.
 - For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because inspections run in the late afternoon.
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
-- When the user asks for a summary of specific categories (e.g., "summary of lights and advertisement boards"), do NOT call get_summary. Use run_sql_query with GROUP BY category that returns COUNT, MIN/MAX first_seen/last_seen, and AVG/MIN/MAX centroid coordinates (joining objects → categories → detections → images).
+- DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
 - When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, call get_anomaly_summary / get_anomalies and/or get_report_summary. Do not call coordinate tools for pure anomaly questions.
 - Do not output explanatory text; only emit tool calls.
 """
@@ -691,13 +686,33 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
             "arguments used:\n" + "\n".join(recent)
         )
 
+    @staticmethod
+    def _round_context(prior_results: Sequence[str] | None) -> str:
+        """Build the in-turn results block appended to the user message.
+
+        This lets the router see what previous tool calls returned so it can decide
+        whether to stop or call more tools in the next round.
+        """
+        if not prior_results:
+            return ""
+        parts = ["\n\n=== Results from tools already called this turn ==="]
+        for i, res in enumerate(prior_results, start=1):
+            parts.append(f"--- result {i} ---\n{res}")
+        return "\n".join(parts)
+
     def select_tool(
         self,
         query: str,
         chat_history: Sequence[tuple[str, str]] | None = None,
         tool_history: Sequence[dict[str, object]] | None = None,
+        prior_results: Sequence[str] | None = None,
     ) -> list[tuple[str, Any]]:
-        """Return a list of (tool_name, args) chosen by the base model."""
+        """Return a list of (tool_name, args) chosen by the base model.
+
+        If prior_results is non-empty, the model is prompted with those results and
+        may return an additional round of tool calls. An empty tool_calls response
+        means the model is satisfied and no further tools are needed.
+        """
         if not self.settings.tool_router_enabled:
             return []
 
@@ -721,11 +736,13 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         # system prompt instructs the model to call them for anomaly/finding/problem
         # questions, so the model decides whether the report is relevant.
 
+        user_content = query + self._round_context(prior_results)
+
         payload = {
             "model": self.settings.tool_router_model,
             "messages": [
-                {"role": "system", "content": self._system_prompt() + prior_images + prior_tools},
-                {"role": "user", "content": query},
+                {"role": "system", "content": self._system_prompt(max_rounds=self.settings.tool_router_max_rounds) + prior_images + prior_tools},
+                {"role": "user", "content": user_content},
             ],
             "stream": False,
             "tools": _ollama_tools(),
