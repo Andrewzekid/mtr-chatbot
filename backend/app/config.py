@@ -29,10 +29,10 @@ class Settings(BaseSettings):
     llm_history_turns: int = 4
     llm_history_char_budget: int = 1600
 
-    # Vision model for image anomaly annotation (Ollama preferred)
-    vision_model_provider: str = "ollama"
-    vision_model_name: str = "llama3.2-vision"
-    vision_ollama_base_url: str = "http://localhost:11434"
+    # Image anomaly annotation (annotate_image tool + /annotate-image endpoint).
+    # Annotation reuses the SAME base LLM as chat — llm_model_name at ollama_base_url —
+    # so the base model must be a multimodal/vision-capable Ollama model (e.g. gemma4:26b,
+    # qwen2.5-vl, llava). The fields below only tune the annotation task, not the model.
     vision_max_tokens: int = 1024
     vision_temperature: float = 0.3
     vision_request_timeout_s: float = 120.0

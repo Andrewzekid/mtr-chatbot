@@ -178,18 +178,16 @@ class VisionAnnotator:
         }
 
     async def _analyze_with_ollama(self, image_bytes: bytes, question: str) -> tuple[dict[str, Any], str]:
-        provider = self.settings.vision_model_provider.lower().strip()
-        if provider != "ollama":
-            raise RuntimeError(f"Vision provider '{provider}' is not supported yet. Use ollama.")
-
+        # Annotation reuses the base chat LLM (llm_model_name at ollama_base_url) rather
+        # than a dedicated vision model, so the base model must be multimodal/vision-capable.
         # Decode the image once to get dimensions so the prompt can explain normalized coordinates.
         _decoded = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         if _decoded is None:
             raise RuntimeError("Could not decode image for vision analysis")
         height, width = _decoded.shape[:2]
 
-        base_url = self.settings.vision_ollama_base_url.rstrip("/")
-        model_name = self.settings.vision_model_name
+        base_url = self.settings.ollama_base_url.rstrip("/")
+        model_name = self.settings.llm_model_name
         prompt = self._annotation_prompt(question, width=width, height=height)
 
         payload = {

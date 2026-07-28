@@ -1054,158 +1054,44 @@ class InspectionDBClient:
         chat_history: Sequence[tuple[str, str]] | None = None,
         tool_history: Sequence[dict[str, object]] | None = None,
     ) -> str | None:
-        """Return a text summary for DB-related queries, or None if unrelated."""
-        q = query.lower().strip()
+        """Return a text summary for DB-related queries, or None if unrelated.
+
+        The router LLM is the sole gatekeeper: every non-empty query reaches it, and it
+        decides which tools to call (or none, for off-topic chat). There is no keyword
+        gate and no keyword-based formatting — _execute_tool formats each chosen tool.
+        """
         self._last_query = query
         self._last_chat_history = list(chat_history) if chat_history else []
-        if not q:
+        if not query.strip():
             return None
 
-        # Bail early if the query is clearly not about the inspection database.
-        db_keywords = [
-            "object", "objects", "track", "tracks", "observation", "observations",
-            "category", "categories", "point", "points", "poster", "advertisement",
-            "exit sign", "light", "lights", "map", "tv", "ticket gate", "gate",
-            "database", "db", "inspect", "inspection", "found", "detected",
-            "largest", "biggest", "smallest", "recent", "last seen", "summary",
-            "count", "how many", "what did", "what is", "where is", "tell me about",
-            "when", "timeline", "story", "history", "duration", "first seen", "last seen", "seen",
-            "timestamp", "timestamps", "time", "times",
-            "image", "images", "picture", "pictures", "photo", "photos", "show me",
-            "look at", "visual", "see", "frame", "frames",
-            "cluster", "clusters", "group", "groups", "grouped", "together", "consecutive",
-            "consecutively", "snapshot", "snapshots", "moment", "moments", "same time",
-            "at time", "around time", "busy", "busiest", "busiest minute", "activity",
-            "coordinate", "coordinates", "position", "positions", "proximity", "near",
-            "nearby", "close", "close to", "next to", "adjacent",
-            "between", "around", "happened", "detections", "range", "period", "window",
-            "sample", "example", "examples",
-            "distance", "far", "apart",
-            "area", "extent", "occupy", "bounding box", "bounds",
-            "filtered", "dropped", "removed",
-            "pose", "poses", "trajectory", "camera pose", "robot pose",
-            "movement", "moved", "move", "path", "waypoints", "displacement",
-            "location", "located", "where was", "where is", "where were",
-            "sql", "query", "run a query", "select",
-            "find", "anomaly", "anomalies",
-        ]
-        if not any(kw in q for kw in db_keywords):
+        # Formatting is function-driven, not keyword-driven: the LLM router selects
+        # which functions to call, and _execute_tool formats each function's result.
+        # When the router is disabled or returns no tools, there is no DB context
+        # (no keyword fallback that guesses a formatter); the answerer replies from
+        # general knowledge / chat history instead.
+        if self.router is None:
             return None
-
-        # Try LLM-based tool selection first.
-        if self.router is not None:
-            try:
-                tool_calls = self.router.select_tool(query, chat_history=chat_history, tool_history=tool_history)
-                self._record_tool_calls(tool_calls)
-                if tool_calls:
-                    results: list[str] = []
-                    tool_results: list[dict[str, Any]] = []
-                    for tool_name, args in tool_calls:
-                        result = await self._execute_tool(tool_name, args, chat_history=chat_history)
-                        tool_results.append({"name": tool_name, "args": args, "output": result})
-                        if result:
-                            results.append(result)
-                    self._record_tool_results(tool_results)
-                    if results:
-                        return "\n\n".join(results)
-                else:
-                    self._record_tool_results([])
-            except Exception as exc:
-                logger.warning("LLM router execution failed: %s", exc)
-
-        image_keywords = ("image", "images", "picture", "pictures", "photo", "photos", "show me", "look at", "visual", "frame", "frames")
-        temporal_keywords = ("when", "timeline", "story", "history", "duration", "first seen", "last seen", "seen", "timestamp", "timestamps", "time", "times")
-
         try:
-            annotation_keywords = ("highlight", "circle", "draw", "mark", "annotate", "outline", "point out")
-            wants_annotation = any(kw in q for kw in annotation_keywords)
-
-            # Specific track / object ID
-            track_match = re.search(r"(?:track|object|id)\s*#?\s*(\d+)", q)
-            if track_match:
-                track_id = int(track_match.group(1))
-                if wants_annotation:
-                    resolved_url = self._resolve_image_reference(query, chat_history)
-                    result = await self.annotate_image(
-                        image_url=resolved_url,
-                        track_id=track_id,
-                        question=self._last_query,
-                    )
-                    return self._format_annotate_image(result)
-                if any(kw in q for kw in image_keywords):
-                    return self._format_object_images(track_id)
-                if any(kw in q for kw in temporal_keywords):
-                    return self._format_object_timeline(track_id)
-                return self._format_object(track_id)
-
-            # Top / largest objects
-            if any(kw in q for kw in ("largest", "biggest", "most points", "top")):
-                return self._format_top_objects()
-
-            # Recent / last seen
-            if any(kw in q for kw in ("recent", "last seen", "latest")):
-                return self._format_recent_objects()
-
-            # Temporal inspection story
-            if any(kw in q for kw in temporal_keywords):
-                # Category-specific timeline if a category alias is present.
-                for alias, canonical in self._CATEGORY_ALIASES.items():
-                    if alias in q:
-                        return self._format_category_timeline(canonical)
-                return self._format_inspection_timeline()
-
-            # Coordinates and/or proximity for categories
-            wants_coordinates = any(kw in q for kw in ("coordinate", "coordinates", "position", "positions", "x y z", "xyz"))
-            wants_proximity = any(kw in q for kw in ("near", "nearby", "close", "close to", "next to", "proximity", "adjacent"))
-            if wants_coordinates or wants_proximity:
-                # Preserve earliest appearance order and deduplicate canonical categories.
-                seen: dict[str, int] = {}
-                for alias, canonical in self._CATEGORY_ALIASES.items():
-                    if alias in q and canonical not in seen:
-                        seen[canonical] = q.find(alias)
-                matched = sorted(seen.items(), key=lambda item: item[1])
-                if matched:
-                    target = matched[0][0]
-                    results: list[str] = []
-                    if wants_coordinates:
-                        results.append(self._format_category_coordinates(target))
-                    if wants_proximity and len(matched) >= 2:
-                        others = [canon for canon, _ in matched[1:]]
-                        results.append(self._format_category_proximity(target, others, radius_m=2.0))
-                    if results:
-                        return "\n\n".join(results)
-
-            # Time-window clusters: objects seen together / consecutively
-            cluster_keywords = ("cluster", "clusters", "group", "groups", "grouped", "together", "consecutive", "consecutively", "snapshot", "snapshots", "moment", "moments", "same time", "at time", "around time", "busy", "busiest")
-            if any(kw in q for kw in cluster_keywords):
-                return self._format_temporal_clusters()
-
-            # Category lookup
-            for alias, canonical in self._CATEGORY_ALIASES.items():
-                if alias in q:
-                    if wants_annotation:
-                        resolved_url = self._resolve_image_reference(query, chat_history)
-                        result = await self.annotate_image(
-                            image_url=resolved_url,
-                            category=canonical if resolved_url is None else None,
-                            question=self._last_query,
-                        )
-                        return self._format_annotate_image(result)
-                    return self._format_category(canonical)
-
-            # Generic summary / count
-            if any(kw in q for kw in ("summary", "overview", "how many", "count", "what did", "what do you see", "what did you find")):
-                return self._format_summary()
-
-            # Fallback: if "object" or "objects" appears, give summary.
-            if "object" in q or "objects" in q:
-                return self._format_summary()
-
-        except sqlite3.Error as exc:
-            logger.warning("Inspection DB query failed: %s", exc)
+            tool_calls = self.router.select_tool(
+                query, chat_history=chat_history, tool_history=tool_history
+            )
+            self._record_tool_calls(tool_calls)
+            if not tool_calls:
+                self._record_tool_results([])
+                return None
+            results: list[str] = []
+            tool_results: list[dict[str, Any]] = []
+            for tool_name, args in tool_calls:
+                result = await self._execute_tool(tool_name, args, chat_history=chat_history)
+                tool_results.append({"name": tool_name, "args": args, "output": result})
+                if result:
+                    results.append(result)
+            self._record_tool_results(tool_results)
+            return "\n\n".join(results) if results else None
+        except Exception as exc:
+            logger.warning("LLM router execution failed: %s", exc)
             return None
-
-        return None
 
     async def _execute_tool(
         self,

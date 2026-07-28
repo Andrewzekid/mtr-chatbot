@@ -591,7 +591,7 @@ class LocalLLM:
                         payload = tags_resp.json()
                         for model in payload.get("models", []):
                             name = model.get("name")
-                            if cisinstance(name, str):
+                            if isinstance(name, str):
                                 ollama_models.append(name)
             except Exception:
                 ollama_ok = False
