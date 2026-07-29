@@ -58,6 +58,11 @@ class InspectionDBClient:
     def last_tool_results(self) -> list[dict[str, Any]]:
         return self._last_tool_results
 
+    @property
+    def last_highlight_status(self) -> str | None:
+        """Status string from the final-pass Rerun highlight (None if nothing was pushed)."""
+        return self._last_highlight_status
+
     def _record_tool_calls(self, tool_calls: list[tuple[str, dict[str, Any]]]) -> None:
         self._last_tool_calls = [
             {"name": name, "args": args} for name, args in tool_calls
@@ -95,6 +100,7 @@ class InspectionDBClient:
         self._last_tool_results: list[dict[str, Any]] = []
         self._last_query: str = ""
         self._last_chat_history: list[tuple[str, str]] = []
+        self._last_highlight_status: str | None = None
 
     # ------------------------------------------------------------------
     # Timestamp / image helpers
@@ -448,6 +454,75 @@ class InspectionDBClient:
                     "centroid_y": ty,
                     "centroid_z": tz,
                     "nearby": nearby,
+                }
+            )
+        return results
+
+    def get_category_proximity_with_images(
+        self,
+        target_category: str,
+        other_categories: list[str],
+        radius_m: float = 2.0,
+        limit: int = 5,
+        nearby_limit: int = 3,
+        inspection_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """For each target-category object, return nearby objects (with sample image).
+
+        Returns up to *limit* target objects; for each target, up to *nearby_limit*
+        nearest objects from *other_categories* within *radius_m*, including their
+        distance and a sample frame URL.
+        """
+        targets = self._object_rows(
+            "c.name = ?", (target_category,), order="first_seen_ns", limit=limit, inspection_id=inspection_id
+        )
+        if not targets or not other_categories:
+            return []
+        placeholders = ",".join("?" for _ in other_categories)
+        others = self._object_rows(
+            f"c.name IN ({placeholders})", tuple(other_categories), inspection_id=inspection_id
+        )
+
+        conn = self._connect()
+        results: list[dict[str, Any]] = []
+        for target in targets:
+            tx, ty, tz = target["centroid_x"], target["centroid_y"], target["centroid_z"]
+            if tx is None or ty is None or tz is None:
+                continue
+            nearby: list[dict[str, Any]] = []
+            for row in others:
+                if row["id"] == target["id"]:
+                    continue
+                ox, oy, oz = row["centroid_x"], row["centroid_y"], row["centroid_z"]
+                if ox is None or oy is None or oz is None:
+                    continue
+                dx, dy, dz = ox - tx, oy - ty, oz - tz
+                dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+                if dist <= radius_m:
+                    sample = conn.execute(
+                        "SELECT i.filename FROM detections d JOIN images i ON i.id=d.image_id "
+                        "WHERE d.object_id=? AND i.filename IS NOT NULL ORDER BY i.timestamp_ns LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    nearby.append(
+                        {
+                            "object_id": row["id"],
+                            "category": row["category"],
+                            "distance_m": round(dist, 3),
+                            "centroid_x": ox,
+                            "centroid_y": oy,
+                            "centroid_z": oz,
+                            "sample_image_path": sample["filename"] if sample else None,
+                        }
+                    )
+            nearby.sort(key=lambda r: r["distance_m"])
+            results.append(
+                {
+                    "object_id": target["id"],
+                    "centroid_x": tx,
+                    "centroid_y": ty,
+                    "centroid_z": tz,
+                    "nearby": nearby[:nearby_limit],
                 }
             )
         return results
@@ -1280,9 +1355,40 @@ class InspectionDBClient:
 
             self._record_tool_calls(all_tool_calls)
             self._record_tool_results(all_tool_results)
-            return "\n\n".join(
-                str(r.get("output", "")) for r in all_tool_results if r.get("output")
-            ) if all_tool_results else None
+
+            db_context = (
+                "\n\n".join(
+                    str(r.get("output", "")) for r in all_tool_results if r.get("output")
+                )
+                if all_tool_results
+                else None
+            )
+
+            # Final-pass highlight: after the router stops calling tools, ask it to decide
+            # which objects/coordinates to show in the Rerun viewer (replaces the old regex
+            # auto-highlight). Skip if the router already pushed an explicit highlight_in_rerun
+            # this turn, or if nothing tool-bearing ran.
+            self._last_highlight_status = None
+            highlight_called = any(
+                name == "highlight_in_rerun" for name, _ in all_tool_calls
+            )
+            if (
+                not highlight_called
+                and self.rerun_visualizer is not None
+                and self.router is not None
+                and db_context
+            ):
+                try:
+                    decision = await asyncio.to_thread(
+                        self.router.decide_highlights, query, db_context, chat_history
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Final-pass highlight decision failed: %s", exc)
+                    decision = None
+                if decision:
+                    self._last_highlight_status = self._apply_highlight_decision(decision)
+
+            return db_context
         except Exception as exc:
             logger.warning("LLM router execution failed: %s", exc)
             return None
@@ -1371,6 +1477,22 @@ class InspectionDBClient:
                 radius = float(args.get("radius_m", 2.0))
                 return self._format_category_proximity(
                     target, [self._canonical_category(c) for c in others], radius, inspection_id=_inspection_id()
+                )
+            if tool_name == "get_category_proximity_with_images":
+                target = self._canonical_category(args["target_category"])
+                others = args.get("other_categories", args.get("other_category", []))
+                if isinstance(others, str):
+                    others = [others]
+                radius = float(args.get("radius_m", 2.0))
+                limit = int(args.get("limit", 5))
+                nearby_limit = int(args.get("nearby_limit", 3))
+                return self._format_category_proximity_with_images(
+                    target,
+                    [self._canonical_category(c) for c in others],
+                    radius,
+                    limit=limit,
+                    nearby_limit=nearby_limit,
+                    inspection_id=_inspection_id(),
                 )
             if tool_name == "get_inspection_timeline":
                 return self._format_inspection_timeline(inspection_id=_inspection_id())
@@ -1483,81 +1605,72 @@ class InspectionDBClient:
         object_ids = [int(o) for o in object_ids if o is not None]
         coords = args.get("coordinates") or []
         category = self._canonical_category(args["category"]) if args.get("category") else None
+        keep_existing = bool(args.get("keep_existing")) or self._query_wants_keep(self._last_query)
         return self.rerun_visualizer.highlight(
             object_ids=object_ids or None,
             coordinates=coords or None,
             category=category,
             inspection_id=int(args["inspection_id"]) if args.get("inspection_id") is not None else None,
             label=args.get("label"),
+            keep_existing=keep_existing,
         )
 
     # ------------------------------------------------------------------
-    # Automatic Rerun highlighting (no explicit tool call required)
+    # Final-pass Rerun highlighting (decided by the router after tools run)
     # ------------------------------------------------------------------
 
-    # Matches 3D coordinate tuples the formatters emit, e.g. "(-18.22, 32.17, -6.85)".
-    _COORD_RE = re.compile(
-        r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+    # Phrases that explicitly ask to KEEP previous highlights (so we do NOT clear).
+    # Conservative on purpose: the router / final-pass LLM also exposes a keep_existing
+    # tool flag for nuance; this is just a safety net for obvious cases.
+    _KEEP_KEYWORDS = (
+        "keep", "don't clear", "dont clear", "don't remove", "dont remove",
+        "do not clear", "do not remove", "add to", "alongside", "in addition to",
+        "accumulate", "as well as the previous", "as well as the existing",
     )
-    # Matches "Object 109" / "object_id 109" references in tool output.
-    _OBJECT_ID_RE = re.compile(r"\bObject\s+(\d+)\b", re.IGNORECASE)
 
     @classmethod
-    def _extract_coordinates(cls, text: str, *, limit: int = 100) -> list[dict[str, float]]:
-        """Pull (x, y, z) tuples out of tool-output text, as highlight coordinate dicts."""
-        coords: list[dict[str, float]] = []
-        for m in cls._COORD_RE.finditer(text or ""):
-            coords.append({
-                "x": float(m.group(1)),
-                "y": float(m.group(2)),
-                "z": float(m.group(3)),
-            })
-            if len(coords) >= limit:
-                break
-        return coords
+    def _query_wants_keep(cls, query: str | None) -> bool:
+        """True if the user explicitly asked to keep / add to previous highlights."""
+        if not query:
+            return False
+        q = query.lower()
+        return any(kw in q for kw in cls._KEEP_KEYWORDS)
 
-    @classmethod
-    def _extract_object_ids(cls, text: str, *, limit: int = 100) -> list[int]:
-        """Pull distinct object ids out of tool-output text (e.g. "Object 109")."""
-        ids: list[int] = []
-        seen: set[int] = set()
-        for m in cls._OBJECT_ID_RE.finditer(text or ""):
-            oid = int(m.group(1))
-            if oid not in seen:
-                seen.add(oid)
-                ids.append(oid)
-                if len(ids) >= limit:
-                    break
-        return ids
+    def _apply_highlight_decision(self, decision: dict[str, Any]) -> str | None:
+        """Push a final-pass highlight decision to the Rerun viewer.
 
-    def auto_highlight(self, context_text: str) -> str | None:
-        """Auto-push coordinates/object ids found in tool output to the Rerun viewer.
-
-        Called by the answerer after the tools run, so any coordinate-bearing answer is
-        visualized automatically — no explicit ``highlight_in_rerun`` tool call needed.
-        Returns a short success status string when something was highlighted, or ``None``
-        when there was nothing to visualize / Rerun is unavailable (so the answerer stays
-        quiet about it). Never raises.
+        Driven by the router's post-tool ``set_rerun_highlight`` decision (see
+        :meth:`ToolRouter.decide_highlights`) instead of an explicit ``highlight_in_rerun``
+        tool call. Mirrors :meth:`_highlight_in_rerun` for argument normalization. Returns
+        the ``RerunVisualizer`` status string, or ``None`` on failure / nothing to
+        highlight. Never raises.
         """
-        if self.rerun_visualizer is None or not context_text:
+        if self.rerun_visualizer is None:
             return None
-        coords = self._extract_coordinates(context_text)
-        object_ids = self._extract_object_ids(context_text)
-        if not coords and not object_ids:
-            return None
+        object_ids = decision.get("object_ids") or []
+        if isinstance(object_ids, (int, float)):
+            object_ids = [int(object_ids)]
+        object_ids = [int(o) for o in object_ids if o is not None]
+        coords = decision.get("coordinates") or []
+        category = (
+            self._canonical_category(decision["category"])
+            if decision.get("category")
+            else None
+        )
+        label = decision.get("label") or "final"
+        keep_existing = bool(decision.get("keep_existing")) or self._query_wants_keep(self._last_query)
         try:
-            status = self.rerun_visualizer.highlight(
+            return self.rerun_visualizer.highlight(
                 object_ids=object_ids or None,
                 coordinates=coords or None,
+                category=category,
                 inspection_id=None,
-                label="auto",
+                label=label,
+                keep_existing=keep_existing,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Auto Rerun highlight failed: %s", exc)
+            logger.warning("Final-pass Rerun highlight failed: %s", exc)
             return None
-        if isinstance(status, str) and status.startswith("Highlighted"):
-            return status
-        return None
 
     # ------------------------------------------------------------------
     # Image annotation
@@ -1890,6 +2003,54 @@ class InspectionDBClient:
             "Per-target breakdown:",
         ]
         lines.extend(detailed_lines)
+        return "\n".join(lines)
+
+    def _format_category_proximity_with_images(
+        self,
+        target_category: str,
+        other_categories: list[str],
+        radius_m: float = 2.0,
+        limit: int = 5,
+        nearby_limit: int = 3,
+        inspection_id: int | None = None,
+    ) -> str:
+        results = self.get_category_proximity_with_images(
+            target_category,
+            other_categories,
+            radius_m,
+            limit=limit,
+            nearby_limit=nearby_limit,
+            inspection_id=inspection_id,
+        )
+        if not results:
+            return f"No '{target_category}' objects found near {other_categories} within {radius_m} m."
+
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [
+            f"Nearby objects for '{target_category}'{scope} within {radius_m} m of {', '.join(other_categories)}, "
+            f"with object IDs, distances, coordinates, and sample images:"
+        ]
+        total_nearby = 0
+        for r in results:
+            nearby = r["nearby"]
+            if not nearby:
+                continue
+            total_nearby += len(nearby)
+            lines.append(
+                f"- From Object {r['object_id']} at "
+                f"({r['centroid_x']:.2f}, {r['centroid_y']:.2f}, {r['centroid_z']:.2f}):"
+            )
+            for n in nearby:
+                lines.append(
+                    f"  - Object {n['object_id']} ({n['category']}): "
+                    f"{n['distance_m']:.2f} m away at "
+                    f"({n['centroid_x']:.2f}, {n['centroid_y']:.2f}, {n['centroid_z']:.2f})"
+                )
+                sample_url = self._image_url(n.get("sample_image_path"))
+                if sample_url:
+                    lines.append(f"    ![nearby frame]({sample_url})")
+        if total_nearby == 0:
+            lines.append(f"No {', '.join(other_categories)} objects were found within {radius_m} m of any '{target_category}' object.")
         return "\n".join(lines)
 
     def _format_object_timeline(self, object_id: int) -> str:

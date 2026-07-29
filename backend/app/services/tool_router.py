@@ -148,12 +148,26 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_category_proximity",
-        "description": "Counts how many objects from other categories are near objects in a target category. Use this when the user asks whether one category is close to another.",
+        "description": "Counts how many objects from other categories are near objects in a target category. Use this when the user asks whether one category is close to another and only needs counts, not images.",
         "parameters": _params(
             {
                 "target_category": {"type": "string", "description": "Category whose objects are the reference points, e.g. Ticket Gate."},
                 "other_categories": {"type": "array", "items": {"type": "string"}, "description": "Categories to measure distance to, e.g. [\"Advertisement Board\", \"Lights\"]."},
                 "radius_m": {"type": "number", "description": "Search radius in meters around each target object centroid.", "default": 2.0},
+            },
+            required=["target_category", "other_categories"],
+        ),
+    },
+    {
+        "name": "get_category_proximity_with_images",
+        "description": "Objects from other categories within radius_m of each target-category object, including object IDs, distances, coordinates, and sample images. Use this when the user asks to SEE nearby objects, e.g. 'show me advertisement boards within 2 meters of lights' or 'display the ad boards near the ticket gates'.",
+        "parameters": _params(
+            {
+                "target_category": {"type": "string", "description": "Category whose objects are the reference points, e.g. Lights."},
+                "other_categories": {"type": "array", "items": {"type": "string"}, "description": "Categories to show nearby objects for, e.g. [\"Advertisement Board\"]."},
+                "radius_m": {"type": "number", "description": "Search radius in meters around each target object centroid.", "default": 2.0},
+                "limit": {"type": "integer", "description": "Maximum target objects to return.", "default": 5},
+                "nearby_limit": {"type": "integer", "description": "Maximum nearby objects per target object.", "default": 3},
             },
             required=["target_category", "other_categories"],
         ),
@@ -366,7 +380,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "highlight_in_rerun",
-        "description": "Highlight 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. NOTE: any (x, y, z) coordinates or object ids returned by OTHER tools are auto-highlighted in the Rerun viewer already, so you do NOT need this tool for coordinate questions. Only call this for explicit visualization requests that would NOT otherwise put coordinates in the tool output, e.g. 'highlight objects 16 and 19 in the 3D viewer' or 'show me where the ticket gates are in 3D' (without asking for their coordinate values). Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running.",
+        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights.",
         "parameters": _params(
             {
                 "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
@@ -385,13 +399,14 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Raw 3D points to highlight.",
                 },
                 "category": {"type": "string", "description": "Highlight every object in this category."},
+                "keep_existing": {"type": "boolean", "default": False, "description": "If true, keep previously highlighted objects/points in the viewer (the user explicitly asked to keep or add to them, e.g. 'keep the previous', 'add to the highlights', 'show alongside'). Default false: previous highlights are cleared before showing these."},
                 "label": {"type": "string", "description": "Optional label for this highlight set."},
             }
         ),
     },
     {
         "name": "annotate_image",
-        "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, object_id, or category. For object_id or category, up to `limit` images are annotated (default 5). Use when the user asks to highlight, circle, draw, mark, annotate, or point out anomalies in an image.",
+        "description": "Analyze and draw annotations (boxes, circles, highlights) on one or more inspection images to mark anomalies or areas of interest. Provide exactly one of image_url, object_id, or category. For object_id or category, up to `limit` images are annotated (default 5). Use ONLY when the user EXPLICITLY asks to annotate / draw on / circle on / mark on / outline / show-on an IMAGE (e.g. 'annotate the image', 'draw on the image', 'circle the defect on the image', 'show the anomaly on the image'). Do NOT use this tool for generic 'show me', 'visualize', 'highlight', or 'where is' requests - those are 3D Rerun viewer requests, not image annotation.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -495,7 +510,8 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 11. get_category_windows(categories[], inspection_id) — first/last windows for several categories.
 12. get_category_objects_coordinates(category, inspection_id) — centroid + 3D bbox per object in a category.
 13. get_category_objects_with_images(category, limit, inspection_id) — object ids, coordinates, and a sample image each.
-14. get_category_proximity(target_category, other_categories[], radius_m, inspection_id) — counts of other-category objects near each target object.
+14. get_category_proximity(target_category, other_categories[], radius_m, inspection_id) — counts of other-category objects near each target object (numbers only, no images).
+14a. get_category_proximity_with_images(target_category, other_categories[], radius_m, limit, nearby_limit, inspection_id) — nearby objects with object IDs, distances, coordinates, and sample images. Use for 'show me X near Y'.
 15. get_inspection_timeline(inspection_id) — chronological object log.
 16. get_temporal_clusters(window_ms, top_n, inspection_id) — busiest moments grouped by time window.
 17. get_detection_counts_by_category(inspection_id) — per-frame detection counts per category.
@@ -558,11 +574,11 @@ Plan:
 3. get_report_summary
 (Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report. If the anomaly tables are not yet populated, those tools return a clear message — still call them.)
 
-Example E (Rerun highlight — auto-highlight):
+Example E (Rerun highlight — final pass):
 User: "What are the coordinates of the ticket gates? Show me where they are."
 Plan:
 1. get_category_objects_coordinates(category="Ticket Gate")
-(The coordinates this tool returns are auto-highlighted in the Rerun viewer — no separate highlight_in_rerun call needed. The answerer describes the coordinates and notes they are shown in the viewer.)
+(A final pass highlights these coordinates in the Rerun viewer — no separate highlight_in_rerun call needed. The answerer describes the coordinates and notes they are shown in the viewer.)
 
 Example E2 (explicit highlight of specific objects):
 User: "Highlight objects 16 and 19 in the 3D viewer."
@@ -591,7 +607,7 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
 
 - In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely.
 - This is a multi-round router: after the backend executes your tool calls, it will show you the results and give you another chance to call more tools if you still need information. Up to {max_rounds} rounds are allowed. If the results from the current round are enough, stop — return no tool calls. Only call additional tools when you genuinely need their output.
-- Any (x, y, z) coordinates or object ids returned by a tool are AUTO-highlighted in the Rerun viewer — you do NOT need to call highlight_in_rerun for coordinate questions. Only call highlight_in_rerun for explicit visualization requests that would not otherwise put coordinates in the tool output.
+- A final pass runs AFTER your tools finish and decides which objects/coordinates to show in the Rerun viewer based on the results and the user's question. You do NOT need to call highlight_in_rerun for ordinary coordinate questions - the final pass highlights them. Only call highlight_in_rerun for explicit, specific 3D-highlight requests that name particular objects (e.g. 'highlight objects 16 and 19 in the 3D viewer').
 - A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
 - Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
@@ -600,8 +616,11 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
 - For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because inspections run in the late afternoon.
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
-- DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
+- DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, proximity, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
 - When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, call get_anomaly_summary / get_anomalies and/or get_report_summary. Do not call coordinate tools for pure anomaly questions.
+- CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images.
+- For 'show me X near Y within R meters' queries, use get_category_proximity_with_images so the nearby objects include sample frames.
+- For 'show me X at time T' queries, use get_images_in_time_range (optionally with category) to return actual frames.
 - Do not output explanatory text; only emit tool calls.
 """
 
@@ -720,16 +739,18 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         prior_images = self._image_context_from_history(chat_history)
         prior_tools = self._prior_tool_context(tool_history)
 
-        # Detect annotation intent up front. We do NOT force a tool here: the router
-        # LLM resolves which image (URL / object_id / category) the user means from the
-        # prior-images context above, which is far more robust than regex heuristics for
-        # phrases like "the previous image", "the second one", or "the one with the
-        # backpack". `wants_annotation` is kept only to drive a safety-net fallback
-        # below in case the LLM fails to emit an annotate_image call.
-        annotation_keywords = (
-            "highlight", "circle", "draw", "mark", "annotate", "outline", "point out",
+        # Detect EXPLICIT image-annotation intent up front: the user names the image as
+        # the canvas ("annotate", "draw on the image", "circle on the image", ...). We do
+        # NOT force a tool here - the router LLM resolves which image (URL / object_id /
+        # category) the user means from the prior-images context above, which is far more
+        # robust than regex heuristics. `wants_image_annotation` only drives a safety-net
+        # fallback below. Generic "highlight"/"visualize"/"show where" is a 3D Rerun
+        # request, NOT image annotation, so it must NOT trigger annotate_image here.
+        image_annotation_keywords = (
+            "annotate", "draw on", "circle on", "mark on", "outline on",
+            "box on", "show on the image", "on the image",
         )
-        wants_annotation = any(kw in q for kw in annotation_keywords)
+        wants_image_annotation = any(kw in q for kw in image_annotation_keywords)
 
         # Whether to fetch the anomaly report is the router LLM's decision, not a
         # keyword gate. get_report_summary / get_anomaly_* are listed in TOOLS and the
@@ -793,7 +814,7 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         # synthesize a best-effort annotate_image so the user's request is not lost.
         # The LLM is expected to resolve the image reference normally; this only fires
         # as a last resort and prefers the most recently shown image.
-        if wants_annotation and not any(name == "annotate_image" for name, _ in results):
+        if wants_image_annotation and not any(name == "annotate_image" for name, _ in results):
             fallback: dict[str, Any] = {"question": query}
             prior_urls = self._prior_image_urls(chat_history)
             if prior_urls:
@@ -814,5 +835,194 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
                 )
                 results.append(("annotate_image", fallback))
 
+        # Image safety net: if the user asked to "show me" / "display" something and the
+        # router returned no image-returning tool, force a reasonable image tool so the
+        # UI actually displays frames instead of just text.
+        image_returning_tools = {
+            "annotate_image",
+            "get_category_sample_images",
+            "get_category_objects_with_images",
+            "get_object_image_paths",
+            "get_images_in_time_range",
+            "get_category_proximity_with_images",
+            "get_anomalies",
+        }
+        image_keywords = (
+            "show me", "show us", "display", "see", "with images", "with pictures",
+            "pictures", "frames", "images of", "photos of",
+        )
+        wants_images = any(kw in q for kw in image_keywords)
+        if wants_images and not any(name in image_returning_tools for name, _ in results):
+            fallback = {}
+            # Prefer a category image tool if a category is mentioned.
+            mentioned_category: str | None = None
+            for alias, canonical in _CATEGORY_ALIASES.items():
+                if alias in q:
+                    mentioned_category = canonical
+                    break
+            prior_urls = self._prior_image_urls(chat_history)
+            if mentioned_category:
+                # Return sample frames for the category (not annotation).
+                fallback = {"category": mentioned_category, "limit": 5}
+            elif prior_urls and wants_image_annotation:
+                # Explicit image-annotation request referencing a prior image; only then
+                # do we fall back to annotate_image. A plain "show me the previous image"
+                # (no annotation intent) is left for the router to handle rather than
+                # forcing boxes to be drawn on it.
+                fallback = {"image_url": prior_urls[-1], "question": query}
+            if fallback:
+                # Decide which tool to use based on the fallback fields.
+                if "image_url" in fallback:
+                    logger.info("annotate_image safety-net fallback for image query: %r", query)
+                    results.append(("annotate_image", fallback))
+                else:
+                    logger.info(
+                        "get_category_objects_with_images safety-net fallback for image query: %r",
+                        query,
+                    )
+                    results.append(("get_category_objects_with_images", fallback))
+
         logger.info("Tool router selected %s for query: %r", results, query)
         return results
+
+    # ------------------------------------------------------------------
+    # Final-pass highlight decision (runs after the tool-calling loop ends)
+    # ------------------------------------------------------------------
+
+    # The single tool exposed to the router during the final highlight pass. Its
+    # parameters mirror ``highlight_in_rerun`` so the decision can be applied by
+    # InspectionDBClient._apply_highlight_decision unchanged.
+    _HIGHLIGHT_DECISION_TOOL: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "set_rerun_highlight",
+            "description": (
+                "Highlight specific objects and/or raw 3D coordinates in the Rerun viewer. "
+                "Call this with exactly the objects/coordinates the user would want to SEE IN 3D "
+                "given the tool results. If nothing spatial is relevant or the user did not ask "
+                "about locations/visualization, call no tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "object_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Object ids to highlight (centroids + 3D bboxes).",
+                    },
+                    "coordinates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                                "z": {"type": "number"},
+                                "label": {"type": "string"},
+                            },
+                            "required": ["x", "y", "z"],
+                        },
+                        "description": "Raw 3D points to highlight.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Highlight every object in this category.",
+                    },
+                    "keep_existing": {
+                        "type": "boolean",
+                        "description": "If true, keep previously highlighted objects/points (user explicitly asked to keep/add to them). Default false: clear previous highlights first.",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional label for this highlight set.",
+                    },
+                },
+            },
+        },
+    }
+
+    def decide_highlights(
+        self,
+        query: str,
+        tool_results_text: str,
+        chat_history: Sequence[tuple[str, str]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Final-pass highlight decision, run after the tool-calling loop ends.
+
+        Asks the router model to look at the user's question plus the accumulated
+        tool results and decide which objects/coordinates (if any) should be shown
+        in the Rerun viewer. Returns the ``set_rerun_highlight`` tool-call arguments
+        dict, or ``None`` when the model calls no tool / on any failure. Never
+        raises (best-effort: a failed decision just means no auto-highlight).
+        """
+        if not query.strip() or not tool_results_text.strip():
+            return None
+
+        system_prompt = (
+            "You are the post-tool highlight decider for a subway-station inspection assistant. "
+            "The tools already ran and returned the results shown below. Decide which objects or "
+            "coordinates, if any, should be highlighted in the 3D Rerun viewer the user watches "
+            "alongside this chat.\n\n"
+            "Call set_rerun_highlight with object_ids and/or coordinates (and optionally "
+            "category/label) for exactly the things the user would want to SEE IN 3D.\n\n"
+            "Rules:\n"
+            "1. Only highlight spatial things: object ids that have a 3D location, or raw "
+            "(x, y, z) points.\n"
+            "2. Prefer object_ids over raw coordinates when the results reference specific objects.\n"
+            "3. Do NOT highlight if the user only asked for 2D images/frames, a count/summary/"
+            "distance with no spatial intent, or an off-topic question - call no tool.\n"
+            "4. Highlight what the user named or asked 'where / visualize / highlight / show me "
+            "where' about - not every coordinate present in the results.\n"
+            "5. Do not call this tool if the user asked for image annotation "
+            "(annotate / draw on / circle on / mark on the image).\n"
+            "6. Set keep_existing=true ONLY if the user explicitly asked to keep or add to "
+            "the previous highlights (e.g. 'keep the previous', 'add to the highlights', "
+            "'show alongside the previous'). Otherwise leave it false (default) so previous "
+            "highlights are cleared before showing the new ones.\n"
+            "7. At most one tool call. Output nothing but the tool call."
+        )
+        user_content = (
+            f"User question: {query}\n\n=== Tool results ===\n{tool_results_text}"
+        )
+
+        payload = {
+            "model": self.settings.tool_router_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+            "tools": [self._HIGHLIGHT_DECISION_TOOL],
+            "options": {
+                "temperature": self.settings.tool_router_temperature,
+                "num_ctx": self.settings.tool_router_n_ctx,
+            },
+        }
+
+        try:
+            # Same generous read timeout as select_tool: 26B/e4b models on CPU are slow.
+            timeout = httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=30.0)
+            with httpx.Client(
+                base_url=self.settings.ollama_base_url.rstrip("/"), timeout=timeout
+            ) as client:
+                resp = client.post("/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("decide_highlights request failed: %s", exc)
+            return None
+
+        tool_calls = (data.get("message") or {}).get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            return None
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            func = call.get("function") or {}
+            if func.get("name") == "set_rerun_highlight":
+                args = func.get("arguments") or {}
+                if isinstance(args, dict) and (
+                    args.get("object_ids") or args.get("coordinates") or args.get("category")
+                ):
+                    return args
+        return None

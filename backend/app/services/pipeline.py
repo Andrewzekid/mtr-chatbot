@@ -186,6 +186,62 @@ class VoicePipeline:
             transcript_raw=stt_result.raw_text,
             request_id=request_id,
         )
+        async for msg in self._stream_reply(
+            stt_result=stt_result,
+            voice_model_path=voice_model_path,
+            chat_history=chat_history,
+            tool_history=tool_history,
+            tool_calls_callback=tool_calls_callback,
+            request_id=request_id,
+        ):
+            yield msg
+
+    async def handle_text(
+        self,
+        text: str,
+        voice_model_path: str | None = None,
+        chat_history: list[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
+        tool_calls_callback: Callable[[list[dict[str, object]]], None] | None = None,
+    ) -> AsyncGenerator[ServerMessage, None]:
+        """Text input path: skip STT and run the reply/TTS stream directly.
+
+        Treats *text* as the transcript via a synthetic ``STTResult`` (no emotion
+        or raw SenseVoice payload), so the rest of the pipeline is identical to the
+        spoken path. TTS language is detected from the text itself.
+        """
+        request_id = str(uuid.uuid4())
+        text = (text or "").strip()
+        logger.info("Pipeline (text) start: request_id=%s chars=%d", request_id, len(text))
+        stt_result = STTResult(text=text, language_tag=None, emotion_tag=None, raw_text=None)
+        yield ServerMessage(
+            type="transcript",
+            transcript=text,
+            transcript_emotion=None,
+            transcript_raw=None,
+            request_id=request_id,
+        )
+        async for msg in self._stream_reply(
+            stt_result=stt_result,
+            voice_model_path=voice_model_path,
+            chat_history=chat_history,
+            tool_history=tool_history,
+            tool_calls_callback=tool_calls_callback,
+            request_id=request_id,
+        ):
+            yield msg
+
+    async def _stream_reply(
+        self,
+        *,
+        stt_result: STTResult,
+        voice_model_path: str | None,
+        chat_history: list[tuple[str, str]] | None,
+        tool_history: Sequence[dict[str, object]] | None,
+        tool_calls_callback: Callable[[list[dict[str, object]]], None] | None,
+        request_id: str,
+    ) -> AsyncGenerator[ServerMessage, None]:
+        """Shared LLM + TTS streaming for a transcribed/typed request (post-STT)."""
         full_reply = ""
         tts_pending_text = ""
         llm_token_count = 0
@@ -193,7 +249,7 @@ class VoicePipeline:
 
         try:
             async for token in self.llm.stream_reply(
-                transcript,
+                stt_result.text,
                 chat_history=chat_history,
                 tool_history=tool_history,
                 tool_calls_callback=tool_calls_callback,

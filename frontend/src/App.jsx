@@ -283,6 +283,20 @@ export default function App() {
     isAssistantStreamingRef.current = false;
   }, [send, ttsStreamActive, interruptActiveResponse, stopAllAudio]);
 
+  // ── Text input ────────────────────────────────────────────────────────────
+
+  const handleSendText = useCallback(
+    (text) => {
+      // Stop any in-flight audio locally for responsiveness; the backend cancels
+      // the active task on user_text and emits "interrupted" for the old turn.
+      stopAllAudio();
+      pendingSpeechRef.current = "";
+      send({ type: "user_text", text });
+      setStatus("Generating response...");
+    },
+    [send, stopAllAudio],
+  );
+
   // ── Recording ─────────────────────────────────────────────────────────────
 
   const handleRecordingReady = useCallback(
@@ -316,6 +330,12 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = async (event) => {
       if (event.code !== "Space") {
+        return;
+      }
+      // Don't hijack Space while the user is typing in the text box.
+      const target = event.target;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) {
         return;
       }
       event.preventDefault();
@@ -421,6 +441,8 @@ export default function App() {
           transcriptRaw={transcriptRaw}
           assistantText={assistantText}
           userEmotion={userEmotion}
+          onSendText={handleSendText}
+          textInputDisabled={!canTalk}
         />
         <ChatHistory chatHistory={chatHistory} />
         <ImageAnnotator disabled={socketState !== "connected"} />

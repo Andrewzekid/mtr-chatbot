@@ -13,6 +13,11 @@ class ClientInterruptMessage(BaseModel):
     request_id: Optional[str] = None
 
 
+class ClientTextMessage(BaseModel):
+    type: Literal["user_text"]
+    text: str
+
+
 class ServerMessage(BaseModel):
     type: str
     text: Optional[str] = None

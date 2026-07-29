@@ -270,16 +270,16 @@ class LocalLLM:
                         "viewer is in this chat window.\n\n" + db_context
                     )
                 elif db_context:
-                    # Auto-highlight: if the tool results contain coordinates or object
-                    # ids, push them to the Rerun viewer automatically — no explicit
-                    # highlight_in_rerun call needed. Stay quiet if there was nothing to
-                    # visualize or Rerun is unavailable.
-                    auto_status = self.db_client.auto_highlight(db_context)
-                    if auto_status:
+                    # Final-pass highlight: the router already decided (after the tools
+                    # ran) which objects/coordinates to show in the Rerun viewer. If it
+                    # did, tell the answerer to mention the viewer; otherwise stay quiet.
+                    highlight_status = self.db_client.last_highlight_status
+                    if highlight_status and highlight_status.startswith("Highlighted"):
                         db_context = (
-                            "Coordinates from the results above were automatically highlighted in the "
-                            "Rerun viewer. Mention briefly that they are shown in the viewer (the user "
-                            "watches it alongside this chat).\n\n" + db_context
+                            "The objects/coordinates relevant to the user's question are now shown in "
+                            "the Rerun viewer (chosen by a final pass after the tools ran; the user "
+                            "watches it alongside this chat). Mention briefly that they are shown in "
+                            "the viewer.\n\n" + db_context
                         )
             except Exception as exc:
                 logger.warning("DB lookup failed: %s", exc)

@@ -88,10 +88,11 @@ class RerunVisualizer:
         self._db_lock = threading.Lock()  # sqlite connection is shared across threads
         self._queue: queue.SimpleQueue | None = None
         self._worker_started = False
-        # Station map: lazily-loaded, pre-rotated point cloud (numpy (N,3) positions +
-        # (N,4) uint8 RGBA colors, or positions only for legacy .npy) logged once per
-        # viewer connection as a static `world/map` entity.
-        self._map_points: Any = None
+        # Station map: lazily-loaded, pre-rotated point clouds logged once per viewer
+        # connection as static `world/map` (photo-colored) and `world/map/laser` (raw
+        # LiDAR context) entities. Both are in the raw camera_init frame; the leveling
+        # matrix is applied at log time.
+        self._map_points: tuple[Any, Any, Any, Any] | None = None  # (colored_pts, colored_cols, laser_pts, laser_cols)
         self._map_loaded = False  # True once we've tried (success or skip) so we don't retry every job
         self._map_logged = False  # True once logged on the current connection
 
@@ -120,6 +121,7 @@ class RerunVisualizer:
         category: str | None = None,
         inspection_id: int | None = None,
         label: str | None = None,
+        keep_existing: bool = False,
     ) -> str:
         """Highlight objects / raw coordinates in the Rerun viewer.
 
@@ -154,6 +156,7 @@ class RerunVisualizer:
             "points": points, "boxes": boxes, "labels": labels,
             "label": label, "inspection_id": inspection_id,
             "needs_spawn": not listening,
+            "keep_existing": keep_existing,
         })
 
         where = "the Rerun viewer" if listening else "a Rerun viewer (launching now)"
@@ -193,7 +196,10 @@ class RerunVisualizer:
         try:
             self._log_map(rr)  # static station map, logged once per connection
             self._log_scene(rr, inspection_id=job.get("inspection_id"))
-            self._log_highlights(rr, job["points"], job["boxes"], job["labels"], label=job.get("label"))
+            self._log_highlights(
+                rr, job["points"], job["boxes"], job["labels"],
+                label=job.get("label"), keep_existing=job.get("keep_existing", False),
+            )
         except Exception as exc:  # noqa: BLE001
             self._connected = False
             self._map_logged = False  # re-log the map after a reconnect
@@ -295,14 +301,80 @@ class RerunVisualizer:
     # Station map (static point cloud, logged once per connection)
     # ------------------------------------------------------------------
 
-    def _load_map_points(self) -> Any:
-        """Load + pre-rotate the station map .npz (cached). Returns positions + colors.
+    @staticmethod
+    def _decode_packed_colors(packed: Any) -> Any:
+        """Decode packed 0xRRGGBBAA uint32 colors to uint8 Nx4 RGBA."""
+        import numpy as np  # type: ignore
 
-        The .npz holds raw camera_init-frame points (same frame as DB centroids) plus
-        per-point RGBA uint8 colors. We pre-rotate the positions by the leveling matrix
-        so the map shares the leveled world frame with the highlights and the grounding
-        bridge's ``world/leveled`` map. Legacy `.npy` position-only files are also
-        supported (they get a default gray color).
+        rgba = np.empty((packed.shape[0], 4), dtype=np.uint8)
+        rgba[:, 0] = (packed >> 24) & 0xFF
+        rgba[:, 1] = (packed >> 16) & 0xFF
+        rgba[:, 2] = (packed >> 8) & 0xFF
+        rgba[:, 3] = (packed >> 0) & 0xFF
+        return rgba
+
+    @staticmethod
+    def _fix_legacy_abgr(colors: Any) -> Any:
+        """Detect and repair legacy .npz rows saved as [A,B,G,R] instead of [R,G,B,A]."""
+        import numpy as np  # type: ignore
+
+        if colors.ndim != 2 or colors.shape[1] != 4:
+            return colors
+        red_saturated = (colors[:, 0] == 255).mean()
+        alpha_varying = colors[:, 3].std() > 1.0
+        if red_saturated > 0.95 and alpha_varying:
+            fixed = np.empty_like(colors)
+            fixed[:, 0] = colors[:, 3]  # R
+            fixed[:, 1] = colors[:, 2]  # G
+            fixed[:, 2] = colors[:, 1]  # B
+            fixed[:, 3] = colors[:, 0]  # A
+            return fixed
+        return colors
+
+    def _load_map_layer(
+        self,
+        data: Any,
+        positions_key: str,
+        colors_key: str,
+        fallback_color: list[int],
+    ) -> tuple[Any, Any] | None:
+        """Load and pre-rotate one map layer from the .npz."""
+        import numpy as np  # type: ignore
+
+        if positions_key not in data:
+            return None
+        raw = data[positions_key].astype(np.float32, copy=False)
+        if raw.ndim != 2 or raw.shape[1] != 3 or raw.shape[0] == 0:
+            return None
+
+        if colors_key in data:
+            colors = data[colors_key]
+            if colors.dtype != np.uint8:
+                colors = colors.astype(np.uint8, copy=False)
+            if colors.ndim == 1:
+                colors = self._decode_packed_colors(colors)
+            elif colors.ndim == 2 and colors.shape[1] == 4:
+                colors = self._fix_legacy_abgr(colors)
+            if colors.shape[0] != raw.shape[0]:
+                logger.warning(
+                    "Map layer %s color count %s != position count %s; using fallback gray",
+                    positions_key, colors.shape[0], raw.shape[0]
+                )
+                colors = np.full((raw.shape[0], 4), fallback_color, dtype=np.uint8)
+        else:
+            colors = np.full((raw.shape[0], 4), fallback_color, dtype=np.uint8)
+
+        R = np.asarray(self._leveling_R, dtype=np.float32)
+        leveled = raw @ R.T
+        return leveled, colors
+
+    def _load_map_points(self) -> tuple[Any, Any, Any, Any] | None:
+        """Load + pre-rotate the station map .npz (cached).
+
+        Returns (colored_pts, colored_colors, laser_pts, laser_colors) all in the
+        leveled world frame. The .npz holds raw camera_init-frame points; we pre-
+        rotate by the leveling matrix so the maps share the leveled world frame
+        with the highlights and the grounding bridge's ``world/leveled`` map.
 
         numpy is a transitive dependency of rerun-sdk, so importing it here is safe.
         """
@@ -318,78 +390,67 @@ class RerunVisualizer:
         try:
             import numpy as np  # type: ignore
 
-            R = np.asarray(self._leveling_R, dtype=np.float32)
             if path.suffix.lower() == ".npz":
                 data = np.load(path)
-                raw = data["positions"].astype(np.float32, copy=False)
-                colors = data["colors"]
-                if colors.dtype != np.uint8:
-                    colors = colors.astype(np.uint8, copy=False)
-                if colors.ndim == 1:
-                    # Packed uint32 colors - decode to RGBA.
-                    # Rerun 0.35 experimental RRD reader returns 0xRRGGBBAA order.
-                    rgba = np.empty((colors.shape[0], 4), dtype=np.uint8)
-                    rgba[:, 0] = (colors >> 24) & 0xFF
-                    rgba[:, 1] = (colors >> 16) & 0xFF
-                    rgba[:, 2] = (colors >> 8) & 0xFF
-                    rgba[:, 3] = (colors >> 0) & 0xFF
-                    colors = rgba
-                elif colors.ndim == 2 and colors.shape[1] == 4:
-                    # Legacy station_map.npz files were saved with the channel
-                    # order misidentified (alpha ended up in the R slot). Detect
-                    # that case: if the first channel is saturated at 255 for
-                    # almost every point while the last channel varies, the rows
-                    # are actually [A, B, G, R] and need to be reordered to
-                    # [R, G, B, A]. This auto-fixes existing broken .npz files.
-                    red_saturated = (colors[:, 0] == 255).mean()
-                    alpha_varying = colors[:, 3].std() > 1.0
-                    if red_saturated > 0.95 and alpha_varying:
-                        fixed = np.empty_like(colors)
-                        fixed[:, 0] = colors[:, 3]  # R
-                        fixed[:, 1] = colors[:, 2]  # G
-                        fixed[:, 2] = colors[:, 1]  # B
-                        fixed[:, 3] = colors[:, 0]  # A
-                        colors = fixed
+                colored = self._load_map_layer(
+                    data, "positions", "colors", [128, 128, 128, 255]
+                )
+                if colored is None:
+                    logger.warning("No colored map positions in %s; skipping map overlay", path)
+                    return None
+                laser = self._load_map_layer(
+                    data, "laser_positions", "laser_colors", [90, 90, 90, 255]
+                )
+                empty = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 4), dtype=np.uint8))
+                laser_pts, laser_cols = laser if laser is not None else empty
+                self._map_points = (colored[0], colored[1], laser_pts, laser_cols)
+                logger.info(
+                    "Loaded station map: %s colored + %s laser points from %s",
+                    colored[0].shape[0], laser_pts.shape[0], path
+                )
+                return self._map_points
             else:
                 # Legacy .npy: positions only.
+                import numpy as np  # type: ignore
+
                 raw = np.load(path).astype(np.float32, copy=False)
                 colors = np.full((raw.shape[0], 4), [128, 128, 128, 255], dtype=np.uint8)
-
-            if raw.ndim != 2 or raw.shape[1] != 3:
-                logger.warning("Station map has unexpected positions shape %s; skipping", raw.shape)
-                return None
-            if colors.shape[0] != raw.shape[0]:
-                logger.warning(
-                    "Station map color count %s != position count %s; using fallback gray",
-                    colors.shape[0], raw.shape[0]
-                )
-                colors = np.full((raw.shape[0], 4), [128, 128, 128, 255], dtype=np.uint8)
-
-            leveled = raw @ R.T  # (N,3) pre-rotated into the level world frame
-            self._map_points = (leveled, colors)
-            logger.info("Loaded station map: %s points from %s", raw.shape[0], path)
-            return self._map_points
+                R = np.asarray(self._leveling_R, dtype=np.float32)
+                leveled = raw @ R.T
+                empty = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 4), dtype=np.uint8))
+                self._map_points = (leveled, colors, empty[0], empty[1])
+                logger.info("Loaded legacy .npy station map: %s points from %s", raw.shape[0], path)
+                return self._map_points
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to load station map %s: %s", path, exc)
             return None
 
     def _log_map(self, rr: Any) -> None:
-        """Log the station map as a static `world/map` Points3D (once per connection)."""
+        """Log the station map layers as static Points3D (once per connection)."""
         if self._map_logged:
             return
         loaded = self._load_map_points()
         if loaded is None:
             self._map_logged = True  # disabled / missing / failed -> don't retry every job
             return
-        pts, colors = loaded
+        colored_pts, colored_cols, laser_pts, laser_cols = loaded
         try:
             rr.log(
                 "world/map",
-                rr.Points3D(positions=pts, colors=colors, radii=_MAP_POINT_RADIUS),
+                rr.Points3D(positions=colored_pts, colors=colored_cols, radii=_MAP_POINT_RADIUS),
                 static=True,
             )
+            if laser_pts.shape[0] > 0:
+                rr.log(
+                    "world/map/laser",
+                    rr.Points3D(positions=laser_pts, colors=laser_cols, radii=_MAP_POINT_RADIUS),
+                    static=True,
+                )
             self._map_logged = True
-            logger.info("Logged station map (%s colored points) as world/map", pts.shape[0])
+            logger.info(
+                "Logged station map (%s colored + %s laser points)",
+                colored_pts.shape[0], laser_pts.shape[0]
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Rerun map logging failed: %s", exc)
 
@@ -559,6 +620,19 @@ class RerunVisualizer:
         except sqlite3.Error as exc:
             logger.warning("Rerun trajectory query failed: %s", exc)
 
+    def _clear_highlights(self, rr: Any) -> None:
+        """Clear all previously logged highlights (the ``world/highlights`` subtree).
+
+        Idempotent and best-effort: a failure here only means stale highlights may
+        linger; the new highlight is still logged afterwards. ``recursive=True``
+        removes every descendant entity (all labels), so per-query highlights do not
+        accumulate across turns.
+        """
+        try:
+            rr.log("world/highlights", rr.Clear(recursive=True), static=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Rerun clear highlights failed: %s", exc)
+
     def _log_highlights(
         self,
         rr: Any,
@@ -567,7 +641,14 @@ class RerunVisualizer:
         labels: list[str],
         *,
         label: str | None,
+        keep_existing: bool = False,
     ) -> None:
+        # By default, clear highlights from previous queries so the viewer shows only
+        # the current selection. Skip the clear only when the user explicitly asked to
+        # keep/add to the existing highlights (keep_existing=True).
+        if not keep_existing:
+            self._clear_highlights(rr)
+
         path_suffix = (label or "selection").replace("/", "_").replace(" ", "_")
         base = f"world/highlights/{path_suffix}"
 

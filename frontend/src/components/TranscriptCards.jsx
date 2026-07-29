@@ -22,8 +22,19 @@ const FALLBACK_EMOJI = "🙂";
  *   userEmotion: string,
  * }} props
  */
-export default function TranscriptCards({ transcript, transcriptRaw, assistantText, userEmotion }) {
+export default function TranscriptCards({ transcript, transcriptRaw, assistantText, userEmotion, onSendText, textInputDisabled }) {
   const [selectedImage, setSelectedImage] = useState(null);
+  const [draft, setDraft] = useState("");
+
+  const submitText = (event) => {
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text || textInputDisabled || !onSendText) {
+      return;
+    }
+    onSendText(text);
+    setDraft("");
+  };
 
   return (
     <>
@@ -36,6 +47,20 @@ export default function TranscriptCards({ transcript, transcriptRaw, assistantTe
         </h2>
         <p>{transcript || "Your transcript appears here."}</p>
         {transcriptRaw ? <p className="sense-raw">SenseVoice raw: {transcriptRaw}</p> : null}
+        <form className="text-input-row" onSubmit={submitText}>
+          <input
+            type="text"
+            className="text-input"
+            placeholder="Type a message…"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            disabled={textInputDisabled}
+            aria-label="Type a message"
+          />
+          <button type="submit" className="text-send-btn" disabled={textInputDisabled || !draft.trim()}>
+            Send
+          </button>
+        </form>
       </section>
 
       <section className="card accent">

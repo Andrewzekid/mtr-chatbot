@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.models import ClientAudioMessage, ClientInterruptMessage, ImageAnnotationResponse, ServerMessage
+from app.models import ClientAudioMessage, ClientInterruptMessage, ClientTextMessage, ImageAnnotationResponse, ServerMessage
 from app.services.pipeline import VoicePipeline
 from app.services.runtime_status import get_vram_status
 from app.services.vision_service import VisionAnnotator
@@ -262,6 +262,49 @@ async def websocket_chat(ws: WebSocket) -> None:
             if len(tool_call_history) > 6:
                 del tool_call_history[:-6]
 
+    async def stream_text_request(text: str) -> None:
+        user_text = ""
+        assistant_text = ""
+        current_request_id: str | None = None
+        last_tool_payload: dict[str, object] | None = None
+
+        def send_tool_calls(payload: dict[str, object]) -> None:
+            nonlocal last_tool_payload
+            last_tool_payload = payload
+            asyncio.create_task(
+                ws.send_json(
+                    ServerMessage(
+                        type="tool_calls",
+                        tool_calls=payload.get("tool_calls"),
+                        tool_router_raw=payload.get("tool_router_raw"),
+                        request_id=current_request_id,
+                    ).model_dump(exclude_none=True)
+                )
+            )
+
+        async for event in pipeline.handle_text(
+            text,
+            voice_model_path=selected_voice_model,
+            chat_history=conversation_history,
+            tool_history=tool_call_history,
+            tool_calls_callback=send_tool_calls,
+        ):
+            if event.type == "transcript":
+                user_text = event.transcript or ""
+                current_request_id = event.request_id
+            elif event.type == "llm_done":
+                assistant_text = event.text or ""
+            await ws.send_json(event.model_dump(exclude_none=True))
+
+        if user_text.strip() and assistant_text.strip():
+            conversation_history.append((user_text, assistant_text))
+            if len(conversation_history) > 12:
+                del conversation_history[:-12]
+        if last_tool_payload and last_tool_payload.get("tool_calls"):
+            tool_call_history.append(last_tool_payload)
+            if len(tool_call_history) > 6:
+                del tool_call_history[:-6]
+
     try:
         while True:
             payload = await ws.receive_json()
@@ -302,17 +345,23 @@ async def websocket_chat(ws: WebSocket) -> None:
                 await ws.send_json({"type": "context_cleared"})
                 continue
 
-            if message_type != "user_audio":
+            if message_type == "user_audio":
+                message = ClientAudioMessage.model_validate(payload)
+                audio_bytes = base64.b64decode(message.audio_base64)
+                suffix = ".webm" if "webm" in message.mime_type.lower() else ".wav"
+                if active_task and not active_task.done():
+                    await cancel_active(reason="new_request")
+                active_task = pipeline_task = asyncio.create_task(stream_audio_request(audio_bytes, suffix))
+            elif message_type == "user_text":
+                text_message = ClientTextMessage.model_validate(payload)
+                text = (text_message.text or "").strip()
+                if not text:
+                    continue
+                if active_task and not active_task.done():
+                    await cancel_active(reason="new_request")
+                active_task = pipeline_task = asyncio.create_task(stream_text_request(text))
+            else:
                 continue
-
-            message = ClientAudioMessage.model_validate(payload)
-            audio_bytes = base64.b64decode(message.audio_base64)
-            suffix = ".webm" if "webm" in message.mime_type.lower() else ".wav"
-
-            if active_task and not active_task.done():
-                await cancel_active(reason="new_request")
-
-            active_task = pipeline_task = asyncio.create_task(stream_audio_request(audio_bytes, suffix))
 
             def _done_cb(task):
                 if task.cancelled():

@@ -210,6 +210,57 @@ h1 {
   background: rgba(255, 255, 255, 0.72);
 }
 
+.text-input-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.text-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.text-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(217, 110, 48, 0.18);
+}
+
+.text-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.text-send-btn {
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.text-send-btn:hover:not(:disabled) {
+  background: #c25e24;
+  transform: translateY(-1px);
+}
+
+.text-send-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .card.history {
   grid-column: 1 / -1;
   min-height: 180px;
