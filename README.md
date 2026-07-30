@@ -289,28 +289,20 @@ When the AI's answer involves coordinates or specific objects, the assistant **a
    With `RERUN_AUTO_SPAWN=true` you can skip this — the backend launches a viewer on first highlight.
 2. Ask a coordinate/visualization question, e.g. *"What are the coordinates of the ticket gates?"* The router calls `get_category_objects_coordinates`; the answerer's auto-highlight then pushes the gate centroids + 3D bboxes to the viewer.
 3. `RerunVisualizer.highlight` does a fast port probe, returns an optimistic status string immediately, and hands the actual Rerun I/O to a **background daemon thread** so the chat turn never blocks on the viewer. The worker attaches to a running viewer via gRPC (`rr.connect_grpc` to `rerun+http://<addr>/proxy`, the rerun 0.35 protocol) or spawns one, sets `world` to `RIGHT_HAND_Z_UP` (matching the grounding bridge), and logs everything as static entities in the chatbot's own recording.
-4. **Station map overlay.** The first time the worker connects, it loads a pre-extracted downsampled point cloud of the FastLIO-built station (`backend/data/station_map.npz`, generated from the grounding `.rrd` by `scripts/extract_station_map.py`) and logs it as a static `world/map` entity. The `.npz` stores both raw `camera_init`-frame point positions and the original per-point RGBA colors, so the chatbot logs a genuine colored point cloud, not a monochrome cloud. Highlights therefore sit on the full colored station map in the chatbot's own recording.
+4. **Station map overlay.** The first time the worker connects, it loads the photo-colored global map PCD (`MTR Inspection Database/outputs/colored_map.pcd`) and logs it as a static `world/leveled/camera_init/colored_map` entity. The PCD stores raw `camera_init`-frame point positions and per-point RGBA colors, so the chatbot logs a genuine colored point cloud, not a monochrome cloud. Highlights therefore sit on the full colored station map in the chatbot's own recording.
 5. **Frame alignment:** the DB stores object centroids/bboxes in the tilted `camera_init` frame. `RerunVisualizer` pre-rotates every point by the leveling matrix (`RERUN_LEVELING_RPY_DEG`, default `0.0,20.0,0.0` — the 20° pitch used by the 2026-06-11 inspection run, mirroring the grounding `rerun_bridge_node` `leveling_rpy_deg`), so highlights and the station map land level in the grounding world frame — the same convention the bridge uses for `world/bboxes3d`.
 6. **Static logging:** the station map, context cloud, trajectory, and highlights are all logged with `static=True` so they render immediately regardless of the viewer's timeline position (logging at a non-zero `set_time_sequence` tick was the cause of the "empty viewer" bug — a fresh viewer scrubbed to time 0 showed nothing).
 7. The tool returns a short status string ("Highlighted 3 objects in the Rerun viewer (grounding world frame)") that the answerer cites; the spoken answer still gives the (x, y, z) coordinates.
 
 It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer that cannot be reached or spawned all degrade to a friendly status string — the chat turn never fails because of Rerun. Highlight by `object_ids`, by raw `coordinates` (`{x, y, z, label?}`), or by `category`, optionally scoped to one `inspection_id`.
 
-> **Generating the station map.** `scripts/extract_station_map.py` reads the colored cumulative map out of the grounding `.rrd` and saves a compact downsampled `.npz` with both positions and per-point RGBA colors:
-> ```bash
-> cd backend
-> .venv/bin/python scripts/extract_station_map.py \
->     --rrd /path/to/output_mtr.rrd \
->     --out data/station_map.npz \
->     --max-points 1500000
-> ```
-> The default `RERUN_MAP_POINTS_PATH=./data/station_map.npz` picks up that file. If the file is missing or `RERUN_MAP_ENABLED=false`, the chatbot simply skips the map overlay (highlights still work).
+> **Station map file.** The visualizer reads the colored global map directly from `MTR Inspection Database/outputs/colored_map.pcd`. If the PCD is missing, it simply skips the map overlay (highlights still work). The legacy `RERUN_MAP_POINTS_PATH=./data/station_map.npz` path is no longer used by the visualizer but is retained for compatibility.
 
 ---
 
 ## Database schema
 
-`MTR_Database/inspection_v2.db` (new multi-inspection schema, written by the `inspection_grounding` pipeline):
+`MTR Inspection Database/inspection_v2.db` (new multi-inspection schema, written by the `inspection_grounding` pipeline):
 
 - **`categories`** — `id`, `name`. Fixed set: Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 - **`inspections`** — `id`, `started_at`, `is_gt`. **Multiple inspections** can coexist; scope tools with `inspection_id`.
@@ -341,11 +333,11 @@ Key env vars (see `backend/.env.example` for the full list):
 | `TOOL_ROUTER_MODEL` | `gemma4:26b` | Model for tool selection (call #1) |
 | `STT_BACKEND` | `sensevoice` | `sensevoice` or `whisper` |
 | `VISION_*` | — | `VISION_MAX_TOKENS`, `VISION_TEMPERATURE`, `VISION_REQUEST_TIMEOUT_S` — tune the annotation task only |
-| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR_Database/inspection_v2.db` / `../MTR_Database/outputs/images` | SQLite DB + source camera frames |
+| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR Inspection Database/inspection_v2.db` / `../MTR Inspection Database/outputs/images` | SQLite DB + source camera frames |
 | `RERUN_ENABLED` / `RERUN_VIEWER_ADDR` | `true` / `127.0.0.1:9876` | Push 3D highlights to a running `rerun` viewer over TCP |
 | `RERUN_APP_ID` / `RERUN_LEVELING_RPY_DEG` | `inspection_grounding_rerun` / `0.0,20.0,0.0` | Match the grounding scene's app id + leveling rotation so highlights overlay the grounding map |
 | `RERUN_AUTO_SPAWN` | `true` | If no viewer is reachable, launch one on first highlight (else require a manually-started `rerun`) |
-| `RERUN_MAP_ENABLED` / `RERUN_MAP_POINTS_PATH` | `true` / `./data/station_map.npz` | Overlay a pre-extracted downsampled station map in the chatbot's own recording so highlights land on the map |
+| `RERUN_MAP_ENABLED` / `RERUN_MAP_PCD_PATH` | `true` / `../MTR Inspection Database/outputs/colored_map.pcd` | Overlay the photo-colored global map PCD in the chatbot's own recording so highlights land on the map |
 | `REPORTS_DIR` / `ANNOTATED_IMAGE_CACHE_DIR` | `../reports` / `./annotated_images` | Reports + annotated-image cache |
 | `PIPER_*` | — | Piper voice/model paths |
 
@@ -385,7 +377,7 @@ curl -X POST "http://localhost:8000/annotate-image" -F "image=@frame.jpg" -F "qu
 rerun                                            # optional: start the 3D viewer (auto-launched on first highlight when RERUN_AUTO_SPAWN=true)
 # Generate the station map .npy from the grounding .rrd (one-time):
 .venv/bin/python scripts/extract_station_map.py --rrd /path/to/output_mtr.rrd --out data/station_map.npz --max-points 1500000
-sqlite3 MTR_Database/inspection_v2.db
+sqlite3 "MTR Inspection Database/inspection_v2.db"
 #   .tables
 #   SELECT c.name AS category, COUNT(*) AS objects FROM objects o JOIN categories c ON c.id=o.category_id GROUP BY c.name ORDER BY objects DESC;
 #   SELECT id, started_at, is_gt FROM inspections;

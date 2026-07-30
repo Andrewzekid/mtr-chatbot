@@ -76,11 +76,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_objects_by_category",
-        "description": "List objects belonging to a category such as Lights, Advertisement Board, or Ticket Gate. Use this when the user asks for the count of objects in a category or for details about objects of a specific category.",
+        "description": "List the UNIQUE objects belonging to a category such as Lights, Advertisement Board, or Ticket Gate. Use this when the user asks 'how many X were detected', 'how many X are there', or for details about objects of a specific category. Each object may have multiple per-frame detections; this tool counts distinct objects, not detections.",
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Lights, Advertisement Board, Ticket Gate."},
-                "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 10},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["category"],
         ),
@@ -88,12 +88,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_top_objects",
         "description": "The objects with the most detections (most frequently detected).",
-        "parameters": _params({"n": {"type": "integer", "description": "Number of objects to return.", "default": 5}}),
+        "parameters": _params({"n": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result.", "default": 5}}),
     },
     {
         "name": "get_recent_objects",
         "description": "The most recently seen objects (by last detection timestamp).",
-        "parameters": _params({"limit": {"type": "integer", "description": "Number of objects to return.", "default": 5}}),
+        "parameters": _params({"limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result.", "default": 5}}),
     },
     {
         "name": "get_object_timeline",
@@ -141,7 +141,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Exit Sign."},
-                "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 5},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["category"],
         ),
@@ -166,8 +166,8 @@ TOOLS: list[dict[str, Any]] = [
                 "target_category": {"type": "string", "description": "Category whose objects are the reference points, e.g. Lights."},
                 "other_categories": {"type": "array", "items": {"type": "string"}, "description": "Categories to show nearby objects for, e.g. [\"Advertisement Board\"]."},
                 "radius_m": {"type": "number", "description": "Search radius in meters around each target object centroid.", "default": 2.0},
-                "limit": {"type": "integer", "description": "Maximum target objects to return.", "default": 5},
-                "nearby_limit": {"type": "integer", "description": "Maximum nearby objects per target object.", "default": 3},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
+                "nearby_limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["target_category", "other_categories"],
         ),
@@ -189,7 +189,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_detection_counts_by_category",
-        "description": "Per-frame detection counts by category (how many times each category was detected). Use when the user asks about detections and distinguishes 'how many times was it seen' from 'how many distinct objects exist'.",
+        "description": "Per-frame detection counts by category (how many times each category was detected across frames). Use ONLY when the user explicitly asks for per-frame detection counts, e.g. 'how many times was it seen' or 'how many per-frame detections'. For 'how many X were detected' or 'how many X are there', use get_objects_by_category instead.",
         "parameters": _params({}),
     },
     {
@@ -199,7 +199,7 @@ TOOLS: list[dict[str, Any]] = [
             {
                 "start_time": {"type": "string", "description": "Start time as ISO datetime, clock time (e.g. '16:51:45'), or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO datetime, clock time, or ns integer."},
-                "limit": {"type": "integer", "description": "Maximum objects to return.", "default": 50},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["start_time", "end_time"],
         ),
@@ -211,7 +211,7 @@ TOOLS: list[dict[str, Any]] = [
             {
                 "start_time": {"type": "string", "description": "Start time as ISO datetime, clock time, or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO datetime, clock time, or ns integer."},
-                "limit": {"type": "integer", "description": "Maximum detections to return.", "default": 50},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["start_time", "end_time"],
         ),
@@ -242,11 +242,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_category_sample_images",
-        "description": "Return a few example image links for a category. Use when the user asks to see examples of a category such as 'show me some advertisement boards'.",
+        "description": "Return example image links for a category. Use when the user asks to see examples of a category such as 'show me some advertisement boards'.",
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Advertisement Board."},
-                "limit": {"type": "integer", "description": "Number of sample images.", "default": 5},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["category"],
         ),
@@ -254,7 +254,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_inspection_poses",
         "description": "Camera/robot poses recorded during the inspection (one per image, stored on the images table). Exposes the tf_translation / tf_rotation columns.",
-        "parameters": _params({"limit": {"type": "integer", "description": "Maximum poses to return.", "default": 20}}),
+        "parameters": _params({"limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."}}),
     },
     {
         "name": "get_object_distance",
@@ -294,7 +294,7 @@ TOOLS: list[dict[str, Any]] = [
                 "category": {"type": "string", "description": "Category name."},
                 "start_time": {"type": "string", "description": "Start time as ISO, clock time, or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO, clock time, or ns integer."},
-                "limit": {"type": "integer", "default": 50},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["category", "start_time", "end_time"],
         ),
@@ -320,13 +320,13 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_images_in_time_range",
-        "description": "Sample images captured within a time window, optionally filtered by category. Use for 'show me what the camera saw at 4:51'.",
+        "description": "Images captured within a time window, optionally filtered by category. Use for 'show me what the camera saw at 4:51'.",
         "parameters": _params(
             {
                 "start_time": {"type": "string", "description": "Start time as ISO, clock time, or ns integer."},
                 "end_time": {"type": "string", "description": "End time as ISO, clock time, or ns integer."},
                 "category": {"type": "string", "description": "Optional category filter."},
-                "limit": {"type": "integer", "default": 5},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["start_time", "end_time"],
         ),
@@ -348,7 +348,7 @@ TOOLS: list[dict[str, Any]] = [
             {
                 "center_time": {"type": "string", "description": "Cluster center time as ISO, clock time, or ns integer."},
                 "window_ms": {"type": "integer", "default": 500},
-                "limit": {"type": "integer", "default": 50},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             required=["center_time"],
         ),
@@ -369,7 +369,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": _params(
             {
                 "anomaly_type": {"type": "string", "description": "Optional: filter to one anomaly type name."},
-                "limit": {"type": "integer", "default": 50},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             }
         ),
     },
@@ -414,7 +414,7 @@ TOOLS: list[dict[str, Any]] = [
                 "object_id": {"type": "integer", "description": "Numeric object id (also called track_id). All frames this object was detected in (up to `limit`) will be annotated."},
                 "category": {"type": "string", "description": "Category name. Up to `limit` sample images of this category will be annotated."},
                 "question": {"type": "string", "description": "What to look for or how to annotate. Defaults to the user's original question."},
-                "limit": {"type": "integer", "default": 5, "description": "Maximum number of images to annotate for an object_id or category. Default 5."},
+                "limit": {"type": ["integer", "string"], "default": 5, "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
         },
     },
@@ -425,7 +425,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "A valid read-only SELECT SQL query."},
-                "limit": {"type": "integer", "default": 100, "description": "Maximum rows to return."},
+                "limit": {"type": ["integer", "string"], "default": 100, "description": "Optional cap; use 'all' or omit to return every matching result."},
             },
             "required": ["query"],
         },
@@ -603,6 +603,12 @@ Plan:
 1. annotate_image(image_url="/inspection/images/14.jpg", question="highlight advertisement board defects")
 Note: "the previous image" means the LAST url in the prior-images list — do NOT sample a fresh category image.
 
+Example I (count distinct objects, not detections):
+User: "How many lights were detected?"
+Plan:
+1. get_objects_by_category(category="Lights")
+(Use get_objects_by_category because the user wants the number of unique light objects. Use get_detection_counts_by_category only for explicit per-frame detection questions like "how many times were lights seen".)
+
 ## Rules
 
 - In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely.
@@ -612,7 +618,7 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
 - Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
 - For proximity questions, pass all other known categories as other_categories unless the user names a specific subset.
-- For questions about how many objects are in a specific category (e.g. "how many exit signs were found"), use get_objects_by_category(category), NOT get_summary.
+- For questions about how many objects are in a specific category (e.g. "how many exit signs were found", "how many lights were detected"), use get_objects_by_category(category). It returns distinct objects, not per-frame detections. Use get_detection_counts_by_category ONLY when the user explicitly asks for per-frame detection counts such as "how many times was it seen".
 - For time ranges, use 24-hour clock strings. If the user says a bare time like "4:51", assume PM because inspections run in the late afternoon.
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
@@ -961,28 +967,50 @@ Note: "the previous image" means the LAST url in the prior-images list — do NO
         system_prompt = (
             "You are the post-tool highlight decider for a subway-station inspection assistant. "
             "The tools already ran and returned the results shown below. Decide which objects or "
-            "coordinates, if any, should be highlighted in the 3D Rerun viewer the user watches "
-            "alongside this chat.\n\n"
-            "Call set_rerun_highlight with object_ids and/or coordinates (and optionally "
-            "category/label) for exactly the things the user would want to SEE IN 3D.\n\n"
+            "coordinates from those results should be highlighted in the 3D Rerun viewer the user "
+            "watches alongside this chat.\n\n"
+            "Default behavior: highlight EVERY object or category that is relevant to the user's "
+            "question. The user expects to see the things they asked about in the viewer unless they "
+            "explicitly asked not to.\n\n"
             "Rules:\n"
-            "1. Only highlight spatial things: object ids that have a 3D location, or raw "
-            "(x, y, z) points.\n"
-            "2. Prefer object_ids over raw coordinates when the results reference specific objects.\n"
-            "3. Do NOT highlight if the user only asked for 2D images/frames, a count/summary/"
-            "distance with no spatial intent, or an off-topic question - call no tool.\n"
-            "4. Highlight what the user named or asked 'where / visualize / highlight / show me "
-            "where' about - not every coordinate present in the results.\n"
-            "5. Do not call this tool if the user asked for image annotation "
-            "(annotate / draw on / circle on / mark on the image).\n"
-            "6. Set keep_existing=true ONLY if the user explicitly asked to keep or add to "
-            "the previous highlights (e.g. 'keep the previous', 'add to the highlights', "
-            "'show alongside the previous'). Otherwise leave it false (default) so previous "
-            "highlights are cleared before showing the new ones.\n"
-            "7. At most one tool call. Output nothing but the tool call."
+            "1. Call set_rerun_highlight with object_ids and/or coordinates (and optionally "
+            "category/label) for ALL spatial objects relevant to the user's question.\n"
+            "2. If the user asks about a category, highlight that category. If they ask about objects "
+            "near / within / around another category (e.g. 'lights within 2m of advertisement boards'), "
+            "highlight BOTH the reference category and the nearby objects/category.\n"
+            "3. Prefer exact object_ids when specific objects are returned in the tool results; otherwise "
+            "use category.\n"
+            "4. Do NOT highlight unrelated context or objects that are only incidental to the question. "
+            "Highlight ONLY objects that answer what the user asked.\n"
+            "5. Do not call this tool for pure image-annotation requests (annotate / draw on / circle on / "
+            "mark on the image) or for off-topic questions.\n"
+            "6. Set keep_existing=true ONLY if the user explicitly asked to keep or add to previous "
+            "highlights (e.g. 'keep the previous', 'add to the highlights', 'show alongside the "
+            "previous'). Otherwise leave it false so previous highlights are cleared first.\n"
+            "7. At most one tool call. Output nothing but the tool call.\n\n"
+            "Examples:\n"
+            "- User: 'how many lights were detected?' -> set_rerun_highlight(category='Lights').\n"
+            "- User: 'where are the lights?' -> set_rerun_highlight(category='Lights').\n"
+            "- User: 'show me the lights within 2m of advertisement boards' -> "
+            "set_rerun_highlight(category='Lights') or include object_ids for both Lights and "
+            "Advertisement Board from the tool results.\n"
+            "- User: 'show me object 12 in the viewer' -> set_rerun_highlight(object_ids=[12]).\n"
+            "- User: 'annotate the previous image' -> NO tool (image annotation, not 3D highlight)."
         )
+
+        history_block = ""
+        if chat_history:
+            recent = list(chat_history)[-4:]
+            lines = []
+            for user_text, assistant_text in recent:
+                lines.append(f"User: {user_text}")
+                lines.append(f"Assistant: {assistant_text[:300]}")
+            history_block = "\n\nRecent conversation:\n" + "\n".join(lines)
+
         user_content = (
-            f"User question: {query}\n\n=== Tool results ===\n{tool_results_text}"
+            f"User question: {query}"
+            f"{history_block}\n\n"
+            f"=== Tool results ===\n{tool_results_text}"
         )
 
         payload = {

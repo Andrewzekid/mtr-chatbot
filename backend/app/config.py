@@ -74,13 +74,19 @@ class Settings(BaseSettings):
     # New multi-inspection schema: categories / inspections / images / objects / detections
     # (plus anomaly_types / abnormal_detections / abnormalities, added by the writer later).
     # Relative paths resolve against the backend/ root (see model_post_init).
-    inspection_db_path: str = "../MTR_Database/inspection_v2.db"
+    inspection_db_path: str = "../MTR Inspection Database/inspection_v2.db"
 
     # Inspection anomaly reports (text + PDF summaries)
     reports_dir: str = "../reports"
 
     # Source camera images referenced by images.filename (served at /inspection/images).
-    inspection_image_dir: str = "../MTR_Database/outputs/images"
+    inspection_image_dir: str = "../MTR Inspection Database/outputs/images"
+
+    # Per-object segmented point clouds loaded by the Rerun visualizer.
+    inspection_objects_dir: str = "../MTR Inspection Database/outputs/objects"
+
+    # Photo-colored global map PCD loaded by the Rerun visualizer.
+    rerun_map_pcd_path: str = "../MTR Inspection Database/outputs/colored_map.pcd"
 
     # Annotated image cache (annotate_image tool draws bounding boxes here).
     annotated_image_cache_dir: str = "./data/annotated_images"
@@ -142,6 +148,8 @@ class Settings(BaseSettings):
         self.reports_dir = self._resolve_backend_path(self.reports_dir)
         self.inspection_db_path = self._resolve_backend_path(self.inspection_db_path)
         self.inspection_image_dir = self._resolve_backend_path(self.inspection_image_dir)
+        self.inspection_objects_dir = self._resolve_backend_path(self.inspection_objects_dir)
+        self.rerun_map_pcd_path = self._resolve_backend_path(self.rerun_map_pcd_path)
         self.rerun_map_points_path = self._resolve_backend_path(self.rerun_map_points_path)
         self.annotated_image_cache_dir = self._resolve_backend_path(self.annotated_image_cache_dir)
         self.piper_exe_path = self._resolve_backend_path(self.piper_exe_path)
