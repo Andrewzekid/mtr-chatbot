@@ -128,6 +128,11 @@ class InspectionDBClient:
         # Normalized args of the last Rerun highlight (decider, explicit tool, or
         # merged fallback) so the debug panel can show what was pushed to the viewer.
         self._last_highlight_args: dict[str, Any] | None = None
+        # Cache for the full anomaly trio (report + locations + details) so generic
+        # anomaly follow-ups reuse the previous turn instead of re-querying.
+        self._last_anomaly_trio_context: str | None = None
+        self._last_anomaly_trio_calls: list[tuple[str, dict[str, Any]]] = []
+        self._last_anomaly_trio_results: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Timestamp / image helpers
@@ -1378,7 +1383,8 @@ class InspectionDBClient:
                    ii.tf_translation_x AS cam_x, ii.tf_translation_y AS cam_y, ii.tf_translation_z AS cam_z,
                    gi.tf_translation_x AS gt_x, gi.tf_translation_y AS gt_y, gi.tf_translation_z AS gt_z,
                    GROUP_CONCAT(DISTINCT t.name) AS types,
-                   GROUP_CONCAT(DISTINCT ab.object) AS objects
+                   GROUP_CONCAT(DISTINCT ab.object) AS objects,
+                   GROUP_CONCAT(DISTINCT NULLIF(ab.note, '')) AS notes
             FROM abnormal_detections ad
             JOIN abnormalities ab ON ab.pair = ad.id
             JOIN anomaly_types t ON t.id = ab.type
@@ -1392,6 +1398,26 @@ class InspectionDBClient:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    @staticmethod
+    def _format_anomaly_label(
+        pair_id: Any,
+        types: str | None,
+        objects: str | None,
+        notes: str | None,
+    ) -> str:
+        """Build a concise label for an anomaly pair.
+
+        Format: "Anomaly {id} {type} {object}" (notes intentionally omitted to
+        keep the 3D viewer label readable).
+        """
+        parts: list[str] = []
+        if types:
+            parts.append(types)
+        if objects:
+            parts.append(objects)
+        detail = " ".join(parts) if parts else "anomaly"
+        return f"Anomaly {pair_id} {detail}"
+
     def anomaly_location_points(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
         """Anomaly markers as Rerun coordinate dicts: {x, y, z, label, color} (orange)."""
         points: list[dict[str, Any]] = []
@@ -1403,7 +1429,12 @@ class InspectionDBClient:
                 x, y, z = row.get("gt_x"), row.get("gt_y"), row.get("gt_z")
             if x is None or y is None or z is None:
                 continue
-            label = row.get("types") or "anomaly"
+            label = self._format_anomaly_label(
+                row.get("pair_id"),
+                row.get("types"),
+                row.get("objects"),
+                row.get("notes"),
+            )
             points.append(
                 {
                     "x": x,
@@ -1461,6 +1492,7 @@ class InspectionDBClient:
         formatted results and may decide to call additional tools, until it has enough
         information or the configured round limit is reached.
         """
+        previous_query = self._last_query
         self._last_query = query
         self._last_chat_history = list(chat_history) if chat_history else []
         self._last_highlight_status = None
@@ -1470,6 +1502,38 @@ class InspectionDBClient:
 
         if self.router is None:
             return None
+
+        # Generic anomaly follow-up short-circuit: if the previous turn already
+        # fetched the full anomaly trio and this question is still a generic
+        # anomaly question (no new inspection / anomaly id / type), reuse the
+        # cached context instead of re-calling the database.
+        if (
+            self._last_anomaly_trio_context is not None
+            and self._is_anomaly_follow_up(query, previous_query)
+            and not self._query_introduces_new_anomaly_scope(query)
+        ):
+            logger.info("Reusing cached anomaly trio context for follow-up: %r", query)
+            all_tool_calls = list(self._last_anomaly_trio_calls)
+            all_tool_results = list(self._last_anomaly_trio_results)
+            prior_results = [
+                str(r.get("output", "")) for r in all_tool_results if r.get("output")
+            ]
+            db_context = self._last_anomaly_trio_context
+            self._record_tool_calls(all_tool_calls)
+            self._record_tool_results(all_tool_results)
+            # Still run the final-pass highlight so follow-ups like "highlight
+            # anomaly 4" can refine the viewer without re-querying.
+            if self.rerun_visualizer is not None:
+                try:
+                    decision = await asyncio.to_thread(
+                        self.router.decide_highlights, query, db_context, chat_history
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Final-pass highlight decision failed: %s", exc)
+                    decision = None
+                if decision:
+                    self._last_highlight_status = self._apply_highlight_decision(decision)
+            return db_context
 
         max_rounds = getattr(self.settings, "tool_router_max_rounds", 1) if self.settings else 1
         max_rounds = max(1, int(max_rounds))
@@ -1488,6 +1552,7 @@ class InspectionDBClient:
                     chat_history,
                     tool_history,
                     prior_results,
+                    all_tool_calls,
                 )
 
                 # Filter out calls we already executed this turn (name + normalized args).
@@ -1535,15 +1600,15 @@ class InspectionDBClient:
                             prior_results.append(result)
 
             # Anomaly completeness: for ANY anomaly-related question the answerer always
-            # needs the same trio — the report data (get_report_summary), the 3D anomaly
-            # coordinates (get_anomaly_locations), and the anomaly details with images
+            # needs the structured anomaly pair — the 3D anomaly coordinates
+            # (get_anomaly_locations) and the anomaly details with images
             # (get_anomalies). The router often calls only a subset (e.g. just locations
             # for a 'where' question); top up whichever ones it did not call.
             if self._anomaly_tables_exist() and self._ANOMALY_QUERY_RE.search(query):
                 called_names = {name for name, _ in all_tool_calls}
                 top_up = [
                     (name, {})
-                    for name in ("get_report_summary", "get_anomaly_locations", "get_anomalies")
+                    for name in ("get_anomaly_locations", "get_anomalies")
                     if name not in called_names
                 ]
                 if top_up:
@@ -1565,6 +1630,21 @@ class InspectionDBClient:
                 if all_tool_results
                 else None
             )
+
+            # Cache the full anomaly pair for generic follow-up questions.
+            if (
+                self._anomaly_tables_exist()
+                and self._ANOMALY_QUERY_RE.search(query)
+                and db_context
+            ):
+                called_names = {name for name, _ in all_tool_calls}
+                if {
+                    "get_anomaly_locations",
+                    "get_anomalies",
+                }.issubset(called_names):
+                    self._last_anomaly_trio_context = db_context
+                    self._last_anomaly_trio_calls = list(all_tool_calls)
+                    self._last_anomaly_trio_results = list(all_tool_results)
 
             # Final-pass highlight: after the router stops calling tools, ask it to decide
             # which objects/coordinates to show in the Rerun viewer (replaces the old regex
@@ -1635,7 +1715,7 @@ class InspectionDBClient:
                             oid = args.get("object_id")
                             if oid is not None and int(oid) not in merged_object_ids:
                                 merged_object_ids.append(int(oid))
-                        elif name in {"get_anomalies", "get_anomaly_summary", "get_anomaly_locations", "get_report_summary"}:
+                        elif name in {"get_anomalies", "get_anomaly_summary", "get_anomaly_locations"}:
                             # Anomaly questions: mark the anomaly locations (camera
                             # positions of the abnormal image pairs) in the 3D viewer.
                             # Added once per query even when several anomaly tools ran.
@@ -1669,28 +1749,32 @@ class InspectionDBClient:
                             highlight_args["label"] = "anomaly locations"
                         # If every contributing tool call was scoped to the same
                         # inspection, scope the highlight too so the viewer marks only
-                        # that inspection's objects of the category.
-                        scoped = {
-                            int(args["inspection_id"])
-                            for name, args in all_tool_calls
-                            if args.get("inspection_id") is not None
-                            and name
-                            in {
-                                "get_category_objects_with_images",
-                                "get_category_sample_images",
-                                "get_images_in_time_range",
-                                "get_objects_by_category",
-                                "get_category_objects_coordinates",
-                                "get_objects_by_category_in_time_range",
-                                "get_category_timeline",
-                                "get_category_detection_timeline",
-                                "get_category_proximity",
-                                "get_category_proximity_with_images",
-                                "get_category_windows",
+                        # that inspection's objects of the category. When multiple
+                        # categories are requested (e.g. 'show me TV and ticket gates'),
+                        # leave inspection_id unset so objects from ALL inspections are
+                        # highlighted and grouped per inspection in the viewer.
+                        if len(merged_categories) <= 1:
+                            scoped = {
+                                int(args["inspection_id"])
+                                for name, args in all_tool_calls
+                                if args.get("inspection_id") is not None
+                                and name
+                                in {
+                                    "get_category_objects_with_images",
+                                    "get_category_sample_images",
+                                    "get_images_in_time_range",
+                                    "get_objects_by_category",
+                                    "get_category_objects_coordinates",
+                                    "get_objects_by_category_in_time_range",
+                                    "get_category_timeline",
+                                    "get_category_detection_timeline",
+                                    "get_category_proximity",
+                                    "get_category_proximity_with_images",
+                                    "get_category_windows",
+                                }
                             }
-                        }
-                        if len(scoped) == 1:
-                            highlight_args["inspection_id"] = scoped.pop()
+                            if len(scoped) == 1:
+                                highlight_args["inspection_id"] = scoped.pop()
                         try:
                             self._last_highlight_status = self._highlight_in_rerun(highlight_args)
                         except Exception as exc:  # noqa: BLE001
@@ -1723,6 +1807,38 @@ class InspectionDBClient:
     @classmethod
     def _query_is_about_objects(cls, query: str) -> bool:
         return bool(cls._BROAD_OBJECT_QUERY_RE.search(query))
+
+    _ANOMALY_SCOPE_RE = re.compile(
+        r"\b(inspection\s*\d+|anomaly\s*\d+|pair\s*\d+|type\s*\d+|"
+        r"foreign_object|missing_object|state_change|relocation|content_change|"
+        r"crack and structure damage|stain/graffiti)\b",
+        re.IGNORECASE,
+    )
+
+    # Vague follow-up words that refer back to the previous anomaly discussion.
+    _ANOMALY_FOLLOW_UP_RE = re.compile(
+        r"\b(them|those|they|it|more|else|detail|specific|which|what about|"
+        r"tell me more|go on|continue|explain|why|how)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _query_introduces_new_anomaly_scope(cls, query: str) -> bool:
+        """True if the follow-up asks for a specific inspection, anomaly, or type."""
+        return bool(cls._ANOMALY_SCOPE_RE.search(query))
+
+    @classmethod
+    def _is_anomaly_follow_up(cls, query: str, last_query: str) -> bool:
+        """True if the current question is about anomalies or follows an anomaly answer."""
+        if cls._ANOMALY_QUERY_RE.search(query):
+            return True
+        if (
+            last_query
+            and cls._ANOMALY_QUERY_RE.search(last_query)
+            and cls._ANOMALY_FOLLOW_UP_RE.search(query)
+        ):
+            return True
+        return False
 
     def _mentioned_categories(self, query: str, max_categories: int = 3) -> list[str]:
         """Canonical DB categories explicitly named in the query (longest alias first)."""
@@ -1801,6 +1917,14 @@ class InspectionDBClient:
                 return self._format_annotate_image(result)
             if tool_name == "highlight_in_rerun":
                 return self._highlight_in_rerun(args)
+            if tool_name == "clear_rerun_markings":
+                if self.rerun_visualizer is None:
+                    status = "Rerun visualization is not configured on this backend."
+                else:
+                    status = self.rerun_visualizer.clear()
+                self._last_highlight_status = status
+                self._last_highlight_args = {"clear": True}
+                return status
             if tool_name == "get_summary":
                 return self._format_summary(inspection_id=_inspection_id())
             if tool_name == "get_categories":
@@ -1950,22 +2074,6 @@ class InspectionDBClient:
             if tool_name in {"run_sql_query", "query_database"}:
                 sql = args.get("query") or args.get("sql_query") or ""
                 return self._format_sql_query_result(sql, limit=self._resolve_limit(args.get("limit"), default=100))
-            if tool_name == "get_report_summary":
-                # The prose report context is fetched and injected by the LLM service.
-                # Return the live structured anomaly data here so the answerer can
-                # cross-reference what the report describes against the current
-                # database records (counts, types, affected objects, locations).
-                if not self._anomaly_tables_exist():
-                    return None
-                sections = [
-                    "The prose inspection report is attached separately as report context. "
-                    "Below is the LIVE structured anomaly data from the database — use it to "
-                    "ground and verify what the report talks about. If the prose report and "
-                    "the database disagree, the database is newer: trust the database.",
-                    self._format_anomaly_summary(),
-                    self._format_anomaly_locations(),
-                ]
-                return "\n\n".join(s for s in sections if s)
             if tool_name == "get_anomaly_types":
                 return self._format_anomaly_types()
             if tool_name == "get_anomaly_summary":
@@ -1982,12 +2090,62 @@ class InspectionDBClient:
             logger.warning("Tool execution failed for %s with args %s: %s", tool_name, args, exc)
         return None
 
+    # Labels the LLM sometimes emits for anomaly coordinates.
+    _GENERIC_ANOMALY_LABELS = {
+        "anomaly location",
+        "anomaly",
+        "anomalies",
+        "abnormal",
+        "abnormality",
+        "",
+    }
+
+    def _enrich_coordinate_labels(self, coords: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace generic anomaly coordinate labels with rich labels from the DB.
+
+        Matches coordinates against known anomaly camera positions; when a generic
+        label is found near a known anomaly, the label is rewritten to
+        'Anomaly {pair_id}: {type}, {object}, {note}'.
+        """
+        if not coords or not self._anomaly_tables_exist():
+            return list(coords)
+        anomaly_points = self.anomaly_location_points()
+        if not anomaly_points:
+            return list(coords)
+        # Build (x,y,z) -> rich label map with a small tolerance for float noise.
+        label_map: dict[tuple[int, int, int], str] = {}
+        for p in anomaly_points:
+            key = (round(float(p["x"]) * 100), round(float(p["y"]) * 100), round(float(p["z"]) * 100))
+            label_map[key] = p.get("label", "")
+
+        out: list[dict[str, Any]] = []
+        for c in coords:
+            if not isinstance(c, dict):
+                out.append(c)
+                continue
+            enriched = dict(c)
+            current_label = str(enriched.get("label") or "").strip().lower()
+            if current_label in self._GENERIC_ANOMALY_LABELS:
+                try:
+                    key = (
+                        round(float(c["x"]) * 100),
+                        round(float(c["y"]) * 100),
+                        round(float(c["z"]) * 100),
+                    )
+                    rich = label_map.get(key)
+                    if rich:
+                        enriched["label"] = rich
+                except (KeyError, TypeError, ValueError):
+                    pass
+            out.append(enriched)
+        return out
+
     def _highlight_in_rerun(self, args: dict[str, Any]) -> str:
         object_ids = args.get("object_ids") or []
         if isinstance(object_ids, (int, float)):
             object_ids = [int(object_ids)]
         object_ids = [int(o) for o in object_ids if o is not None]
-        coords = args.get("coordinates") or []
+        coords = self._enrich_coordinate_labels(args.get("coordinates") or [])
         category = self._canonical_category(args["category"]) if args.get("category") else None
         categories = [
             self._canonical_category(c)
@@ -2050,7 +2208,7 @@ class InspectionDBClient:
         if isinstance(object_ids, (int, float)):
             object_ids = [int(object_ids)]
         object_ids = [int(o) for o in object_ids if o is not None]
-        coords = decision.get("coordinates") or []
+        coords = self._enrich_coordinate_labels(decision.get("coordinates") or [])
         category = (
             self._canonical_category(decision["category"])
             if decision.get("category")
@@ -3066,9 +3224,14 @@ class InspectionDBClient:
             pos = self._format_xyz(r["cam_x"], r["cam_y"], r["cam_z"])
             if r["cam_x"] is None:
                 pos = f"{self._format_xyz(r['gt_x'], r['gt_y'], r['gt_z'])} (ground-truth viewpoint)"
-            objects = f" on: {r['objects']}" if r.get("objects") else ""
+            label = self._format_anomaly_label(
+                r.get("pair_id"),
+                r.get("types"),
+                r.get("objects"),
+                r.get("notes"),
+            )
             lines.append(
-                f"- Pair {r['pair_id']} [inspection {r['inspection_id']}]: types={r['types']}{objects} at {pos}"
+                f"- Pair {r['pair_id']} [inspection {r['inspection_id']}]: {label} at {pos}"
             )
         return "\n".join(lines)
 

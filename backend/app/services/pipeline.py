@@ -13,7 +13,6 @@ from app.config import Settings
 from app.models import ServerMessage
 from app.services.db_service import InspectionDBClient
 from app.services.llm_service import LocalLLM
-from app.services.report_service import InspectionReportClient
 from app.services.rerun_service import RerunVisualizer
 from app.services.stt_service import STTResult, build_stt
 from app.services.tool_router import ToolRouter
@@ -47,15 +46,7 @@ class VoicePipeline:
             else:
                 logger.warning("Inspection DB not found at %s; DB lookups disabled", db_path)
 
-        report_client = None
-        if settings.reports_dir:
-            reports_dir = Path(settings.reports_dir)
-            if reports_dir.exists():
-                report_client = InspectionReportClient(reports_dir)
-            else:
-                logger.warning("Reports directory not found at %s; report lookups disabled", reports_dir)
-
-        self.llm = LocalLLM(settings, db_client=db_client, report_client=report_client)
+        self.llm = LocalLLM(settings, db_client=db_client)
         self.tts = PiperTTS(settings)
 
     async def _stream_tts_segments(

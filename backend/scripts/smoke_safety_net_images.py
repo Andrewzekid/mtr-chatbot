@@ -76,26 +76,26 @@ class EmptyRouter:
     settings = SimpleNamespace(tool_router_max_rounds=1)
     last_raw_response = None
 
-    def select_tool(self, query, chat_history, tool_history, prior_results):
+    def select_tool(self, query, chat_history, tool_history, prior_results, current_turn_calls=None):
         return []
 
     def decide_highlights(self, query, tool_results_text, chat_history=None):
         return None
 
 
-class ReportOnlyRouter(EmptyRouter):
-    """Router that answers anomaly questions with get_report_summary only."""
+class SummaryOnlyRouter(EmptyRouter):
+    """Router that answers anomaly questions with get_anomaly_summary only."""
 
-    def select_tool(self, query, chat_history, tool_history, prior_results):
+    def select_tool(self, query, chat_history, tool_history, prior_results, current_turn_calls=None):
         if not prior_results:
-            return [("get_report_summary", {})]
+            return [("get_anomaly_summary", {})]
         return []
 
 
 class LocationsOnlyRouter(EmptyRouter):
     """Router that answers anomaly questions with get_anomaly_locations only."""
 
-    def select_tool(self, query, chat_history, tool_history, prior_results):
+    def select_tool(self, query, chat_history, tool_history, prior_results, current_turn_calls=None):
         if not prior_results:
             return [("get_anomaly_locations", {})]
         return []
@@ -106,20 +106,20 @@ async def main() -> None:
         db_path = Path(tmp) / "test.db"
         make_db(db_path)
 
-        # (a) Anomaly question answered via get_report_summary only -> top-up adds
+        # (a) Anomaly question answered via get_anomaly_summary only -> top-up adds
         # locations + details; anomaly locations highlighted once, with larger markers.
         rerun = FakeRerun()
-        client = make_client(db_path, rerun, ReportOnlyRouter())
+        client = make_client(db_path, rerun, SummaryOnlyRouter())
         ctx = await client.lookup("tell me about the anomalies found during this inspection")
         names = [c["name"] for c in client.last_tool_calls]
-        assert names == ["get_report_summary", "get_anomaly_locations", "get_anomalies"], names
+        assert names == ["get_anomaly_summary", "get_anomaly_locations", "get_anomalies"], names
         assert ctx is not None and "missing object" in ctx, ctx
         assert rerun.calls, "anomaly fallback highlight did not fire"
         coords = rerun.calls[0].get("coordinates")
         assert coords and len(coords) == 1, rerun.calls[0]
         assert abs(coords[0]["x"] - 9.0) < 1e-6 and abs(coords[0]["z"] - 7.0) < 1e-6, coords
         assert coords[0].get("radius") == 0.35, coords
-        print("PASS a: report-only router -> top-up + anomaly highlight (radius 0.35)")
+        print("PASS a: summary-only router -> top-up + anomaly highlight (radius 0.35)")
 
         # (b) "show me the lights" with a silent router -> image tool with limit 5,
         # subset note in context, and the Lights category highlighted.
@@ -158,7 +158,7 @@ async def main() -> None:
         print("PASS d: multi-category show query -> both categories highlighted")
 
         # (f) Anomaly question with a silent router -> anomaly safety net plus the
-        # anomaly top-up (report + locations), and the anomaly locations highlighted
+        # anomaly top-up (locations + details), and the anomaly locations highlighted
         # exactly once despite several anomaly tools running.
         rerun.calls.clear()
         client = make_client(db_path, rerun, EmptyRouter())
@@ -167,7 +167,6 @@ async def main() -> None:
         assert names == [
             "get_anomaly_summary",
             "get_anomalies",
-            "get_report_summary",
             "get_anomaly_locations",
         ], names
         assert "missing object" in ctx, ctx
@@ -175,19 +174,19 @@ async def main() -> None:
         coords = rerun.calls[0]["coordinates"]
         assert len(coords) == 1, f"anomaly coordinates duplicated: {len(coords)}"
         assert coords[0].get("radius") == 0.35, rerun.calls[0]
-        print("PASS f: silent-router anomaly question -> full anomaly trio + highlight")
+        print("PASS f: silent-router anomaly question -> full anomaly pair + highlight")
 
-        # (g) Router calls only get_anomaly_locations -> top-up adds the report and
-        # the anomaly details, so the answerer always has the full picture.
+        # (g) Router calls only get_anomaly_locations -> top-up adds the anomaly
+        # details, so the answerer always has the full picture.
         rerun.calls.clear()
         client = make_client(db_path, rerun, LocationsOnlyRouter())
         ctx = await client.lookup("where are the anomalies located?")
         names = [c["name"] for c in client.last_tool_calls]
-        assert names == ["get_anomaly_locations", "get_report_summary", "get_anomalies"], names
+        assert names == ["get_anomaly_locations", "get_anomalies"], names
         assert "missing object" in ctx and "Pair 1" in ctx, ctx
         coords = rerun.calls[0]["coordinates"] if rerun.calls else []
         assert len(coords) == 1, f"anomaly coordinates duplicated: {len(coords)}"
-        print("PASS g: locations-only router -> top-up adds report + details")
+        print("PASS g: locations-only router -> top-up adds anomaly details")
 
         # (e) Off-topic chat untouched.
         rerun.calls.clear()

@@ -11,7 +11,6 @@ import httpx
 
 from app.config import Settings
 from app.services.db_service import InspectionDBClient
-from app.services.report_service import InspectionReportClient
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +25,9 @@ class LocalLLM:
         self,
         settings: Settings,
         db_client: InspectionDBClient | None = None,
-        report_client: InspectionReportClient | None = None,
     ) -> None:
         self.settings = settings
         self.db_client = db_client
-        self.report_client = report_client
         # Lazily fetched from the DB so the answering prompt always names the real
         # categories (prevents the model from inventing ones that do not exist).
         self._cached_categories: list[str] | None = None
@@ -56,14 +53,12 @@ class LocalLLM:
             "- You may reason step by step before answering, but put all reasoning inside <think>...</think> tags.\n"
             "- Only the text outside <think>...</think> tags is shown to the user, so keep the final answer clean and direct.\n\n"
             "Information sources:\n"
-            "- Inspection database context contains object detections, categories, counts, timestamps, timelines, time-window clusters, 3D coordinates, proximity information, and image links.\n"
-            "- Inspection report context contains anomaly findings, issues, problems, state changes, and recommendations. It is only included when the user asks about anomalies or findings.\n"
-            "- The prose report can predate the current database. When report prose conflicts with the structured anomaly data from the database (counts, types, affected objects, locations), trust the database and briefly note the discrepancy.\n"
-            "- For questions about objects, categories, counts, tracks, detections, timestamps, timelines, coordinates, or proximity, prioritize the database context.\n"
-            "- For questions about anomalies, findings, issues, problems, state changes, or recommendations, prioritize the report context.\n"
+            "- Inspection database context contains object detections, categories, counts, timestamps, timelines, time-window clusters, 3D coordinates, proximity information, anomaly details, and image links.\n"
+            "- All anomaly answers come from the structured anomaly tables in the database (abnormalities, abnormal_detections, anomaly_types). There is no separate prose report.\n"
+            "- For questions about objects, categories, counts, tracks, detections, timestamps, timelines, coordinates, or proximity, use the database context.\n"
+            "- For questions about anomalies, findings, issues, problems, or state changes, use the structured anomaly data from the database context.\n"
             "- Do not reveal coordinates, positions, locations, or spatial extents unless the user explicitly asks for them. "
             "Coordinate/location questions use words such as 'where', 'coordinates', 'position', 'location', 'spatial', 'extent', or 'area'.\n"
-            "- When a question touches on both sources (for example, anomalies in a specific category or object), synthesize them into one coherent answer rather than two separate sections.\n"
             "- If the provided context does not contain the requested information, say so directly and concisely. "
             "Do not infer, assume, or invent data that is not in the context. "
             "If useful, end with one brief follow-up question offering to look into it another way.\n\n"
@@ -225,7 +220,6 @@ class LocalLLM:
         prompt: str,
         chat_history: Sequence[tuple[str, str]] | None,
         db_context: str | None = None,
-        report_context: str | None = None,
         tool_context: str | None = None,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt() + self._database_facts()}]
@@ -235,9 +229,6 @@ class LocalLLM:
 
         if db_context:
             messages.append({"role": "system", "content": f"Inspection database context (object detections, categories, counts, timelines, and image links):\n{db_context}"})
-
-        if report_context:
-            messages.append({"role": "system", "content": f"Inspection report context (anomaly findings, issues, and recommendations):\n{report_context}"})
 
         if chat_history:
             recent_turns = list(chat_history)[-self.settings.llm_history_turns :]
@@ -271,7 +262,6 @@ class LocalLLM:
     ) -> AsyncGenerator[str, None]:
         db_context = None
         tool_results: list[dict[str, object]] = []
-        report_needed = False
         tool_router_raw: dict[str, object] | None = None
         # Annotated-image links the backend emits itself (see yield below) so
         # the image is guaranteed to display regardless of model compliance.
@@ -285,10 +275,6 @@ class LocalLLM:
                     {"name": r["name"], "args": r["args"], "output": r["output"]}
                     for r in self.db_client.last_tool_results
                 ]
-                report_needed = any(
-                    call.get("name") in {"get_report_summary", "get_anomaly_summary", "get_anomalies"}
-                    for call in self.db_client.last_tool_calls
-                )
                 highlight_called = any(
                     call.get("name") == "highlight_in_rerun" for call in self.db_client.last_tool_calls
                 )
@@ -381,29 +367,6 @@ class LocalLLM:
             except Exception as exc:
                 logger.warning("DB lookup failed: %s", exc)
 
-        report_context = None
-        if report_needed and self.report_client is not None:
-            try:
-                report_context = self.report_client.get_context()
-                image_urls = self.report_client.get_image_urls()
-                if image_urls:
-                    report_context += "\n\n--- Anomaly images ---\n"
-                    report_context += (
-                        "The following images are available. '/reports/reference/<N>_result.jpg' is the annotated "
-                        "result for the report's 'Frame N' — the same frame the anomaly was found on, with the "
-                        "anomaly boxes drawn:\n"
-                    )
-                    for url in image_urls:
-                        report_context += f"- {url}\n"
-                if report_context:
-                    logger.info("Injecting inspection report context for prompt: %r", prompt)
-                    # Attach the real report output to the debug payload.
-                    for r in tool_results:
-                        if r["name"] == "get_report_summary":
-                            r["output"] = report_context
-            except Exception as exc:
-                logger.warning("Report lookup failed: %s", exc)
-
         if tool_calls_callback:
             debug_payload: dict[str, object] = {}
             if tool_results:
@@ -427,7 +390,6 @@ class LocalLLM:
             prompt,
             chat_history,
             db_context=db_context,
-            report_context=report_context,
             tool_context=tool_context,
         )
 

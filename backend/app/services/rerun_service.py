@@ -126,6 +126,17 @@ class RerunVisualizer:
             return f"Highlighted {len(coordinates)} coordinate(s){label_str} in {where}."
         return f"Highlighted selection{label_str} in {where}."
 
+    def clear(self) -> str:
+        """Clear all markings from the Rerun viewer.
+
+        Returns a short status string. The actual Rerun clear happens
+        asynchronously on the background worker thread.
+        """
+        if not self.settings.rerun_enabled:
+            return "Rerun visualization is disabled (RERUN_ENABLED=false)."
+        self._enqueue({"clear": True})
+        return "Cleared all markings from the Rerun viewer."
+
     # ------------------------------------------------------------------
     # Background worker (all Rerun I/O happens here, off the chat turn)
     # ------------------------------------------------------------------
@@ -153,6 +164,10 @@ class RerunVisualizer:
             return
 
         try:
+            if job.get("clear"):
+                marker.clean_markings()
+                return
+
             if not job.get("keep_existing", False):
                 marker.clean_markings()
 
@@ -225,7 +240,7 @@ class RerunVisualizer:
         if not pts:
             return
         pts_arr = np.asarray(pts, dtype=np.float32)
-        kwargs: dict[str, Any] = {"labels": labels} if any(labels) else {}
+        kwargs: dict[str, Any] = {"labels": labels, "show_labels": True} if any(labels) else {}
         # Log under marks_root: coordinates are camera_init-frame points, and this
         # keeps them inside clean_markings()'s recursive clear so stale points from
         # previous queries do not linger when keep_existing is false.

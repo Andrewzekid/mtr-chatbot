@@ -43,7 +43,7 @@ class DummyRouter:
     settings = SimpleNamespace(tool_router_max_rounds=1)
     last_raw_response = None
 
-    def select_tool(self, query, chat_history, tool_history, prior_results):
+    def select_tool(self, query, chat_history, tool_history, prior_results, current_turn_calls=None):
         return []
 
     def decide_highlights(self, query, tool_results_text, chat_history=None):

@@ -12,7 +12,6 @@ from pathlib import Path
 from app.config import Settings
 from app.services.db_service import InspectionDBClient
 from app.services.llm_service import LocalLLM
-from app.services.report_service import InspectionReportClient
 from app.services.tool_router import ToolRouter
 
 COORD_RE = re.compile(r"\(-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?\)")
@@ -43,10 +42,7 @@ async def main() -> None:
     db_client = InspectionDBClient(
         Path(settings.inspection_db_path), router=router, settings=settings
     )
-    report_client = None
-    if settings.reports_dir and Path(settings.reports_dir).exists():
-        report_client = InspectionReportClient(Path(settings.reports_dir))
-    llm = LocalLLM(settings, db_client=db_client, report_client=report_client)
+    llm = LocalLLM(settings, db_client=db_client)
 
     failures = 0
     for query in QUERIES:

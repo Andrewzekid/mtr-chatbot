@@ -379,13 +379,8 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": _params({}),
     },
     {
-        "name": "get_report_summary",
-        "description": "Fetch the inspection report text, including anomaly findings, issues, state changes, and recommendations. Use this when the user asks about the written anomaly report or recommendations. Pair with get_anomalies for the structured abnormalities.",
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
         "name": "highlight_in_rerun",
-        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights.",
+        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights. When you include coordinates, give each point a descriptive label: objects as 'Object <id>: <category>' and anomaly locations using the rich label from get_anomaly_locations (e.g. 'Anomaly 4 foreign_object: overhead monitor/screen, ...').",
         "parameters": _params(
             {
                 "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
@@ -401,13 +396,21 @@ TOOLS: list[dict[str, Any]] = [
                         },
                         "required": ["x", "y", "z"],
                     },
-                    "description": "Raw 3D points to highlight.",
+                    "description": "Raw 3D points to highlight. Each point MUST have a descriptive label: objects as 'Object <id>: <category>', anomaly locations using the rich label from get_anomaly_locations. Never use generic labels like 'Anomaly Location'.",
                 },
                 "category": {"type": "string", "description": "Highlight every object in this category."},
                 "keep_existing": {"type": "boolean", "default": False, "description": "If true, keep previously highlighted objects/points in the viewer (the user explicitly asked to keep or add to them, e.g. 'keep the previous', 'add to the highlights', 'show alongside'). Default false: previous highlights are cleared before showing these."},
                 "label": {"type": "string", "description": "Optional label for this highlight set."},
             }
         ),
+    },
+    {
+        "name": "clear_rerun_markings",
+        "description": "Clear all markings/highlighted objects from the 3D Rerun viewer. Use ONLY when the user explicitly asks to clear/remove/reset the 3D map markings (e.g. 'clear all markings on 3d map', 'remove the highlights', 'reset the viewer').",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
     },
     {
         "name": "annotate_image",
@@ -441,7 +444,6 @@ TOOLS: list[dict[str, Any]] = [
 REDUCED_TOOLS: list[dict[str, Any]] = [
     next(t for t in TOOLS if t["name"] == "get_categories"),
     next(t for t in TOOLS if t["name"] == "run_sql_query"),
-    next(t for t in TOOLS if t["name"] == "get_report_summary"),
 ]
 
 
@@ -540,11 +542,11 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 33. get_anomaly_types — anomaly type names.
 34. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
 35. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, affected object, scene location, 2D bbox, note, pair summary, and gt/inspection image links.
-35a. get_anomaly_locations(inspection_id) — 3D camera positions where each abnormal image pair was taken (the anomalies' locations). These are automatically marked in the Rerun viewer. Use for 'where are the anomalies'.
-36. get_report_summary — the written anomaly report text + recommendations. Its result also carries the live structured anomaly data from the database, and annotated per-frame result images (report 'Frame N' = /reports/reference/<N>_result.jpg) are attached to the report context.
+36. get_anomaly_locations(inspection_id) — 3D camera positions where each abnormal image pair was taken (the anomalies' locations). These are automatically marked in the Rerun viewer. Use for 'where are the anomalies'.
 37. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the Rerun viewer (only for explicit visual requests; coordinates from other tools auto-highlight).
 38. run_sql_query(query, limit) — read-only SELECT escape hatch. Use ONLY when no other tool fits.
-39. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
+39. clear_rerun_markings() — clear all markings/highlights from the 3D Rerun viewer. Use only for explicit clear/remove/reset requests.
+40. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
 
 ## Multi-tool flow examples
 
@@ -581,13 +583,12 @@ Plan:
 1. get_category_sample_images(category="Advertisement Board", limit=5)
 2. get_object_distance(object_id_a=16, object_id_b=19)
 
-Example D (anomalies — structured + report, multi-tool):
+Example D (anomalies — structured DB only, multi-tool):
 User: "What anomalies did you find, and show me the ones on the ticket gates?"
 Plan:
 1. get_anomaly_summary
 2. get_anomalies()
-3. get_report_summary
-(Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report.)
+(Note: get_anomalies returns image links for each abnormality's inspection frame.)
 
 Example E (Rerun highlight — final pass):
 User: "What are the coordinates of the ticket gates? Show me where they are."
@@ -626,9 +627,10 @@ Plan:
 
 ## Rules
 
-- In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely.
+- In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count. Combine tools freely.
 - For broad questions about what was detected overall ("tell me about all the objects", "what objects are there", "what did you find/detect", "what's in the scene", "what categories exist"), ALWAYS call get_summary and get_categories. The answering model has NO built-in knowledge of the database — if you call no tools, it will invent categories that do not exist.
 - This is a multi-round router: after the backend executes your tool calls, it will show you the results and give you another chance to call more tools if you still need information. Up to {max_rounds} rounds are allowed. If the results from the current round are enough, stop — return no tool calls. Only call additional tools when you genuinely need their output.
+- NEVER call a tool that is already listed in "Tools already called this turn" with the SAME arguments. The results of those calls are shown below; calling them again just wastes a round. The only valid reason to re-call a tool within the same turn is if the user asked for DIFFERENT parameters (a different radius, time window, category, limit, object id, inspection_id, etc.), and that changed argument must be visible in the new call.
 - A final pass runs AFTER your tools finish and decides which objects/coordinates to show in the Rerun viewer based on the results and the user's question. You do NOT need to call highlight_in_rerun for ordinary coordinate questions - the final pass highlights them. Only call highlight_in_rerun for explicit, specific 3D-highlight requests that name particular objects (e.g. 'highlight objects 16 and 19 in the 3D viewer').
 - A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
 - Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
@@ -639,7 +641,7 @@ Plan:
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
 - DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, proximity, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
-- When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, ALWAYS call the full anomaly trio together: get_report_summary (report + live structured data), get_anomaly_locations (3D coordinates), and get_anomalies (details with images) — no matter how narrow the wording is ('where', 'how many', 'what'). The backend tops up any of the three you skip, but calling them yourself keeps results consistent. Do not call coordinate tools for pure anomaly questions. Whenever anomaly tools run, the anomaly locations (camera positions of the abnormal image pairs) are automatically marked in the Rerun viewer — no highlight_in_rerun call needed. The get_report_summary result already includes the live structured anomaly data (counts by type, affected objects, 3D locations), so the answerer can cross-reference the prose report against the current database records.
+- When the user asks about anomalies, findings, issues, problems, defects, or state changes, ALWAYS call the relevant anomaly DB tools together: get_anomaly_summary (counts by type), get_anomaly_locations (3D coordinates), and get_anomalies (details with images) — no matter how narrow the wording is ('where', 'how many', 'what'). The backend tops up whichever of these you skip. Do not call coordinate tools for pure anomaly questions. Whenever anomaly tools run, the anomaly locations (camera positions of the abnormal image pairs) are automatically marked in the Rerun viewer — no highlight_in_rerun call needed.
 - CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images. 'Show me' requests ALWAYS produce BOTH outputs: 2D images in the chat AND a 3D highlight of the relevant objects/categories in the Rerun viewer — the final pass handles the 3D highlight automatically, so you just need to call the right image tool(s).
 - For 'show me X near Y within R meters' queries, use get_category_proximity_with_images so the nearby objects include sample frames.
 - For 'show me X at time T' queries, use get_images_in_time_range (optionally with category) to return actual frames.
@@ -729,18 +731,36 @@ Plan:
         )
 
     @staticmethod
-    def _round_context(prior_results: Sequence[str] | None) -> str:
+    def _round_context(
+        prior_results: Sequence[str] | None,
+        current_turn_calls: Sequence[tuple[str, dict[str, Any]]] | None = None,
+    ) -> str:
         """Build the in-turn results block appended to the user message.
 
         This lets the router see what previous tool calls returned so it can decide
-        whether to stop or call more tools in the next round.
+        whether to stop or call more tools in the next round. It also lists the tools
+        already called this turn so the model does not repeat them.
         """
-        if not prior_results:
-            return ""
-        parts = ["\n\n=== Results from tools already called this turn ==="]
-        for i, res in enumerate(prior_results, start=1):
-            parts.append(f"--- result {i} ---\n{res}")
-        return "\n".join(parts)
+        blocks: list[str] = []
+        if current_turn_calls:
+            blocks.append(
+                "\n\n=== Tools already called this turn (do NOT call them again with the same arguments) ==="
+            )
+            for name, args in current_turn_calls:
+                blocks.append(f"- {name}({args})")
+        if prior_results:
+            blocks.append("\n\n=== Results from tools already called this turn ===")
+            for i, res in enumerate(prior_results, start=1):
+                blocks.append(f"--- result {i} ---\n{res}")
+        return "\n".join(blocks)
+
+    @staticmethod
+    def _call_key(name: str, args: Any) -> str:
+        """Stable key for deduplicating tool calls by name + normalized arguments."""
+        try:
+            return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        except Exception:
+            return f"{name}:{str(args)}"
 
     def select_tool(
         self,
@@ -748,6 +768,7 @@ Plan:
         chat_history: Sequence[tuple[str, str]] | None = None,
         tool_history: Sequence[dict[str, object]] | None = None,
         prior_results: Sequence[str] | None = None,
+        current_turn_calls: Sequence[tuple[str, Any]] | None = None,
     ) -> list[tuple[str, Any]]:
         """Return a list of (tool_name, args) chosen by the base model.
 
@@ -758,6 +779,7 @@ Plan:
         if not self.settings.tool_router_enabled:
             return []
 
+        current_turn_calls = list(current_turn_calls) if current_turn_calls else []
         q = query.lower()
         prior_images = self._image_context_from_history(chat_history)
         prior_tools = self._prior_tool_context(tool_history)
@@ -775,12 +797,10 @@ Plan:
         )
         wants_image_annotation = any(kw in q for kw in image_annotation_keywords)
 
-        # Whether to fetch the anomaly report is the router LLM's decision, not a
-        # keyword gate. get_report_summary / get_anomaly_* are listed in TOOLS and the
-        # system prompt instructs the model to call them for anomaly/finding/problem
-        # questions, so the model decides whether the report is relevant.
+        # Anomaly questions are routed to the structured anomaly DB tools
+        # (get_anomaly_*) only; the written report is no longer used.
 
-        user_content = query + self._round_context(prior_results)
+        user_content = query + self._round_context(prior_results, current_turn_calls)
 
         payload = {
             "model": self.settings.tool_router_model,
@@ -831,6 +851,13 @@ Plan:
             args = func.get("arguments") or {}
             if isinstance(name, str) and name in valid_names:
                 results.append((name, args))
+
+        # Hard guard: never return a tool call that exactly duplicates one already
+        # executed this turn, even if the LLM repeats it. Different parameters are
+        # still allowed (the model may genuinely need a re-call with new args).
+        if current_turn_calls:
+            already = {self._call_key(n, a) for n, a in current_turn_calls}
+            results = [(n, a) for n, a in results if self._call_key(n, a) not in already]
 
         # Safety net: if this was clearly an annotation request but the router did not
         # emit an annotate_image call (it blanked or chose a non-annotation tool),
@@ -945,7 +972,12 @@ Plan:
                             },
                             "required": ["x", "y", "z"],
                         },
-                        "description": "Raw 3D points to highlight.",
+                        "description": (
+                            "Raw 3D points to highlight. Each point MUST have a descriptive label: "
+                            "for objects use 'Object <id>: <category>', for anomaly locations use the "
+                            "rich label from get_anomaly_locations (e.g. 'Anomaly 4 foreign_object: "
+                            "overhead monitor/screen, note...'). Never use generic labels like 'Anomaly Location'."
+                        ),
                     },
                     "category": {
                         "type": "string",
@@ -1022,7 +1054,14 @@ Plan:
             "7. Set keep_existing=true ONLY if the user explicitly asked to keep or add to previous "
             "highlights (e.g. 'keep the previous', 'add to the highlights', 'show alongside the "
             "previous'). Otherwise leave it false so previous highlights are cleared first.\n"
-            "8. At most one tool call. Output nothing but the tool call.\n\n"
+            "8. Labels matter: when you include coordinates, each point's label must be descriptive. "
+            "For objects use 'Object <id>: <category>'. For anomaly locations use the exact rich label "
+            "from the get_anomaly_locations result (e.g. 'Anomaly 4 foreign_object: overhead monitor/screen, ...'). "
+            "Never use generic labels like 'Anomaly Location'.\n"
+            "9. Do NOT set inspection_id unless the user explicitly names one inspection (e.g. 'inspection 2'). "
+            "When the user asks about multiple categories or says 'all', leave inspection_id unset so the viewer "
+            "shows matching objects from every inspection and groups them per inspection automatically.\n"
+            "10. At most one tool call. Output nothing but the tool call.\n\n"
             "Examples:\n"
             "- User: 'how many lights were detected?' -> set_rerun_highlight(category='Lights').\n"
             "- User: 'how many ad boards were seen?' -> set_rerun_highlight(category='Advertisement Board').\n"

@@ -391,7 +391,8 @@ class InspectionMarker:
 
     def _query_object(self, object_id: int) -> dict[str, Any] | None:
         cur = self.conn.execute(
-            "SELECT o.id, c.name AS category FROM objects o "
+            "SELECT o.id, c.name AS category, "
+            "o.centroid_x, o.centroid_y, o.centroid_z FROM objects o "
             "LEFT JOIN categories c ON o.category_id = c.id WHERE o.id = ?",
             (object_id,),
         )
@@ -404,7 +405,12 @@ class InspectionMarker:
         """Return (matched_name, rows). category may be exact name,
         case-insensitive name, or slug. rows ordered by id. When
         ``inspection_id`` is given, only objects seen in that inspection
-        (via detections -> images) are returned."""
+        (via detections -> images) are returned.
+
+        Each row includes the object's centroid and the inspection it belongs to
+        (derived from its detections), so missing segmented clouds can fall back
+        to a centroid point and unscoped marks can be grouped per inspection.
+        """
         cats = self._categories()
         wanted = category.strip()
         wanted_slug = category_slug(wanted)
@@ -419,9 +425,16 @@ class InspectionMarker:
                 break
         if match is None:
             return None, []
+        inspection_select = (
+            "(SELECT MIN(i.inspection_id) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) AS inspection_id"
+        )
         if inspection_id is not None:
             cur = self.conn.execute(
-                "SELECT DISTINCT o.id, c.name AS category FROM objects o "
+                "SELECT DISTINCT o.id, c.name AS category, "
+                "o.centroid_x, o.centroid_y, o.centroid_z, "
+                f"{inspection_select} "
+                "FROM objects o "
                 "JOIN categories c ON o.category_id = c.id "
                 "JOIN detections d ON d.object_id = o.id "
                 "JOIN images i ON i.id = d.image_id "
@@ -431,7 +444,10 @@ class InspectionMarker:
             )
         else:
             cur = self.conn.execute(
-                "SELECT o.id, c.name AS category FROM objects o "
+                "SELECT o.id, c.name AS category, "
+                "o.centroid_x, o.centroid_y, o.centroid_z, "
+                f"{inspection_select} "
+                "FROM objects o "
                 "JOIN categories c ON o.category_id = c.id WHERE c.name = ? "
                 "ORDER BY o.id",
                 (match,),
@@ -451,7 +467,7 @@ class InspectionMarker:
     # ------------------------------------------------------------------
 
     def mark_by_id(self, object_id: int) -> None:
-        """Mark one object's segmented point cloud on the map."""
+        """Mark one object's segmented point cloud (or centroid fallback) on the map."""
         row = self._query_object(object_id)
         if row is None:
             print(
@@ -460,19 +476,28 @@ class InspectionMarker:
             )
             return
         pts = self._load_object_cloud(object_id)
+        fallback = False
         if pts is None:
-            print(
-                f"[mark_by_id] id={object_id}: no segmented cloud "
-                f"({self.objects_dir}/{object_id}.pcd)"
-            )
-            return
+            cx, cy, cz = row.get("centroid_x"), row.get("centroid_y"), row.get("centroid_z")
+            if cx is None or cy is None or cz is None:
+                print(
+                    f"[mark_by_id] id={object_id}: no segmented cloud "
+                    f"({self.objects_dir}/{object_id}.pcd) and no centroid"
+                )
+                return
+            pts = np.array([[float(cx), float(cy), float(cz)]], dtype=np.float32)
+            fallback = True
         category = row["category"] or "unknown"
         color = np.array(color_for_category(category), dtype=np.uint8)
         rr.log(
             f"{self.marks_root}/id_{int(object_id)}",
-            rr.Points3D(pts, colors=np.tile(color, (pts.shape[0], 1))),
+            rr.Points3D(
+                pts,
+                colors=np.tile(color, (pts.shape[0], 1)),
+            ),
         )
-        print(f"[mark_by_id] id={object_id} {category}: {pts.shape[0]} pts")
+        fb = " (centroid fallback)" if fallback else ""
+        print(f"[mark_by_id] id={object_id} {category}: {pts.shape[0]} pts{fb}")
 
     def mark_by_ids(self, object_ids: list[int]) -> None:
         """Mark a list of object ids on the map."""
@@ -480,11 +505,17 @@ class InspectionMarker:
             self.mark_by_id(object_id)
 
     def mark_by_category(self, category: str, inspection_id: int | None = None) -> None:
-        """Mark every object's segmented cloud of a category on the map.
+        """Mark every object of a category on the map.
 
         When ``inspection_id`` is given, only that inspection's objects are
-        marked, under a per-inspection entity path so scoped and unscoped
-        marks can coexist."""
+        marked. When ``inspection_id`` is None (the default), objects from ALL
+        inspections are marked, grouped under per-inspection entity paths so the
+        viewer can distinguish which inspection each object belongs to.
+
+        Segmented point clouds are used when available; otherwise the object's
+        centroid is logged as a fallback point so nothing disappears from the
+        viewer.
+        """
         match, rows = self._query_objects_by_category(category, inspection_id=inspection_id)
         if match is None:
             print(
@@ -493,28 +524,53 @@ class InspectionMarker:
             )
             return
         color = np.array(color_for_category(match), dtype=np.uint8)
-        chunks, ids = [], []
+
+        # Group by inspection so unscoped marks are still organized per inspection.
+        from collections import defaultdict
+        by_inspection: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+        fallback_ids: list[int] = []
         for r in rows:
             pts = self._load_object_cloud(r["id"])
-            if pts is not None:
-                chunks.append(pts)
-                ids.append(int(r["id"]))
-        if not chunks:
+            if pts is None:
+                cx, cy, cz = r.get("centroid_x"), r.get("centroid_y"), r.get("centroid_z")
+                if cx is not None and cy is not None and cz is not None:
+                    pts = np.array([[float(cx), float(cy), float(cz)]], dtype=np.float32)
+                    fallback_ids.append(int(r["id"]))
+            if pts is None:
+                continue
+            insp = int(r["inspection_id"]) if r.get("inspection_id") is not None else 0
+            by_inspection[insp].append((int(r["id"]), pts))
+
+        if not by_inspection:
             scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
-            print(f"[mark_by_category] '{match}'{scope}: no segmented clouds found")
+            print(f"[mark_by_category] '{match}'{scope}: no clouds or centroids found")
             return
-        pts = np.concatenate(chunks)
-        ent = f"{self.marks_root}/cat_{category_slug(match)}"
-        if inspection_id is not None:
-            ent += f"/insp_{int(inspection_id)}"
-        rr.log(
-            ent,
-            rr.Points3D(pts, colors=np.tile(color, (pts.shape[0], 1))),
-        )
-        scope = f" inspection {inspection_id}," if inspection_id is not None else ""
+
+        total_pts = 0
+        total_objs = 0
+        for insp, pairs in sorted(by_inspection.items()):
+            chunks = [pts for _, pts in pairs]
+            ids = [oid for oid, _ in pairs]
+            pts = np.concatenate(chunks)
+            ent = f"{self.marks_root}/cat_{category_slug(match)}/insp_{insp}"
+            rr.log(
+                ent,
+                rr.Points3D(
+                    pts,
+                    colors=np.tile(color, (pts.shape[0], 1)),
+                ),
+            )
+            total_pts += pts.shape[0]
+            total_objs += len(ids)
+            print(
+                f"[mark_by_category] '{match}' inspection {insp}: "
+                f"{len(ids)} objects, {pts.shape[0]} pts (ids {ids[0]}..{ids[-1]})"
+            )
+        fb = f" ({len(fallback_ids)} centroid fallback)" if fallback_ids else ""
+        scope = f" inspection {inspection_id}," if inspection_id is not None else " all inspections,"
         print(
-            f"[mark_by_category] '{match}':{scope} {len(ids)} objects, "
-            f"{pts.shape[0]} pts (ids {ids[0]}..{ids[-1]})"
+            f"[mark_by_category] '{match}':{scope} {total_objs} objects, "
+            f"{total_pts} pts{fb}"
         )
 
     def clean_markings(self) -> None:
