@@ -42,6 +42,7 @@ export default function App() {
   const [runtime, setRuntime] = useState(INITIAL_RUNTIME);
   const [toolCalls, setToolCalls] = useState([]);
   const [toolRouterRaw, setToolRouterRaw] = useState(null);
+  const [highlightInfo, setHighlightInfo] = useState(null);
 
   // Coordination refs shared across callbacks
   const isSpacePressedRef = useRef(false);
@@ -165,6 +166,9 @@ export default function App() {
         }
         if (msg.tool_router_raw) {
           setToolRouterRaw({ requestId, raw: msg.tool_router_raw });
+        }
+        if (msg.highlight) {
+          setHighlightInfo({ requestId, ...msg.highlight });
         }
         return;
       }
@@ -446,7 +450,7 @@ export default function App() {
         />
         <ChatHistory chatHistory={chatHistory} />
         <ImageAnnotator disabled={socketState !== "connected"} />
-        <DebugPanel toolCalls={toolCalls} toolRouterRaw={toolRouterRaw} />
+        <DebugPanel toolCalls={toolCalls} toolRouterRaw={toolRouterRaw} highlight={highlightInfo} />
         <ReportImageGallery />
       </main>
 

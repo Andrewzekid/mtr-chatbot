@@ -72,9 +72,9 @@ class Settings(BaseSettings):
 
     # Inspection SQLite database (MTR object grounding results).
     # New multi-inspection schema: categories / inspections / images / objects / detections
-    # (plus anomaly_types / abnormal_detections / abnormalities, added by the writer later).
+    # plus the populated anomaly tables: anomaly_types / abnormal_detections / abnormalities.
     # Relative paths resolve against the backend/ root (see model_post_init).
-    inspection_db_path: str = "../MTR Inspection Database/inspection_v2.db"
+    inspection_db_path: str = "../MTR Inspection Database/inspection_v2_mtr_new.db"
 
     # Inspection anomaly reports (text + PDF summaries)
     reports_dir: str = "../reports"

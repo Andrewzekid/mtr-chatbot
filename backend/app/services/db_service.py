@@ -63,6 +63,11 @@ class InspectionDBClient:
         """Status string from the final-pass Rerun highlight (None if nothing was pushed)."""
         return self._last_highlight_status
 
+    @property
+    def last_highlight_args(self) -> dict[str, Any] | None:
+        """Normalized args of the last Rerun highlight push (for the debug panel)."""
+        return self._last_highlight_args
+
     def _record_tool_calls(self, tool_calls: list[tuple[str, dict[str, Any]]]) -> None:
         self._last_tool_calls = [
             {"name": name, "args": args} for name, args in tool_calls
@@ -120,6 +125,9 @@ class InspectionDBClient:
         self._last_query: str = ""
         self._last_chat_history: list[tuple[str, str]] = []
         self._last_highlight_status: str | None = None
+        # Normalized args of the last Rerun highlight (decider, explicit tool, or
+        # merged fallback) so the debug panel can show what was pushed to the viewer.
+        self._last_highlight_args: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Timestamp / image helpers
@@ -323,7 +331,11 @@ class InspectionDBClient:
             "(SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
             "WHERE d.object_id=o.id) AS first_seen_ns, "
             "(SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id "
-            "WHERE d.object_id=o.id) AS last_seen_ns "
+            "WHERE d.object_id=o.id) AS last_seen_ns, "
+            # Each object belongs to exactly one inspection (verified on the current DB),
+            # so MIN is just a safe scalar pick of that single inspection id.
+            "(SELECT MIN(i.inspection_id) FROM detections d JOIN images i ON i.id=d.image_id "
+            "WHERE d.object_id=o.id) AS inspection_id "
             "FROM objects o JOIN categories c ON c.id=o.category_id"
             + where + order_clause + limit_clause
         )
@@ -397,6 +409,34 @@ class InspectionDBClient:
             """
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def _inspection_meta(self) -> dict[int, bool]:
+        """Map inspection id -> is_gt flag (empty dict if no inspections table rows)."""
+        try:
+            return {ins["id"]: bool(ins["is_gt"]) for ins in self.get_inspections()}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _inspection_tag(self, inspection_id: Any, meta: dict[int, bool]) -> str:
+        """Short label like 'inspection 2' or 'inspection 1 (ground truth)'."""
+        if inspection_id is None:
+            return "unknown inspection"
+        tag = f"inspection {inspection_id}"
+        if meta.get(int(inspection_id)):
+            tag += " (ground truth)"
+        return tag
+
+    def _category_counts_by_inspection(self, category: str) -> list[dict[str, Any]]:
+        """Distinct object counts for one category, broken down per inspection."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT i.inspection_id, COUNT(DISTINCT o.id) AS count "
+            "FROM objects o JOIN categories c ON c.id=o.category_id "
+            "JOIN detections d ON d.object_id=o.id JOIN images i ON i.id=d.image_id "
+            "WHERE c.name=? GROUP BY i.inspection_id ORDER BY i.inspection_id",
+            (category,),
+        ).fetchall()
+        return [{"inspection_id": row["inspection_id"], "count": row["count"]} for row in rows]
 
     def query_database(self, sql_query: str, limit: int | str | None = 100) -> dict[str, Any]:
         """Execute a read-only SELECT query and return the results."""
@@ -560,7 +600,9 @@ class InspectionDBClient:
                    (SELECT MIN(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id
                     WHERE d.object_id=o.id) AS first_seen_ns,
                    (SELECT MAX(i.timestamp_ns) FROM detections d JOIN images i ON i.id=d.image_id
-                    WHERE d.object_id=o.id) AS last_seen_ns
+                    WHERE d.object_id=o.id) AS last_seen_ns,
+                   (SELECT MIN(i.inspection_id) FROM detections d JOIN images i ON i.id=d.image_id
+                    WHERE d.object_id=o.id) AS inspection_id
             FROM objects o JOIN categories c ON c.id=o.category_id
             WHERE o.id = ?
             """,
@@ -1272,10 +1314,12 @@ class InspectionDBClient:
             params.append(limit)
         rows = conn.execute(
             f"""
-            SELECT ab.id, t.name AS type, ab.min_x, ab.min_y, ab.max_x, ab.max_y, ab.note,
-                   ad.id AS pair_id, ad.gt_image, ad.inspection_image,
+            SELECT ab.id, t.name AS type, ab.object, ab.location,
+                   ab.min_x, ab.min_y, ab.max_x, ab.max_y, ab.note,
+                   ad.id AS pair_id, ad.gt_image, ad.inspection_image, ad.summary AS pair_summary,
                    gi.filename AS gt_filename, ii.filename AS inspection_filename,
-                   ii.inspection_id
+                   ii.inspection_id,
+                   ii.tf_translation_x AS cam_x, ii.tf_translation_y AS cam_y, ii.tf_translation_z AS cam_z
             FROM abnormalities ab
             JOIN anomaly_types t ON t.id=ab.type
             JOIN abnormal_detections ad ON ad.id=ab.pair
@@ -1291,8 +1335,88 @@ class InspectionDBClient:
             d = dict(row)
             d["gt_image_url"] = self._image_url(row["gt_filename"])
             d["inspection_image_url"] = self._image_url(row["inspection_filename"])
+            # The reports dir holds an annotated counterpart of the ground-truth
+            # frame (<gt_image_id>_result.jpg, anomaly bboxes drawn) — same frame,
+            # same viewpoint. Link it when present.
+            d["annotated_result_url"] = self._annotated_result_url(row["gt_image"])
             out.append(d)
         return out
+
+    def _annotated_result_url(self, gt_image_id: Any) -> str | None:
+        """URL of the annotated result image for a ground-truth image id, if on disk."""
+        if not self.settings or gt_image_id is None:
+            return None
+        reports_dir = getattr(self.settings, "reports_dir", None)
+        if not reports_dir:
+            return None
+        try:
+            candidate = Path(reports_dir) / f"{int(gt_image_id)}_result.jpg"
+        except (TypeError, ValueError):
+            return None
+        if candidate.exists():
+            return f"/reports/reference/{candidate.name}"
+        return None
+
+    def get_anomaly_locations(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """3D location of each anomaly, derived from the camera pose of the images.
+
+        Every abnormal pair links a ground-truth image (``gt_image``) and an
+        inspection image (``inspection_image``) to the ``images`` table, which stores
+        the camera pose (``tf_translation_x/y/z``) where that frame was taken. The
+        inspection frame's position is where the robot observed the anomaly; the
+        ground-truth frame's position is the reference viewpoint of the same spot.
+        One row per abnormal pair, with the pair's abnormality types aggregated.
+        """
+        if not self._anomaly_tables_exist():
+            return []
+        conn = self._connect()
+        where = " WHERE ii.inspection_id=?" if inspection_id is not None else ""
+        params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
+        rows = conn.execute(
+            f"""
+            SELECT ad.id AS pair_id, ii.inspection_id,
+                   ii.tf_translation_x AS cam_x, ii.tf_translation_y AS cam_y, ii.tf_translation_z AS cam_z,
+                   gi.tf_translation_x AS gt_x, gi.tf_translation_y AS gt_y, gi.tf_translation_z AS gt_z,
+                   GROUP_CONCAT(DISTINCT t.name) AS types,
+                   GROUP_CONCAT(DISTINCT ab.object) AS objects
+            FROM abnormal_detections ad
+            JOIN abnormalities ab ON ab.pair = ad.id
+            JOIN anomaly_types t ON t.id = ab.type
+            JOIN images ii ON ii.id = ad.inspection_image
+            JOIN images gi ON gi.id = ad.gt_image
+            {where}
+            GROUP BY ad.id
+            ORDER BY ad.id
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def anomaly_location_points(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+        """Anomaly markers as Rerun coordinate dicts: {x, y, z, label, color} (orange)."""
+        points: list[dict[str, Any]] = []
+        for row in self.get_anomaly_locations(inspection_id=inspection_id):
+            x, y, z = row.get("cam_x"), row.get("cam_y"), row.get("cam_z")
+            if x is None or y is None or z is None:
+                # Fall back to the ground-truth frame's position if the
+                # inspection frame has no pose stored.
+                x, y, z = row.get("gt_x"), row.get("gt_y"), row.get("gt_z")
+            if x is None or y is None or z is None:
+                continue
+            label = row.get("types") or "anomaly"
+            points.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "label": label,
+                    "color": [255, 170, 0, 255],
+                    # Larger than ordinary object points (0.15) so anomaly markers
+                    # stand out clearly in the viewer.
+                    "radius": 0.35,
+                }
+            )
+        return points
 
     def run_sql_query(self, query: str, limit: int | str | None = 100) -> dict[str, Any]:
         """Execute a read-only SELECT query and return the results."""
@@ -1339,6 +1463,8 @@ class InspectionDBClient:
         """
         self._last_query = query
         self._last_chat_history = list(chat_history) if chat_history else []
+        self._last_highlight_status = None
+        self._last_highlight_args = None
         if not query.strip():
             return None
 
@@ -1392,6 +1518,43 @@ class InspectionDBClient:
                     break
                 prior_results.extend(round_results)
 
+            # Safety net: the router LLM is the gatekeeper, but it occasionally returns
+            # no tool calls at all, leaving the answering model to invent categories or
+            # subtypes. When the query names a real category ("show me the lights",
+            # "how many lights"), or is a broad object question ("tell me about all the
+            # objects"), fetch the real data deterministically.
+            if not all_tool_calls:
+                net_calls = self._safety_net_calls(query)
+                if net_calls:
+                    logger.info("Router called no tools; running safety-net calls %s for query: %r", net_calls, query)
+                    for name, args in net_calls:
+                        result = await self._execute_tool(name, args, chat_history=chat_history)
+                        all_tool_results.append({"name": name, "args": args, "output": result})
+                        all_tool_calls.append((name, args))
+                        if result:
+                            prior_results.append(result)
+
+            # Anomaly completeness: for ANY anomaly-related question the answerer always
+            # needs the same trio — the report data (get_report_summary), the 3D anomaly
+            # coordinates (get_anomaly_locations), and the anomaly details with images
+            # (get_anomalies). The router often calls only a subset (e.g. just locations
+            # for a 'where' question); top up whichever ones it did not call.
+            if self._anomaly_tables_exist() and self._ANOMALY_QUERY_RE.search(query):
+                called_names = {name for name, _ in all_tool_calls}
+                top_up = [
+                    (name, {})
+                    for name in ("get_report_summary", "get_anomaly_locations", "get_anomalies")
+                    if name not in called_names
+                ]
+                if top_up:
+                    logger.info("Anomaly query top-up: running %s for query: %r", top_up, query)
+                    for name, args in top_up:
+                        result = await self._execute_tool(name, args, chat_history=chat_history)
+                        all_tool_results.append({"name": name, "args": args, "output": result})
+                        all_tool_calls.append((name, args))
+                        if result:
+                            prior_results.append(result)
+
             self._record_tool_calls(all_tool_calls)
             self._record_tool_results(all_tool_results)
 
@@ -1407,7 +1570,6 @@ class InspectionDBClient:
             # which objects/coordinates to show in the Rerun viewer (replaces the old regex
             # auto-highlight). Skip if the router already pushed an explicit highlight_in_rerun
             # this turn, or if nothing tool-bearing ran.
-            self._last_highlight_status = None
             highlight_called = any(
                 name == "highlight_in_rerun" for name, _ in all_tool_calls
             )
@@ -1427,10 +1589,180 @@ class InspectionDBClient:
                 if decision:
                     self._last_highlight_status = self._apply_highlight_decision(decision)
 
+                # Fallback: if the user asked about objects of a category and the LLM
+                # decider still did not highlight anything, ensure the relevant category
+                # (or categories for proximity queries) is shown in the 3D viewer. This
+                # covers count/list queries, proximity queries, and image-returning tools.
+                # ALL relevant tool calls contribute: categories are merged into one set
+                # so multi-category questions ("show me all lights and advertisement
+                # boards") highlight every category, not just the first tool call.
+                if not self._last_highlight_status:
+                    merged_categories: list[str] = []
+                    merged_coordinates: list[dict[str, Any]] = []
+                    merged_object_ids: list[int] = []
+                    anomaly_coords_added = False
+                    for name, args in all_tool_calls:
+                        if name in {
+                            "get_category_objects_with_images",
+                            "get_category_sample_images",
+                            "get_images_in_time_range",
+                            "get_objects_by_category",
+                            "get_category_objects_coordinates",
+                            "get_objects_by_category_in_time_range",
+                            "get_category_timeline",
+                            "get_category_detection_timeline",
+                        }:
+                            cat = args.get("category")
+                            if cat:
+                                canon = self._canonical_category(cat)
+                                if canon not in merged_categories:
+                                    merged_categories.append(canon)
+                        elif name in {"get_category_proximity", "get_category_proximity_with_images"}:
+                            target = args.get("target_category")
+                            others = args.get("other_categories") or []
+                            for c in [target] + list(others):
+                                if c:
+                                    canon = self._canonical_category(c)
+                                    if canon not in merged_categories:
+                                        merged_categories.append(canon)
+                        elif name == "get_category_windows":
+                            for c in args.get("categories") or []:
+                                if c:
+                                    canon = self._canonical_category(c)
+                                    if canon not in merged_categories:
+                                        merged_categories.append(canon)
+                        elif name in {"get_object_by_id", "get_object_timeline", "get_object_image_paths", "get_object_movement"}:
+                            oid = args.get("object_id")
+                            if oid is not None and int(oid) not in merged_object_ids:
+                                merged_object_ids.append(int(oid))
+                        elif name in {"get_anomalies", "get_anomaly_summary", "get_anomaly_locations", "get_report_summary"}:
+                            # Anomaly questions: mark the anomaly locations (camera
+                            # positions of the abnormal image pairs) in the 3D viewer.
+                            # Added once per query even when several anomaly tools ran.
+                            if not anomaly_coords_added:
+                                anomaly_coords_added = True
+                                ins_ids = {
+                                    int(a["inspection_id"])
+                                    for n, a in all_tool_calls
+                                    if n in {"get_anomalies", "get_anomaly_summary", "get_anomaly_locations"}
+                                    and a.get("inspection_id") is not None
+                                }
+                                merged_coordinates.extend(
+                                    self.anomaly_location_points(
+                                        inspection_id=ins_ids.pop() if len(ins_ids) == 1 else None
+                                    )
+                                )
+                        elif name in {"get_summary", "get_categories"}:
+                            # Broad "tell me about all the objects" queries: every
+                            # category is relevant, so highlight them all.
+                            for c in self.get_categories():
+                                if c not in merged_categories:
+                                    merged_categories.append(c)
+                    if merged_categories or merged_coordinates or merged_object_ids:
+                        highlight_args: dict[str, Any] = {}
+                        if merged_categories:
+                            highlight_args["categories"] = merged_categories
+                        if merged_object_ids:
+                            highlight_args["object_ids"] = merged_object_ids
+                        if merged_coordinates:
+                            highlight_args["coordinates"] = merged_coordinates
+                            highlight_args["label"] = "anomaly locations"
+                        # If every contributing tool call was scoped to the same
+                        # inspection, scope the highlight too so the viewer marks only
+                        # that inspection's objects of the category.
+                        scoped = {
+                            int(args["inspection_id"])
+                            for name, args in all_tool_calls
+                            if args.get("inspection_id") is not None
+                            and name
+                            in {
+                                "get_category_objects_with_images",
+                                "get_category_sample_images",
+                                "get_images_in_time_range",
+                                "get_objects_by_category",
+                                "get_category_objects_coordinates",
+                                "get_objects_by_category_in_time_range",
+                                "get_category_timeline",
+                                "get_category_detection_timeline",
+                                "get_category_proximity",
+                                "get_category_proximity_with_images",
+                                "get_category_windows",
+                            }
+                        }
+                        if len(scoped) == 1:
+                            highlight_args["inspection_id"] = scoped.pop()
+                        try:
+                            self._last_highlight_status = self._highlight_in_rerun(highlight_args)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Tool fallback highlight failed: %s", exc)
+
             return db_context
         except Exception as exc:
             logger.warning("LLM router execution failed: %s", exc)
             return None
+
+    # Matches queries that are clearly about the inspection's objects/categories even
+    # when no specific category is named (used by the no-tool-calls safety net).
+    _BROAD_OBJECT_QUERY_RE = re.compile(
+        r"\b(objects?|categor(?:y|ies)|detections?|detected|found|scene|inspection|seen|saw)\b",
+        re.IGNORECASE,
+    )
+
+    # Show-intent words: the user wants frames/images, not just counts.
+    _SHOW_INTENT_RE = re.compile(
+        r"\b(show|see|display|images?|pictures?|photos?|frames?|look)\b",
+        re.IGNORECASE,
+    )
+
+    # Anomaly/report questions: fetch the structured anomaly data, not object counts.
+    _ANOMALY_QUERY_RE = re.compile(
+        r"\b(anomal(?:y|ies)|abnormal|findings?|issues?|problems?|defects?|report)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _query_is_about_objects(cls, query: str) -> bool:
+        return bool(cls._BROAD_OBJECT_QUERY_RE.search(query))
+
+    def _mentioned_categories(self, query: str, max_categories: int = 3) -> list[str]:
+        """Canonical DB categories explicitly named in the query (longest alias first)."""
+        q = query.lower()
+        candidates: list[tuple[str, str]] = [
+            (alias, canonical) for alias, canonical in self._CATEGORY_ALIASES.items()
+        ]
+        candidates += [(c.lower(), c) for c in self.get_categories()]
+        candidates.sort(key=lambda item: len(item[0]), reverse=True)
+        found: list[str] = []
+        for needle, canonical in candidates:
+            if canonical in found:
+                continue
+            if re.search(r"\b" + re.escape(needle) + r"s?\b", q):
+                found.append(canonical)
+                if len(found) >= max_categories:
+                    break
+        return found
+
+    def _safety_net_calls(self, query: str) -> list[tuple[str, dict[str, Any]]]:
+        """Deterministic tool calls when the router returned nothing.
+
+        Category-named queries get that category's real data (images for show-intent,
+        object list otherwise); anomaly questions get the structured anomaly data;
+        broad object questions get the overall summary and category list. Anything
+        else (greetings, chit-chat) stays untouched.
+        """
+        if self._ANOMALY_QUERY_RE.search(query) and self._anomaly_tables_exist():
+            return [("get_anomaly_summary", {}), ("get_anomalies", {"limit": 5})]
+        categories = self._mentioned_categories(query)
+        if categories:
+            if self._SHOW_INTENT_RE.search(query):
+                return [
+                    ("get_category_objects_with_images", {"category": c, "limit": 5})
+                    for c in categories
+                ]
+            return [("get_objects_by_category", {"category": c}) for c in categories]
+        if self._query_is_about_objects(query):
+            return [("get_summary", {}), ("get_categories", {})]
+        return []
 
     @staticmethod
     def _tool_call_key(name: str, args: dict[str, Any]) -> str:
@@ -1505,7 +1837,7 @@ class InspectionDBClient:
             if tool_name == "get_category_objects_with_images":
                 return self._format_category_objects_with_images(
                     self._canonical_category(args["category"]),
-                    limit=self._resolve_limit(args.get("limit"), default=None),
+                    limit=self._resolve_limit(args.get("limit"), default=5),
                     inspection_id=_inspection_id(),
                 )
             if tool_name == "get_category_proximity":
@@ -1564,7 +1896,7 @@ class InspectionDBClient:
                 )
             if tool_name == "get_category_sample_images":
                 return self._format_category_sample_images(
-                    self._canonical_category(args["category"]), limit=self._resolve_limit(args.get("limit"), default=None), inspection_id=_inspection_id()
+                    self._canonical_category(args["category"]), limit=self._resolve_limit(args.get("limit"), default=5), inspection_id=_inspection_id()
                 )
             if tool_name == "get_inspection_poses":
                 return self._format_inspection_poses(limit=self._resolve_limit(args.get("limit"), default=None), inspection_id=_inspection_id())
@@ -1619,8 +1951,21 @@ class InspectionDBClient:
                 sql = args.get("query") or args.get("sql_query") or ""
                 return self._format_sql_query_result(sql, limit=self._resolve_limit(args.get("limit"), default=100))
             if tool_name == "get_report_summary":
-                # Report context is fetched and injected by the LLM service.
-                return None
+                # The prose report context is fetched and injected by the LLM service.
+                # Return the live structured anomaly data here so the answerer can
+                # cross-reference what the report describes against the current
+                # database records (counts, types, affected objects, locations).
+                if not self._anomaly_tables_exist():
+                    return None
+                sections = [
+                    "The prose inspection report is attached separately as report context. "
+                    "Below is the LIVE structured anomaly data from the database — use it to "
+                    "ground and verify what the report talks about. If the prose report and "
+                    "the database disagree, the database is newer: trust the database.",
+                    self._format_anomaly_summary(),
+                    self._format_anomaly_locations(),
+                ]
+                return "\n\n".join(s for s in sections if s)
             if tool_name == "get_anomaly_types":
                 return self._format_anomaly_types()
             if tool_name == "get_anomaly_summary":
@@ -1631,28 +1976,43 @@ class InspectionDBClient:
                     inspection_id=_inspection_id(),
                     limit=self._resolve_limit(args.get("limit"), default=None),
                 )
+            if tool_name == "get_anomaly_locations":
+                return self._format_anomaly_locations(inspection_id=_inspection_id())
         except Exception as exc:
             logger.warning("Tool execution failed for %s with args %s: %s", tool_name, args, exc)
         return None
 
     def _highlight_in_rerun(self, args: dict[str, Any]) -> str:
-        if self.rerun_visualizer is None:
-            return "Rerun visualization is not configured on this backend."
         object_ids = args.get("object_ids") or []
         if isinstance(object_ids, (int, float)):
             object_ids = [int(object_ids)]
         object_ids = [int(o) for o in object_ids if o is not None]
         coords = args.get("coordinates") or []
         category = self._canonical_category(args["category"]) if args.get("category") else None
+        categories = [
+            self._canonical_category(c)
+            for c in (args.get("categories") or [])
+            if c
+        ]
         keep_existing = bool(args.get("keep_existing")) or self._query_wants_keep(self._last_query)
-        return self.rerun_visualizer.highlight(
-            object_ids=object_ids or None,
-            coordinates=coords or None,
-            category=category,
-            inspection_id=int(args["inspection_id"]) if args.get("inspection_id") is not None else None,
-            label=args.get("label"),
-            keep_existing=keep_existing,
-        )
+        normalized: dict[str, Any] = {
+            "object_ids": object_ids or None,
+            "coordinates": coords or None,
+            "category": category,
+            "categories": categories or None,
+            "inspection_id": int(args["inspection_id"]) if args.get("inspection_id") is not None else None,
+            "label": args.get("label"),
+            "keep_existing": keep_existing,
+        }
+        if self.rerun_visualizer is None:
+            status = "Rerun visualization is not configured on this backend."
+            self._last_highlight_args = normalized
+            self._last_highlight_status = status
+            return status
+        status = self.rerun_visualizer.highlight(**normalized)
+        self._last_highlight_args = normalized
+        self._last_highlight_status = status
+        return status
 
     # ------------------------------------------------------------------
     # Final-pass Rerun highlighting (decided by the router after tools run)
@@ -1696,17 +2056,30 @@ class InspectionDBClient:
             if decision.get("category")
             else None
         )
+        categories = [
+            self._canonical_category(c)
+            for c in (decision.get("categories") or [])
+            if c
+        ]
         label = decision.get("label") or "final"
         keep_existing = bool(decision.get("keep_existing")) or self._query_wants_keep(self._last_query)
+        normalized: dict[str, Any] = {
+            "object_ids": object_ids or None,
+            "coordinates": coords or None,
+            "category": category,
+            "categories": categories or None,
+            "inspection_id": (
+                int(decision["inspection_id"])
+                if decision.get("inspection_id") is not None
+                else None
+            ),
+            "label": label,
+            "keep_existing": keep_existing,
+        }
         try:
-            return self.rerun_visualizer.highlight(
-                object_ids=object_ids or None,
-                coordinates=coords or None,
-                category=category,
-                inspection_id=None,
-                label=label,
-                keep_existing=keep_existing,
-            )
+            status = self.rerun_visualizer.highlight(**normalized)
+            self._last_highlight_args = normalized
+            return status
         except Exception as exc:  # noqa: BLE001
             logger.warning("Final-pass Rerun highlight failed: %s", exc)
             return None
@@ -1812,6 +2185,10 @@ class InspectionDBClient:
             if not self.settings:
                 return None
             return Path(self.settings.inspection_image_dir) / Path(image_url).name
+        if image_url.startswith("/reports/reference/"):
+            if not self.settings:
+                return None
+            return Path(self.settings.reports_dir) / Path(image_url).name
         if image_url.startswith("/reports/extracted_images/") or image_url.startswith("/reports/images/"):
             if not self.settings:
                 return None
@@ -1829,6 +2206,7 @@ class InspectionDBClient:
             candidates = [
                 Path(self.settings.inspection_image_dir) / raw,
                 Path(self.settings.reports_dir) / "extracted_images" / raw,
+                Path(self.settings.reports_dir) / raw,
             ]
             for candidate in candidates:
                 if candidate.exists():
@@ -1889,6 +2267,19 @@ class InspectionDBClient:
             lines.append("Objects by category:")
             for row in data["categories"]:
                 lines.append(f"- {row['category']}: {row['count']}")
+        if inspection_id is None:
+            inspections = self.get_inspections()
+            if len(inspections) > 1:
+                lines.append(
+                    "NOTE: the totals above COMBINE all inspections. Per-inspection breakdown "
+                    "(each is a separate run — do not blend them when the user asks about 'the inspection'):"
+                )
+                for ins in inspections:
+                    gt = " (ground truth)" if ins["is_gt"] else ""
+                    lines.append(
+                        f"- Inspection {ins['id']}{gt}: started {ins['started_at']}, "
+                        f"{ins['object_count']} object(s), {ins['detection_count']} detection(s)"
+                    )
         if data.get("objects"):
             lines.append("Notable objects (by detection count):")
             for obj in data["objects"][:5]:
@@ -1932,16 +2323,31 @@ class InspectionDBClient:
         counts = self._category_counts(inspection_id=inspection_id)
         total = next((c["count"] for c in counts if c["category"] == category), len(objects))
 
-        if total == len(objects):
-            lines = [f"Found {total} object(s) in category '{category}'{scope}. Object IDs:"]
+        meta = self._inspection_meta()
+        multi = inspection_id is None and len(meta) > 1
+
+        if multi:
+            per = self._category_counts_by_inspection(category)
+            breakdown = ", ".join(
+                f"{self._inspection_tag(row['inspection_id'], meta)}: {row['count']}" for row in per
+            )
+            header = (
+                f"Found {total} object(s) in category '{category}' across {len(meta)} inspections "
+                f"({breakdown}). These are SEPARATE counts per inspection run — do not add them up "
+                f"unless the user explicitly wants a combined total."
+            )
+        elif total == len(objects):
+            header = f"Found {total} object(s) in category '{category}'{scope}."
         else:
-            lines = [
+            header = (
                 f"Found {total} object(s) in category '{category}'{scope} "
-                f"(showing first {len(objects)}). Object IDs:"
-            ]
+                f"(showing first {len(objects)})."
+            )
+        lines = [header + " Object IDs:"]
         for obj in objects:
+            tag = f" [{self._inspection_tag(obj.get('inspection_id'), meta)}]" if multi else ""
             lines.append(
-                f"- Object {obj['id']}: {obj['detection_count']} detections, "
+                f"- Object {obj['id']}{tag}: {obj['detection_count']} detections, "
                 f"{self._format_xyz(obj['centroid_x'], obj['centroid_y'], obj['centroid_z'], prefix='centroid ')}"
             )
         lines.append(f"To see frames, say: 'show me images of object {objects[0]['id']}'.")
@@ -1951,9 +2357,11 @@ class InspectionDBClient:
         obj = self.get_object_by_id(object_id)
         if obj is None:
             return f"No object found with object ID {object_id}."
+        meta = self._inspection_meta()
         lines = [
             f"Object ID: {obj['id']}",
             f"Category: {obj['category']}",
+            f"Inspection: {self._inspection_tag(obj.get('inspection_id'), meta)}",
             f"Detections: {obj['detection_count']}",
             f"Centroid: {self._format_xyz(obj['centroid_x'], obj['centroid_y'], obj['centroid_z'])}",
             f"First seen: {self._format_timestamp(obj.get('first_seen_ns'))}",
@@ -1968,10 +2376,13 @@ class InspectionDBClient:
         objects = self.get_top_objects(n, inspection_id=inspection_id)
         if not objects:
             return "No objects found in the database."
+        meta = self._inspection_meta()
+        multi = inspection_id is None and len(meta) > 1
         lines = [f"Top {len(objects)} objects by detection count. Object IDs:"]
         for obj in objects:
+            tag = f" [{self._inspection_tag(obj.get('inspection_id'), meta)}]" if multi else ""
             lines.append(
-                f"- Object {obj['id']} ({obj['category']}): "
+                f"- Object {obj['id']} ({obj['category']}){tag}: "
                 f"{obj['detection_count']} detections"
             )
         lines.append("To see frames for an object, ask: 'show me images of object [ID]'.")
@@ -1981,10 +2392,13 @@ class InspectionDBClient:
         objects = self.get_recent_objects(limit, inspection_id=inspection_id)
         if not objects:
             return "No objects found in the database."
+        meta = self._inspection_meta()
+        multi = inspection_id is None and len(meta) > 1
         lines = [f"{len(objects)} most recently seen object(s). Object IDs:"]
         for obj in objects:
+            tag = f" [{self._inspection_tag(obj.get('inspection_id'), meta)}]" if multi else ""
             lines.append(
-                f"- Object {obj['id']} ({obj['category']}): "
+                f"- Object {obj['id']} ({obj['category']}){tag}: "
                 f"last seen at {self._format_timestamp(obj['last_seen_ns'])}"
             )
         lines.append("To see frames, ask: 'show me images of object [ID]'.")
@@ -2007,9 +2421,18 @@ class InspectionDBClient:
         objects = self.get_category_objects_with_images(category, limit, inspection_id=inspection_id)
         if not objects:
             return f"No objects found in category '{category}'."
-        limit_note = f" (showing {len(objects)} of up to {limit})" if limit is not None else ""
+        total = next(
+            (c["count"] for c in self._category_counts(inspection_id) if c["category"] == category),
+            len(objects),
+        )
+        is_subset = len(objects) < total
+        scope_note = (
+            f" (representative subset: showing {len(objects)} of {total} '{category}' objects)"
+            if is_subset
+            else f" (all {len(objects)} object(s))"
+        )
         lines = [
-            f"Objects in category '{category}' with object IDs, coordinates, and sample images{limit_note}:"
+            f"Objects in category '{category}' with object IDs, coordinates, and sample images{scope_note}:"
         ]
         for obj in objects:
             lines.append(
@@ -2020,6 +2443,11 @@ class InspectionDBClient:
             sample_url = self._image_url(obj.get("sample_image_path"))
             if sample_url:
                 lines.append(f"  ![sample frame]({sample_url})")
+        if is_subset:
+            lines.append(
+                f"These are a representative subset of the '{category}' objects — "
+                "ask if you'd like to see more images."
+            )
         lines.append("To see more frames for an object, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
@@ -2314,13 +2742,18 @@ class InspectionDBClient:
         image_urls = self.get_category_sample_images(category, limit, inspection_id=inspection_id)
         if not image_urls:
             return f"No sample images found for category '{category}'."
-        lines = [f"Sample images for category '{category}'. Object IDs visible in each frame are listed below the image:"]
+        lines = [f"Sample images for category '{category}' ({len(image_urls)} frame(s)). Object IDs visible in each frame are listed below the image:"]
         for url in image_urls:
             filename = Path(url).name
             obj_info = self._image_objects_info(filename)
             lines.append(f"![frame]({url})")
             if obj_info:
                 lines.append(f"Objects in this frame: {obj_info}")
+        if limit is not None:
+            lines.append(
+                f"These are a representative subset of the '{category}' frames — "
+                "ask if you'd like to see more images."
+            )
         lines.append("To see more frames for an object, ask: 'show me images of object [ID]'.")
         return "\n".join(lines)
 
@@ -2594,12 +3027,49 @@ class InspectionDBClient:
             lines.append(
                 f"- Abnormality {r['id']} (inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
             )
+            if r.get("object"):
+                lines.append(f"  object: {r['object']}")
+            if r.get("location"):
+                lines.append(f"  location in scene: {r['location']}")
             if r.get("note"):
                 lines.append(f"  note: {r['note']}")
+            if r.get("pair_summary"):
+                lines.append(f"  pair summary: {r['pair_summary']}")
+            if r.get("cam_x") is not None:
+                lines.append(
+                    f"  observed from camera position {self._format_xyz(r['cam_x'], r['cam_y'], r['cam_z'])} "
+                    f"(marked in the Rerun viewer)"
+                )
             if r.get("inspection_image_url"):
                 lines.append(f"  inspection frame: ![inspection frame]({r['inspection_image_url']})")
             if r.get("gt_image_url"):
                 lines.append(f"  ground-truth frame: ![gt frame]({r['gt_image_url']})")
+            if r.get("annotated_result_url"):
+                lines.append(
+                    f"  annotated result (same frame with anomaly boxes drawn): "
+                    f"![annotated result]({r['annotated_result_url']})"
+                )
+        return "\n".join(lines)
+
+    def _format_anomaly_locations(self, inspection_id: int | None = None) -> str:
+        if not self._anomaly_tables_exist():
+            return "Anomaly tables (anomaly_types, abnormal_detections, abnormalities) are not yet populated in this database."
+        rows = self.get_anomaly_locations(inspection_id=inspection_id)
+        if not rows:
+            return "No anomaly locations found."
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [
+            f"{len(rows)} anomaly location(s){scope} — camera positions where the abnormal frames were taken "
+            f"(these coordinates are marked in the Rerun viewer):"
+        ]
+        for r in rows:
+            pos = self._format_xyz(r["cam_x"], r["cam_y"], r["cam_z"])
+            if r["cam_x"] is None:
+                pos = f"{self._format_xyz(r['gt_x'], r['gt_y'], r['gt_z'])} (ground-truth viewpoint)"
+            objects = f" on: {r['objects']}" if r.get("objects") else ""
+            lines.append(
+                f"- Pair {r['pair_id']} [inspection {r['inspection_id']}]: types={r['types']}{objects} at {pos}"
+            )
         return "\n".join(lines)
 
     def _format_sql_query_result(self, query: str, limit: int = 100) -> str:

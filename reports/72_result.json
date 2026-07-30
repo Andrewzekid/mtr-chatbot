@@ -1,0 +1,19 @@
+{
+  "status": "ANOMALY",
+  "summary": "A major structural damage anomaly is present on the green wall panels at center-right: extensive cracking with broken surface areas. No other clear anomalies are visible; ceiling lighting appears unchanged. People at the left and right edges are ignored as dynamic objects.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "crack and structure damage",
+      "object": "wall panel",
+      "location": "center-right green wall panels",
+      "bbox": [
+        391,
+        286,
+        642,
+        621
+      ],
+      "note": "large spiderweb cracking and puncture damage across multiple wall panels"
+    }
+  ]
+}

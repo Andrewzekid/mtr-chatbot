@@ -37,6 +37,7 @@ class ServerMessage(BaseModel):
     tts_text_language: Optional[str] = None
     tool_calls: Optional[list[dict[str, object]]] = None
     tool_router_raw: Optional[dict[str, object]] = None
+    highlight: Optional[dict[str, object]] = None
 
 
 class ImageAnnotationRequest(BaseModel):

@@ -138,7 +138,7 @@ get_report_summary {}                                   # prose report + recomme
 get_category_proximity {target_category: "Ticket Gate",
                          other_categories: ["Lights","Advertisement Board", ...]}   # "near ticket gates" part
 ```
-`get_anomaly_summary` / `get_anomalies` read the `anomaly_types` / `abnormal_detections` / `abnormalities` tables and return typed abnormalities with 2D pixel bboxes, notes, and the ground-truth vs inspection image links for each pair. `get_report_summary` returns `None` from `_execute_tool`; its real text is fetched by `llm_service` into `report_context` (loaded because `report_needed` now also triggers on the anomaly tools). So the answerer receives **two** system messages — `db_context` (structured abnormalities + proximity) and `report_context` (prose + `![...](/reports/extracted_images/...)` links) — and weaves them together: "the report found cracks near gate 3; the abnormalities table lists 2 scratches on the ticket-gate panels; around that area there are 8 lights and 3 ad boards within 2 m." (If the anomaly tables are not yet populated, the anomaly tools return a clear "not yet populated" string instead of raising.)
+`get_anomaly_summary` / `get_anomalies` read the `anomaly_types` / `abnormal_detections` / `abnormalities` tables and return typed abnormalities with 2D pixel bboxes, notes, affected object/location, camera position, and the ground-truth vs inspection image links for each pair — plus the annotated result image (`/reports/reference/<gt_image_id>_result.jpg`, the same frame with anomaly boxes drawn) when present. `get_report_summary` returns the live structured anomaly data (summary + 3D locations) as its tool result; the prose report text is fetched by `llm_service` into `report_context`. So the answerer receives **two** system messages — `db_context` (structured abnormalities + proximity) and `report_context` (prose + annotated result image links) — and weaves them together, trusting the database when the prose is stale: "the report found cracks near gate 3; the abnormalities table lists 2 scratches on the ticket-gate panels; around that area there are 8 lights and 3 ad boards within 2 m." The report's "Frame N" references map to `/reports/reference/<N>_result.jpg`.
 
 ### Worked example C — images + live annotation (vision tool)
 
@@ -206,7 +206,7 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 | `app/services/stt_service.py` | `build_stt` → `SenseVoiceSTT` (default, emotion+lang tags) or `WhisperSTT`. Returns `STTResult`. |
 | `app/services/tool_router.py` | `ToolRouter.select_tool` — Ollama native tool-calling (call #1). `TOOLS`/`_ollama_tools`. Prior-image + prior-tool context. Annotation safety-net fallback. |
 | `app/services/db_service.py` | `InspectionDBClient.lookup` → router → `_execute_tool` per tool → join. All SQL query methods + `_format_*` formatters. `_parse_time_string` for clock/ns/ISO times. `annotate_image` orchestration. |
-| `app/services/report_service.py` | `InspectionReportClient` — reads `.txt`/`.pdf` (via `pdftotext`) reports, lists `extracted_images`. Loaded only when `get_report_summary` was selected. |
+| `app/services/report_service.py` | `InspectionReportClient` — reads `.txt`/`.pdf` (via `pdftotext`) reports, lists `extracted_images/` and the annotated `<N>_result.jpg` reference images (served at `/reports/reference/`). Loaded only when `get_report_summary` was selected. |
 | `app/services/vision_service.py` | `VisionAnnotator.annotate` — sends image to the **base LLM** (multimodal), strict-JSON parsing with retries, normalizes coords, draws annotations with OpenCV. |
 | `app/services/rerun_service.py` | `RerunVisualizer.highlight` — pushes 3D object centroids/bboxes + raw coordinates to a Rerun viewer, sharing the grounding scene's app id + leveling frame. Logs the station map (`world/map`) from a pre-extracted downsampled `.npy` so highlights land on the map. All Rerun I/O on a background daemon thread (never blocks the chat); auto-launches a viewer when `RERUN_AUTO_SPAWN=true`. Called by the `highlight_in_rerun` tool AND by `InspectionDBClient.auto_highlight` (coordinate-bearing answers). |
 | `app/services/llm_service.py` | `LocalLLM.stream_reply` (call #2): gather context, `_build_messages`, stream via Ollama/vLLM, strip `thinking`. `preload_model`, `runtime_status`. |
@@ -302,7 +302,7 @@ It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer 
 
 ## Database schema
 
-`MTR Inspection Database/inspection_v2.db` (new multi-inspection schema, written by the `inspection_grounding` pipeline):
+`MTR Inspection Database/inspection_v2_mtr_new.db` (new multi-inspection schema, written by the `inspection_grounding` pipeline):
 
 - **`categories`** — `id`, `name`. Fixed set: Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 - **`inspections`** — `id`, `started_at`, `is_gt`. **Multiple inspections** can coexist; scope tools with `inspection_id`.
@@ -310,11 +310,11 @@ It is fully tolerant: `RERUN_ENABLED=false`, a missing `rerun-sdk`, or a viewer 
 - **`objects`** — one row per tracked object: `id` (the object id — there is no `track_id`), `category_id` (→ `categories.name`), `centroid_x/y/z`, `min_x/y/z`, `max_x/y/z`, `is_gt`, `created_at`. An object has ONE centroid + 3D bbox; it does **not** store `first_seen`/`last_seen` or a detection count — those are **derived** from `detections`.
 - **`detections`** — one row per per-frame detection: `id`, `image_id` (→ `images`), `object_id` (→ `objects`), `centroid_x/y/z`, `min/max_x/y/z`. An object's detection count = `COUNT(detections)`; first/last seen = `MIN/MAX(images.timestamp_ns)` over its detections→images.
 
-Anomaly tables (added by the writer later; the tools no-op cleanly until then):
+Anomaly tables (populated in `inspection_v2_mtr_new.db`):
 
-- **`anomaly_types`** — `id`, `name`.
-- **`abnormal_detections`** — `id`, `gt_image` (→ `images.id`), `inspection_image` (→ `images.id`). An abnormal **image pair** (ground truth vs inspection).
-- **`abnormalities`** — `id`, `pair` (→ `abnormal_detections.id`), `type` (→ `anomaly_types.id`), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
+- **`anomaly_types`** — `id`, `name`. 7 types: missing_object, foreign_object, relocation, state_change, crack and structure damage, stain/graffiti, content_change.
+- **`abnormal_detections`** — `id`, `gt_image` (→ `images.id`), `inspection_image` (→ `images.id`), `status`, `summary` (prose summary of the pair), `viewpoint_change`. An abnormal **image pair** (ground truth vs inspection).
+- **`abnormalities`** — `id`, `pair` (→ `abnormal_detections.id`), `type` (→ `anomaly_types.id`), `object` (affected object), `location` (where in the scene), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
 
 Derived columns the tools compute: `detection_count` = `COUNT(detections)` per object; `first_seen_ns` / `last_seen_ns` = `MIN/MAX(images.timestamp_ns)` over an object's detections→images. The old `observations`, `inspection_poses`, and `filtered_objects` tables and the `track_id` / `observation_count` / `total_point_count` / `aggregated_pcd_path` / `point_count` / `pcd_path` / `mask_path` columns are gone.
 
@@ -333,7 +333,7 @@ Key env vars (see `backend/.env.example` for the full list):
 | `TOOL_ROUTER_MODEL` | `gemma4:26b` | Model for tool selection (call #1) |
 | `STT_BACKEND` | `sensevoice` | `sensevoice` or `whisper` |
 | `VISION_*` | — | `VISION_MAX_TOKENS`, `VISION_TEMPERATURE`, `VISION_REQUEST_TIMEOUT_S` — tune the annotation task only |
-| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR Inspection Database/inspection_v2.db` / `../MTR Inspection Database/outputs/images` | SQLite DB + source camera frames |
+| `INSPECTION_DB_PATH` / `INSPECTION_IMAGE_DIR` | `../MTR Inspection Database/inspection_v2_mtr_new.db` / `../MTR Inspection Database/outputs/images` | SQLite DB + source camera frames |
 | `RERUN_ENABLED` / `RERUN_VIEWER_ADDR` | `true` / `127.0.0.1:9876` | Push 3D highlights to a running `rerun` viewer over TCP |
 | `RERUN_APP_ID` / `RERUN_LEVELING_RPY_DEG` | `inspection_grounding_rerun` / `0.0,20.0,0.0` | Match the grounding scene's app id + leveling rotation so highlights overlay the grounding map |
 | `RERUN_AUTO_SPAWN` | `true` | If no viewer is reachable, launch one on first highlight (else require a manually-started `rerun`) |
@@ -377,7 +377,7 @@ curl -X POST "http://localhost:8000/annotate-image" -F "image=@frame.jpg" -F "qu
 rerun                                            # optional: start the 3D viewer (auto-launched on first highlight when RERUN_AUTO_SPAWN=true)
 # Generate the station map .npy from the grounding .rrd (one-time):
 .venv/bin/python scripts/extract_station_map.py --rrd /path/to/output_mtr.rrd --out data/station_map.npz --max-points 1500000
-sqlite3 "MTR Inspection Database/inspection_v2.db"
+sqlite3 "MTR Inspection Database/inspection_v2_mtr_new.db"
 #   .tables
 #   SELECT c.name AS category, COUNT(*) AS objects FROM objects o JOIN categories c ON c.id=o.category_id GROUP BY c.name ORDER BY objects DESC;
 #   SELECT id, started_at, is_gt FROM inspections;

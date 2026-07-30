@@ -1,0 +1,31 @@
+{
+  "status": "ANOMALY",
+  "summary": "Main anomaly is a removed upper wall/ceiling cover panel in the middle-right area, revealing internal pipes and cables. No clear additional light state change is observed; visible ceiling lights appear consistent. Person on the left is ignored as dynamic.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "missing_object",
+      "object": "ceiling/wall cover panel",
+      "location": "upper middle-right above the green wall",
+      "bbox": [
+        381,
+        170,
+        612,
+        341
+      ],
+      "note": "large cover panel present in reference is absent, exposing the ceiling cavity behind"
+    },
+    {
+      "type": "foreign_object",
+      "object": "exposed pipes, ducts, and cables",
+      "location": "upper middle-right above the green wall",
+      "bbox": [
+        389,
+        171,
+        593,
+        322
+      ],
+      "note": "revealed after removal of the cover panel"
+    }
+  ]
+}

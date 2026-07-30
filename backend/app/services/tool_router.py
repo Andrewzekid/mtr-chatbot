@@ -141,7 +141,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Exit Sign."},
-                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
+                "limit": {"type": ["integer", "string"], "description": "Max objects to return. Omit for the default of 5 (a representative subset). Use 'all' ONLY when the user explicitly asks for every object/image or asks to see more."},
             },
             required=["category"],
         ),
@@ -246,7 +246,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": _params(
             {
                 "category": {"type": "string", "description": "Category name, e.g. Advertisement Board."},
-                "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
+                "limit": {"type": ["integer", "string"], "description": "Max images to return. Omit for the default of 5 (a representative subset). Use 'all' ONLY when the user explicitly asks for every image or asks to see more."},
             },
             required=["category"],
         ),
@@ -374,6 +374,11 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "get_anomaly_locations",
+        "description": "3D locations of the anomalies: the camera position where each abnormal image pair was taken (from the images table pose), with the anomaly types and affected objects per location. These coordinates are automatically marked in the Rerun viewer. Use when the user asks WHERE the anomalies are or to show/mark anomaly locations in 3D.",
+        "parameters": _params({}),
+    },
+    {
         "name": "get_report_summary",
         "description": "Fetch the inspection report text, including anomaly findings, issues, state changes, and recommendations. Use this when the user asks about the written anomaly report or recommendations. Pair with get_anomalies for the structured abnormalities.",
         "parameters": {"type": "object", "properties": {}},
@@ -480,9 +485,9 @@ Do not answer the user directly. Do not output any text other than the tool call
 - `objects` table: `id` (the object id — there is NO track_id), `category_id` (→ categories.name), `centroid_x/y/z`, `min_x/y/z`, `max_x/y/z`, `is_gt`, `created_at`. An object has ONE centroid and 3D bbox; it does NOT have stored first_seen/last_seen or observation_count columns.
 - `detections` table: `id`, `image_id` (→ images), `object_id` (→ objects), `centroid_x/y/z`, `min/max_x/y/z`. One row per per-frame detection. An object's detection count and first/last-seen timestamps are DERIVED by joining detections → images.
 - `anomaly_types` table: `id`, `name`.
-- `abnormal_detections` table: `id`, `gt_image` (→ images.id), `inspection_image` (→ images.id). An abnormal image PAIR (ground truth vs inspection).
-- `abnormalities` table: `id`, `pair` (→ abnormal_detections.id), `type` (→ anomaly_types.id), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
-  NOTE: the anomaly tables may not be populated yet. The anomaly tools will return a clear "not yet populated" message in that case — still call them when the user asks about anomalies.
+- `abnormal_detections` table: `id`, `gt_image` (→ images.id), `inspection_image` (→ images.id), `status`, `summary` (prose summary of the pair), `viewpoint_change`. An abnormal image PAIR (ground truth vs inspection).
+- `abnormalities` table: `id`, `pair` (→ abnormal_detections.id), `type` (→ anomaly_types.id), `object` (what the anomaly is on, e.g. 'metal service door'), `location` (where in the scene), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
+  The anomaly tables ARE populated: 7 anomaly types (missing_object, foreign_object, relocation, state_change, crack and structure damage, stain/graffiti, content_change). Use the anomaly tools for any anomaly/finding/defect question.
 
 All timestamps are nanoseconds since epoch. Time tools accept ISO datetimes, clock times such as "16:51:45" or "4:51 PM", or raw nanosecond integers.
 
@@ -491,9 +496,11 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 
 ## Multi-inspection
 
-- The database can hold several inspections. Most tools accept an optional `inspection_id`.
+- The database holds several inspections: one is the GROUND TRUTH reference run (`is_gt=1`, currently inspection 1); the others are robot inspection runs. When the user says "the reference", "the ground truth", or "the original scan", they mean the `is_gt` inspection — call get_inspections to confirm its id if unsure.
+- Most tools accept an optional `inspection_id`.
 - When the user names a specific inspection ("inspection 2", "the second inspection", "the ground-truth run"), pass `inspection_id`. If you do not know the id, call get_inspections first.
-- When the user does NOT name an inspection, omit `inspection_id` to query across all inspections. The answerer can still reason across inspections because tool outputs include inspection ids where relevant.
+- When the user does NOT name an inspection, omit `inspection_id` to query across all inspections. Tool outputs are labeled per inspection (and summaries include a per-inspection breakdown), so the answerer can attribute numbers correctly and ask the user which inspection they meant. Do NOT guess an inspection id on the user's behalf.
+- Object ids are unique across the whole database and each object belongs to exactly one inspection — tool outputs tell you which one.
 
 ## Tool reference
 
@@ -509,7 +516,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 10. get_category_timeline(category, inspection_id) — first/last seen per object in a category.
 11. get_category_windows(categories[], inspection_id) — first/last windows for several categories.
 12. get_category_objects_coordinates(category, inspection_id) — centroid + 3D bbox per object in a category.
-13. get_category_objects_with_images(category, limit, inspection_id) — object ids, coordinates, and a sample image each.
+13. get_category_objects_with_images(category, limit, inspection_id) — object ids, coordinates, and a sample image each (default limit 5).
 14. get_category_proximity(target_category, other_categories[], radius_m, inspection_id) — counts of other-category objects near each target object (numbers only, no images).
 14a. get_category_proximity_with_images(target_category, other_categories[], radius_m, limit, nearby_limit, inspection_id) — nearby objects with object IDs, distances, coordinates, and sample images. Use for 'show me X near Y'.
 15. get_inspection_timeline(inspection_id) — chronological object log.
@@ -519,7 +526,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 19. get_detections_in_time_range(start_time, end_time, limit, inspection_id) — per-frame detections in a window.
 20. get_objects_in_image(filename) — every object detected in one specific image frame.
 21. get_objects_near_position(x, y, z, radius_m, category, inspection_id) — objects within radius of a 3D point.
-22. get_category_sample_images(category, limit, inspection_id) — a few example image links for a category.
+22. get_category_sample_images(category, limit, inspection_id) — a few example image links for a category (default limit 5).
 23. get_inspection_poses(limit, inspection_id) — camera poses (from the images table).
 24. get_object_distance(object_id_a, object_id_b) — centroid distance between two objects.
 25. get_category_bounding_box(category, inspection_id) — spatial extent of a category.
@@ -532,8 +539,9 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 32. get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id) — objects/detections around a time.
 33. get_anomaly_types — anomaly type names.
 34. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
-35. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, 2D bbox, note, and gt/inspection image links.
-36. get_report_summary — the written anomaly report text + recommendations.
+35. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, affected object, scene location, 2D bbox, note, pair summary, and gt/inspection image links.
+35a. get_anomaly_locations(inspection_id) — 3D camera positions where each abnormal image pair was taken (the anomalies' locations). These are automatically marked in the Rerun viewer. Use for 'where are the anomalies'.
+36. get_report_summary — the written anomaly report text + recommendations. Its result also carries the live structured anomaly data from the database, and annotated per-frame result images (report 'Frame N' = /reports/reference/<N>_result.jpg) are attached to the report context.
 37. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the Rerun viewer (only for explicit visual requests; coordinates from other tools auto-highlight).
 38. run_sql_query(query, limit) — read-only SELECT escape hatch. Use ONLY when no other tool fits.
 39. annotate_image(image_url | object_id | category, question, limit) — vision-annotate images.
@@ -560,6 +568,13 @@ Plan:
 1. get_detection_counts_by_category
 2. get_objects_near_position(x=-18, y=32, z=-6, radius_m=2.0)
 
+Example B2 (broad "all objects" question):
+User: "Tell me about all the objects."
+Plan:
+1. get_summary
+2. get_categories
+(Broad questions like "what objects are there", "what did you detect", "what's in the scene", or "tell me about everything you found" MUST call get_summary and get_categories so the answerer has the real category list and counts. Never leave such questions unanswered by tools.)
+
 Example C:
 User: "Show me some advertisement boards and how far apart are objects 16 and 19."
 Plan:
@@ -572,7 +587,7 @@ Plan:
 1. get_anomaly_summary
 2. get_anomalies()
 3. get_report_summary
-(Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report. If the anomaly tables are not yet populated, those tools return a clear message — still call them.)
+(Note: get_anomalies returns image links for each abnormality's inspection frame; get_report_summary returns the prose report.)
 
 Example E (Rerun highlight — final pass):
 User: "What are the coordinates of the ticket gates? Show me where they are."
@@ -612,6 +627,7 @@ Plan:
 ## Rules
 
 - In each round, call every tool you need based on what you already know. You may (and should) return MULTIPLE tool calls in one response whenever the user's question requires more than one piece of data — for example coordinates AND nearby objects, or images AND a count, or anomalies AND the report. Combine tools freely.
+- For broad questions about what was detected overall ("tell me about all the objects", "what objects are there", "what did you find/detect", "what's in the scene", "what categories exist"), ALWAYS call get_summary and get_categories. The answering model has NO built-in knowledge of the database — if you call no tools, it will invent categories that do not exist.
 - This is a multi-round router: after the backend executes your tool calls, it will show you the results and give you another chance to call more tools if you still need information. Up to {max_rounds} rounds are allowed. If the results from the current round are enough, stop — return no tool calls. Only call additional tools when you genuinely need their output.
 - A final pass runs AFTER your tools finish and decides which objects/coordinates to show in the Rerun viewer based on the results and the user's question. You do NOT need to call highlight_in_rerun for ordinary coordinate questions - the final pass highlights them. Only call highlight_in_rerun for explicit, specific 3D-highlight requests that name particular objects (e.g. 'highlight objects 16 and 19 in the 3D viewer').
 - A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
@@ -623,10 +639,11 @@ Plan:
 - When the user asks about something happening "at" or "around" a bare time (e.g. "what did the camera see at 4:53", "show me detections around 4:53"), use a one-minute window from that minute to the next minute, NOT a 10-second window.
 - Use the exact category names listed above.
 - DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, proximity, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
-- When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, call get_anomaly_summary / get_anomalies and/or get_report_summary. Do not call coordinate tools for pure anomaly questions.
-- CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images.
+- When the user asks about anomalies, findings, issues, problems, defects, state changes, or recommendations, ALWAYS call the full anomaly trio together: get_report_summary (report + live structured data), get_anomaly_locations (3D coordinates), and get_anomalies (details with images) — no matter how narrow the wording is ('where', 'how many', 'what'). The backend tops up any of the three you skip, but calling them yourself keeps results consistent. Do not call coordinate tools for pure anomaly questions. Whenever anomaly tools run, the anomaly locations (camera positions of the abnormal image pairs) are automatically marked in the Rerun viewer — no highlight_in_rerun call needed. The get_report_summary result already includes the live structured anomaly data (counts by type, affected objects, 3D locations), so the answerer can cross-reference the prose report against the current database records.
+- CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images. 'Show me' requests ALWAYS produce BOTH outputs: 2D images in the chat AND a 3D highlight of the relevant objects/categories in the Rerun viewer — the final pass handles the 3D highlight automatically, so you just need to call the right image tool(s).
 - For 'show me X near Y within R meters' queries, use get_category_proximity_with_images so the nearby objects include sample frames.
 - For 'show me X at time T' queries, use get_images_in_time_range (optionally with category) to return actual frames.
+- Image limit rule: for image-returning tools, OMIT the limit so the default of 5 (a representative subset) applies. Only pass limit='all' (or a larger number) when the user explicitly says 'all', 'every', or asks for more images. Non-image listing tools (get_objects_by_category, get_category_objects_coordinates) return every matching object by default — do not cap them unless the user asks for a subset.
 - Do not output explanatory text; only emit tool calls.
 """
 
@@ -636,7 +653,7 @@ Plan:
         urls: list[str] = []
         for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", text):
             urls.append(match.group(1))
-        for match in re.finditer(r"((?:/(?:inspection|annotated)/images/|/reports/(?:extracted_)?images/)[^\s\)\"]+)", text):
+        for match in re.finditer(r"((?:/(?:inspection|annotated)/images/|/reports/(?:(?:extracted_)?images|reference)/)[^\s\)\"]+)", text):
             if match.group(1) not in urls:
                 urls.append(match.group(1))
         return urls
@@ -934,9 +951,18 @@ Plan:
                         "type": "string",
                         "description": "Highlight every object in this category.",
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Highlight every object in each of these categories (use for proximity/multi-category queries).",
+                    },
                     "keep_existing": {
                         "type": "boolean",
                         "description": "If true, keep previously highlighted objects/points (user explicitly asked to keep/add to them). Default false: clear previous highlights first.",
+                    },
+                    "inspection_id": {
+                        "type": "integer",
+                        "description": "Scope the highlight to a single inspection. Set this when the user asked about a specific inspection (the tool calls/results show which inspection_id was used). Omit to highlight across all inspections.",
                     },
                     "label": {
                         "type": "string",
@@ -967,33 +993,45 @@ Plan:
         system_prompt = (
             "You are the post-tool highlight decider for a subway-station inspection assistant. "
             "The tools already ran and returned the results shown below. Decide which objects or "
-            "coordinates from those results should be highlighted in the 3D Rerun viewer the user "
+            "categories from those results should be highlighted in the 3D Rerun viewer the user "
             "watches alongside this chat.\n\n"
             "Default behavior: highlight EVERY object or category that is relevant to the user's "
-            "question. The user expects to see the things they asked about in the viewer unless they "
+            "question, and make sure the Rerun viewer opens if it is not already running. "
+            "The user expects the viewer to show the things they asked about unless they "
             "explicitly asked not to.\n\n"
             "Rules:\n"
-            "1. Call set_rerun_highlight with object_ids and/or coordinates (and optionally "
-            "category/label) for ALL spatial objects relevant to the user's question.\n"
-            "2. If the user asks about a category, highlight that category. If they ask about objects "
-            "near / within / around another category (e.g. 'lights within 2m of advertisement boards'), "
-            "highlight BOTH the reference category and the nearby objects/category.\n"
-            "3. Prefer exact object_ids when specific objects are returned in the tool results; otherwise "
-            "use category.\n"
-            "4. Do NOT highlight unrelated context or objects that are only incidental to the question. "
-            "Highlight ONLY objects that answer what the user asked.\n"
-            "5. Do not call this tool for pure image-annotation requests (annotate / draw on / circle on / "
+            "1. If the user's question is about a category in any way — count, list, summary, images, "
+            "coordinates, or proximity — highlight that category. If the question names MULTIPLE categories, "
+            "highlight ALL of them via categories=[...], never just one.\n"
+            "2. If the user asks about objects near / within / around another category (e.g. 'what are "
+            "advertisement boards within 2m of lights?', 'show me lights near ticket gates'), highlight "
+            "BOTH categories involved by passing categories=['CategoryA', 'CategoryB'], or include all "
+            "relevant object_ids from the tool results.\n"
+            "3. Use object_ids ONLY when the user asked about specific, individually-named objects "
+            "(e.g. 'object 16', 'objects 16 and 19'). For category-level questions, highlight the WHOLE "
+            "category via category/categories even when the tool results list individual object ids — "
+            "'show me all lights' means every light, not just the few ids in a truncated tool result.\n"
+            "4. If the user asked to SEE objects of a category (e.g. 'show me all advertisement boards', "
+            "'display the ticket gates', 'show me some lights'), the image tools return 2D sample frames. "
+            "You should ALSO highlight that category in the 3D viewer so the user sees the segmented "
+            "point clouds alongside the images.\n"
+            "5. Do NOT highlight unrelated context or objects that are only incidental to the question. "
+            "Highlight ONLY objects/categories that answer what the user asked.\n"
+            "6. Do not call this tool for pure image-annotation requests (annotate / draw on / circle on / "
             "mark on the image) or for off-topic questions.\n"
-            "6. Set keep_existing=true ONLY if the user explicitly asked to keep or add to previous "
+            "7. Set keep_existing=true ONLY if the user explicitly asked to keep or add to previous "
             "highlights (e.g. 'keep the previous', 'add to the highlights', 'show alongside the "
             "previous'). Otherwise leave it false so previous highlights are cleared first.\n"
-            "7. At most one tool call. Output nothing but the tool call.\n\n"
+            "8. At most one tool call. Output nothing but the tool call.\n\n"
             "Examples:\n"
             "- User: 'how many lights were detected?' -> set_rerun_highlight(category='Lights').\n"
+            "- User: 'how many ad boards were seen?' -> set_rerun_highlight(category='Advertisement Board').\n"
             "- User: 'where are the lights?' -> set_rerun_highlight(category='Lights').\n"
-            "- User: 'show me the lights within 2m of advertisement boards' -> "
-            "set_rerun_highlight(category='Lights') or include object_ids for both Lights and "
-            "Advertisement Board from the tool results.\n"
+            "- User: 'show me all advertisement boards' -> set_rerun_highlight(category='Advertisement Board').\n"
+            "- User: 'show me all lights and advertisement boards' -> "
+            "set_rerun_highlight(categories=['Lights', 'Advertisement Board']).\n"
+            "- User: 'what are advertisement boards within 2m of lights?' -> "
+            "set_rerun_highlight(categories=['Advertisement Board', 'Lights']).\n"
             "- User: 'show me object 12 in the viewer' -> set_rerun_highlight(object_ids=[12]).\n"
             "- User: 'annotate the previous image' -> NO tool (image annotation, not 3D highlight)."
         )
@@ -1050,7 +1088,10 @@ Plan:
             if func.get("name") == "set_rerun_highlight":
                 args = func.get("arguments") or {}
                 if isinstance(args, dict) and (
-                    args.get("object_ids") or args.get("coordinates") or args.get("category")
+                    args.get("object_ids")
+                    or args.get("coordinates")
+                    or args.get("category")
+                    or args.get("categories")
                 ):
                     return args
         return None

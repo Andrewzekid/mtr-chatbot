@@ -69,6 +69,13 @@ _images_dir = Path(settings.reports_dir) / "extracted_images"
 if _images_dir.exists():
     app.mount("/reports/extracted_images", StaticFiles(directory=str(_images_dir)), name="report_extracted_images")
 
+# Serve the annotated per-frame result images (and other report artifacts) that
+# live at the reports/ root, e.g. reports/143_result.jpg -> /reports/reference/143_result.jpg.
+# The numeric prefix is the ground-truth image id (the report's "Frame N").
+_reports_dir = Path(settings.reports_dir)
+if _reports_dir.exists():
+    app.mount("/reports/reference", StaticFiles(directory=str(_reports_dir)), name="report_reference_images")
+
 # Serve source camera frames referenced by observations.image_path.
 _inspection_img_dir = Path(settings.inspection_image_dir)
 if _inspection_img_dir.exists():
@@ -145,12 +152,24 @@ def health() -> dict[str, str]:
 
 @app.get("/reports/image-list")
 def report_image_list() -> dict[str, list[str]]:
-    """Return URLs of extracted anomaly images from inspection reports."""
+    """Return URLs of anomaly images from inspection reports.
+
+    Combines legacy reports/extracted_images/ with the annotated per-frame
+    result images at the reports/ root (<gt_image_id>_result.jpg — the same
+    frames as the database's gt images, with anomaly bboxes drawn on)."""
+    urls: list[str] = []
     images_dir = Path(settings.reports_dir) / "extracted_images"
-    if not images_dir.exists():
-        return {"images": []}
-    names = sorted(p.name for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-    return {"images": [f"/reports/extracted_images/{name}" for name in names]}
+    if images_dir.exists():
+        names = sorted(p.name for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+        urls.extend(f"/reports/extracted_images/{name}" for name in names)
+    reports_dir = Path(settings.reports_dir)
+    if reports_dir.exists():
+        names = sorted(
+            p.name for p in reports_dir.iterdir()
+            if p.is_file() and p.name.endswith("_result.jpg")
+        )
+        urls.extend(f"/reports/reference/{name}" for name in names)
+    return {"images": urls}
 
 
 @app.get("/status")
@@ -233,6 +252,7 @@ async def websocket_chat(ws: WebSocket) -> None:
                         type="tool_calls",
                         tool_calls=payload.get("tool_calls"),
                         tool_router_raw=payload.get("tool_router_raw"),
+                        highlight=payload.get("highlight"),
                         request_id=current_request_id,
                     ).model_dump(exclude_none=True)
                 )
@@ -277,6 +297,7 @@ async def websocket_chat(ws: WebSocket) -> None:
                         type="tool_calls",
                         tool_calls=payload.get("tool_calls"),
                         tool_router_raw=payload.get("tool_router_raw"),
+                        highlight=payload.get("highlight"),
                         request_id=current_request_id,
                     ).model_dump(exclude_none=True)
                 )

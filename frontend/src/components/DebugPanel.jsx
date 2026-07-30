@@ -7,12 +7,12 @@ const IMAGE_LINK_RE = /!\[[^\]]*\]\([^)]+\)/;
  * Displays the database tool calls the LLM router selected for the current / latest turn,
  * including the raw output returned by each tool and the raw tool-calling model response.
  *
- * @param {{ toolCalls: Array<{ requestId?: string, calls: Array<{ name: string, args: object, output?: string|object }> }>, toolRouterRaw: { requestId?: string, raw: object }|null }} props
+ * @param {{ toolCalls: Array<{ requestId?: string, calls: Array<{ name: string, args: object, output?: string|object }> }>, toolRouterRaw: { requestId?: string, raw: object }|null, highlight: { requestId?: string, status?: string, args?: object }|null }} props
  */
-export default function DebugPanel({ toolCalls, toolRouterRaw }) {
+export default function DebugPanel({ toolCalls, toolRouterRaw, highlight }) {
   const [expanded, setExpanded] = useState(true);
 
-  if ((!toolCalls || toolCalls.length === 0) && !toolRouterRaw) {
+  if ((!toolCalls || toolCalls.length === 0) && !toolRouterRaw && !highlight) {
     return null;
   }
 
@@ -31,6 +31,23 @@ export default function DebugPanel({ toolCalls, toolRouterRaw }) {
       </div>
       {expanded && (
         <div className="debug-body">
+          {highlight && (
+            <div className="debug-turn">
+              <p className="debug-turn-label">
+                Rerun viewer highlight command
+                {highlight.requestId ? ` · ${highlight.requestId.slice(0, 8)}` : ""}
+              </p>
+              {highlight.status && (
+                <p className="debug-call-name">{highlight.status}</p>
+              )}
+              {highlight.args && (
+                <details className="debug-call-output" open>
+                  <summary>Highlight args</summary>
+                  <pre>{JSON.stringify(highlight.args, null, 2)}</pre>
+                </details>
+              )}
+            </div>
+          )}
           {toolRouterRaw && (
             <div className="debug-turn">
               <p className="debug-turn-label">

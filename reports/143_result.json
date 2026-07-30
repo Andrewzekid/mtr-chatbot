@@ -1,0 +1,19 @@
+{
+  "status": "ANOMALY",
+  "summary": "The main anomaly is a state change on the right-side metal service door, which is open in the current image but closed in the reference. The revealed maintenance equipment inside is consistent with the door opening and is not separately labeled as foreign. No clear additional anomalies or ceiling light state changes are observed. People in the foreground are ignored as dynamic objects.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "state_change",
+      "object": "metal service door",
+      "location": "right side of the corridor",
+      "bbox": [
+        430,
+        330,
+        768,
+        690
+      ],
+      "note": "service room door changed from closed in reference to open in current, revealing interior"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "status": "ANOMALY",
+  "summary": "The main visible anomaly is a significant relocation of the recycling machine on the right side. Ceiling lights appear unchanged and on. No clear missing objects, foreign objects, damage, stains, or screen/poster content changes are visible. People on the left are dynamic and ignored.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "relocation",
+      "object": "recycling machine",
+      "location": "right side of the corridor against the green wall",
+      "bbox": [
+        427,
+        621,
+        734,
+        853
+      ],
+      "note": "The recycling machine has been moved from the far right edge and rotated/shifted leftward to a lower horizontal position."
+    }
+  ]
+}

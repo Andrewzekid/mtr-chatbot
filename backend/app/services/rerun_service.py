@@ -65,11 +65,12 @@ class RerunVisualizer:
         object_ids: list[int] | None = None,
         coordinates: list[dict[str, float]] | None = None,
         category: str | None = None,
+        categories: list[str] | None = None,
         inspection_id: int | None = None,
         label: str | None = None,
         keep_existing: bool = False,
     ) -> str:
-        """Highlight objects / raw coordinates in the Rerun viewer.
+        """Highlight objects / categories / raw coordinates in the Rerun viewer.
 
         Returns a short human-readable status string for the answering LLM to cite.
         Never raises, never blocks on the viewer: the actual Rerun logging happens
@@ -78,7 +79,12 @@ class RerunVisualizer:
         if not self.settings.rerun_enabled:
             return "Rerun visualization is disabled (RERUN_ENABLED=false)."
 
-        if not object_ids and not coordinates and not category and inspection_id is None:
+        categories = list(categories) if categories else []
+        if category:
+            categories.append(category)
+        categories = [c for c in categories if c]
+
+        if not object_ids and not coordinates and not categories and inspection_id is None:
             return "Nothing to highlight."
 
         listening = self._viewer_listening()
@@ -88,7 +94,7 @@ class RerunVisualizer:
             {
                 "object_ids": object_ids or [],
                 "coordinates": coordinates or [],
-                "category": category,
+                "categories": categories,
                 "inspection_id": inspection_id,
                 "label": label,
                 "keep_existing": keep_existing,
@@ -104,13 +110,16 @@ class RerunVisualizer:
         label_str = f" ({label})" if label else ""
 
         n_objects = len(object_ids) if object_ids else 0
-        if category and n_objects:
+        n_categories = len(categories)
+        if n_categories and n_objects:
+            cats = ", ".join(f"'{c}'" for c in categories)
             return (
-                f"Highlighted category '{category}' and {n_objects} object(s)"
-                f"{label_str} in {where}."
+                f"Highlighted categor{'y' if n_categories == 1 else 'ies'} {cats} "
+                f"and {n_objects} object(s){label_str} in {where}."
             )
-        if category:
-            return f"Highlighted category '{category}'{label_str} in {where}."
+        if n_categories:
+            cats = ", ".join(f"'{c}'" for c in categories)
+            return f"Highlighted categor{'y' if n_categories == 1 else 'ies'} {cats}{label_str} in {where}."
         if n_objects:
             return f"Highlighted {n_objects} object(s){label_str} in {where}."
         if coordinates:
@@ -147,8 +156,8 @@ class RerunVisualizer:
             if not job.get("keep_existing", False):
                 marker.clean_markings()
 
-            if job.get("category"):
-                marker.mark_by_category(job["category"])
+            for cat in job.get("categories") or []:
+                marker.mark_by_category(cat, inspection_id=job.get("inspection_id"))
 
             object_ids = job.get("object_ids") or []
             if object_ids:
@@ -193,19 +202,41 @@ class RerunVisualizer:
     @staticmethod
     def _log_coordinates(marker: InspectionMarker, coordinates: list[dict[str, float]]) -> None:
         pts: list[list[float]] = []
+        labels: list[str] = []
+        colors: list[list[int]] = []
+        radii: list[float] = []
         for c in coordinates:
             try:
                 x, y, z = float(c["x"]), float(c["y"]), float(c["z"])
             except (KeyError, TypeError, ValueError):
                 continue
             pts.append([x, y, z])
+            labels.append(str(c.get("label") or ""))
+            try:
+                radii.append(float(c.get("radius")) if c.get("radius") is not None else 0.15)
+            except (TypeError, ValueError):
+                radii.append(0.15)
+            color = c.get("color")
+            if isinstance(color, (list, tuple)) and len(color) in (3, 4):
+                rgba = [int(v) for v in color]
+                colors.append(rgba + [255] if len(rgba) == 3 else rgba)
+            else:
+                colors.append(list(_HIGHLIGHT_COLOR))
         if not pts:
             return
         pts_arr = np.asarray(pts, dtype=np.float32)
-        colors = np.tile(_HIGHLIGHT_COLOR, (pts_arr.shape[0], 1)).astype(np.uint8)
+        kwargs: dict[str, Any] = {"labels": labels} if any(labels) else {}
+        # Log under marks_root: coordinates are camera_init-frame points, and this
+        # keeps them inside clean_markings()'s recursive clear so stale points from
+        # previous queries do not linger when keep_existing is false.
         rr.log(
-            f"{marker.base_path}/coordinates",
-            rr.Points3D(pts_arr, colors=colors, radii=[0.12] * pts_arr.shape[0]),
+            f"{marker.marks_root}/coordinates",
+            rr.Points3D(
+                pts_arr,
+                colors=np.asarray(colors, dtype=np.uint8),
+                radii=radii,
+                **kwargs,
+            ),
         )
 
     # ------------------------------------------------------------------

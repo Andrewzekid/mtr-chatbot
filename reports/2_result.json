@@ -1,0 +1,19 @@
+{
+  "status": "ANOMALY",
+  "summary": "Viewpoint is essentially unchanged. A clear new stain/graffiti anomaly appears on the foreground advertisement/display on the right wall, with large dark dripping marks across the surface. No other obvious fixed-facility anomalies are visible; ceiling lighting appears consistent.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "stain/graffiti",
+      "object": "large dripping graffiti/stain on right-side advertisement lightbox",
+      "location": "right wall, foreground poster/display",
+      "bbox": [
+        500,
+        267,
+        767,
+        560
+      ],
+      "note": "dark dripping markings and residue cover the display surface compared with the clean reference"
+    }
+  ]
+}

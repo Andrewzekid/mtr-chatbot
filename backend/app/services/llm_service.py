@@ -31,6 +31,10 @@ class LocalLLM:
         self.settings = settings
         self.db_client = db_client
         self.report_client = report_client
+        # Lazily fetched from the DB so the answering prompt always names the real
+        # categories (prevents the model from inventing ones that do not exist).
+        self._cached_categories: list[str] | None = None
+        self._cached_inspections: list[dict[str, object]] | None = None
 
     @staticmethod
     def _system_prompt() -> str:
@@ -54,6 +58,7 @@ class LocalLLM:
             "Information sources:\n"
             "- Inspection database context contains object detections, categories, counts, timestamps, timelines, time-window clusters, 3D coordinates, proximity information, and image links.\n"
             "- Inspection report context contains anomaly findings, issues, problems, state changes, and recommendations. It is only included when the user asks about anomalies or findings.\n"
+            "- The prose report can predate the current database. When report prose conflicts with the structured anomaly data from the database (counts, types, affected objects, locations), trust the database and briefly note the discrepancy.\n"
             "- For questions about objects, categories, counts, tracks, detections, timestamps, timelines, coordinates, or proximity, prioritize the database context.\n"
             "- For questions about anomalies, findings, issues, problems, state changes, or recommendations, prioritize the report context.\n"
             "- Do not reveal coordinates, positions, locations, or spatial extents unless the user explicitly asks for them. "
@@ -62,6 +67,15 @@ class LocalLLM:
             "- If the provided context does not contain the requested information, say so directly and concisely. "
             "Do not infer, assume, or invent data that is not in the context. "
             "If useful, end with one brief follow-up question offering to look into it another way.\n\n"
+            "Follow-up questions and feedback:\n"
+            "- When the database context says it contains a REPRESENTATIVE SUBSET (e.g. 'showing 5 of 45'), say so in your answer "
+            "('here is a representative subset of the lights') and end by asking the user whether they would like to see more images.\n"
+            "- Each database category is a single flat category. 'Lights' is ONE category — never invent subtypes such as street lights, "
+            "building lights, or traffic lights, and never ask the user to pick between subtypes that do not exist in the data.\n"
+            "- When the user's question is ambiguous and several concrete options exist (especially WHICH inspection they mean), "
+            "end your answer with one follow-up question that lists the options as explicit choices "
+            "(e.g. 'Which inspection do you mean — inspection 1 (ground truth), inspection 2, or inspection 3?'). "
+            "One short follow-up question at most.\n\n"
             "Answering temporal and spatial questions:\n"
             "- When the user asks about order, sequence, before/after, or clusters, describe the pattern in plain language.\n"
             "- Do not dump raw timestamps. Convert them to readable clock times (e.g., 'around 4:51 PM').\n"
@@ -94,8 +108,10 @@ class LocalLLM:
             "- When the context includes multiple image links (e.g. representative frames), include every link in your response; the UI will display them as thumbnails.\n"
             "- Do not describe the image filename or URL in words; the UI handles the image.\n"
             "- IMPORTANT: only use image links that appear VERBATIM in the provided context (the 'Extracted anomaly images' list or tool outputs). "
-            "Never invent, guess, or construct image filenames. In particular, do NOT convert a report's 'Frame N' reference into an "
-            "img-N.jpg link — the extracted image filenames do NOT correspond to frame numbers. If you are not given a link for an image, do not show one.\n"
+            "Never invent, guess, or construct image filenames. The ONE allowed mapping: the report's 'Frame N' references correspond to "
+            "the annotated result images named <N>_result.jpg — when '/reports/reference/<N>_result.jpg' appears in the provided context, "
+            "you may show it for Frame N (it is the same frame with anomaly boxes drawn). Any other filename must appear verbatim. "
+            "If you are not given a link for an image, do not show one.\n"
             "- When the annotate_image tool ran, the annotation is ALREADY done by the system's vision model and the annotated image is shown to the user. "
             "Never say you cannot annotate, draw, or edit images. Just describe what the annotation found (object, location, anomaly) in plain language.\n\n"
             "Speech and readability:\n"
@@ -110,6 +126,71 @@ class LocalLLM:
             "The busiest moment was around 4:51 PM, when over 100 Lights were detected in a five-second window. "
             "The next cluster included a mix of Lights, Maps, Advertisement Boards, and a Ticket Gate, suggesting the camera passed through a more complex area.\n\n"
             "Do not output emojis."
+        )
+
+    def _database_facts(self) -> str:
+        """Real category list + schema facts, appended to the system prompt.
+
+        Without this the model has no knowledge of the database when no tool ran and
+        invents categories (people, vehicles, ...). Categories come from the DB itself,
+        cached after the first successful read.
+        """
+        if self._cached_categories is None and self.db_client is not None:
+            try:
+                categories = self.db_client.get_categories()
+                if categories:
+                    self._cached_categories = list(categories)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not fetch category list for system prompt: %s", exc)
+        if self._cached_inspections is None and self.db_client is not None:
+            try:
+                self._cached_inspections = self.db_client.get_inspections()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not fetch inspection list for system prompt: %s", exc)
+                self._cached_inspections = []
+        categories = self._cached_categories or [
+            "Lights",
+            "Advertisement Board",
+            "Ticket Gate",
+            "Map",
+            "TV",
+            "Exit Sign",
+        ]
+        inspections = self._cached_inspections or []
+        inspection_facts = ""
+        if len(inspections) > 1:
+            listing = "; ".join(
+                f"inspection {ins['id']} ({'ground truth reference' if ins['is_gt'] else 'robot inspection run'}, "
+                f"started {ins['started_at']}, {ins['object_count']} objects)"
+                for ins in inspections
+            )
+            inspection_facts = (
+                f"- The database contains MULTIPLE inspections: {listing}. "
+                "Each inspection is a separate run over the same station, so counts differ between them.\n"
+                "- When the user asks about 'the inspection' without saying which one, and the answer depends "
+                "on which inspection is meant, do NOT silently blend the numbers: give the per-inspection "
+                "breakdown briefly, then end with ONE follow-up question that lists the inspections as explicit "
+                "choices (e.g. 'Which inspection do you mean — inspection 1 (ground truth reference), "
+                "inspection 2, or inspection 3?'). Exception: if the question is clearly about the reference "
+                "scene or 'ground truth', use the ground-truth inspection without asking.\n"
+                "- Whenever you state counts or object details, name the inspection they come from "
+                "(or explicitly say the number combines all inspections). Never mix an object id from one "
+                "inspection with counts from another.\n"
+            )
+        elif len(inspections) == 1:
+            ins = inspections[0]
+            inspection_facts = f"- The database contains a single inspection (id {ins['id']}).\n"
+        return (
+            "\n\nDatabase facts (always true, even when no database context is attached):\n"
+            f"- The inspection database ONLY contains these object categories: {', '.join(categories)}. "
+            "No other categories exist — there are no people, vehicles, buildings, or generic 'street furniture' in this data. "
+            "Never invent, assume, or generalize categories outside this list.\n"
+            "- 'Objects' are unique physical items tracked in 3D (each has one centroid and 3D bounding box); "
+            "'detections' are per-frame sightings of those objects, so one object can have many detections. "
+            "When the user asks 'how many' of something, they mean unique objects unless they explicitly ask about detections or sightings.\n"
+            f"{inspection_facts}"
+            "- If the user asks what was detected but NO database context is provided in this conversation, "
+            "do not invent categories or counts — say the lookup returned no data and offer to try a more specific question."
         )
 
     @staticmethod
@@ -147,7 +228,7 @@ class LocalLLM:
         report_context: str | None = None,
         tool_context: str | None = None,
     ) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt()}]
+        messages: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt() + self._database_facts()}]
 
         if tool_context:
             messages.append({"role": "system", "content": f"Past tool call history:\n{tool_context}"})
@@ -281,6 +362,22 @@ class LocalLLM:
                             "watches it alongside this chat). Mention briefly that they are shown in "
                             "the viewer.\n\n" + db_context
                         )
+                anomaly_locations_called = any(
+                    call.get("name") == "get_anomaly_locations"
+                    for call in self.db_client.last_tool_calls
+                )
+                if (
+                    anomaly_locations_called
+                    and db_context
+                    and re.search(r"\b(where|locations?|located|coordinates?|positions?|spatial|area)\b", prompt, re.IGNORECASE)
+                ):
+                    db_context = (
+                        "The user explicitly asked WHERE the anomalies are. The get_anomaly_locations "
+                        "output below lists each anomaly pair with the 3D camera position where it was "
+                        "observed. You MUST quote several of these exact (x, y, z) coordinates in your "
+                        "answer (always include the z value); you may group them by area, but do not "
+                        "answer with area descriptions alone.\n\n" + db_context
+                    )
             except Exception as exc:
                 logger.warning("DB lookup failed: %s", exc)
 
@@ -290,8 +387,12 @@ class LocalLLM:
                 report_context = self.report_client.get_context()
                 image_urls = self.report_client.get_image_urls()
                 if image_urls:
-                    report_context += "\n\n--- Extracted anomaly images ---\n"
-                    report_context += "The following images are available for reference:\n"
+                    report_context += "\n\n--- Anomaly images ---\n"
+                    report_context += (
+                        "The following images are available. '/reports/reference/<N>_result.jpg' is the annotated "
+                        "result for the report's 'Frame N' — the same frame the anomaly was found on, with the "
+                        "anomaly boxes drawn:\n"
+                    )
                     for url in image_urls:
                         report_context += f"- {url}\n"
                 if report_context:
@@ -309,6 +410,14 @@ class LocalLLM:
                 debug_payload["tool_calls"] = tool_results
             if tool_router_raw:
                 debug_payload["tool_router_raw"] = tool_router_raw
+            if self.db_client is not None:
+                highlight_status = self.db_client.last_highlight_status
+                highlight_args = self.db_client.last_highlight_args
+                if highlight_status or highlight_args:
+                    debug_payload["highlight"] = {
+                        "status": highlight_status,
+                        "args": highlight_args,
+                    }
             if debug_payload:
                 tool_calls_callback(debug_payload)
 
@@ -677,7 +786,7 @@ class LocalLLM:
         try:
             logger.info("Preloading LLM model: %s via %s", self.settings.llm_model_name, self.settings.llm_provider)
             preload_messages = [
-                {"role": "system", "content": self._system_prompt()},
+                {"role": "system", "content": self._system_prompt() + self._database_facts()},
                 {"role": "user", "content": "Hi"},
             ]
             provider = self.settings.llm_provider.lower().strip()

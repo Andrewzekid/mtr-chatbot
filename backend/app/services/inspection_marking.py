@@ -23,7 +23,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-DEFAULT_DB = "../MTR Inspection Database/inspection_v2.db"
+DEFAULT_DB = "../MTR Inspection Database/inspection_v2_mtr_new.db"
 DEFAULT_MAP = "../MTR Inspection Database/outputs/colored_map.pcd"
 DEFAULT_OBJECTS_DIR = "../MTR Inspection Database/outputs/objects"
 DEFAULT_LEVELLING_RPY_DEG = [0.0, 20.0, 0.0]
@@ -398,9 +398,13 @@ class InspectionMarker:
         row = cur.fetchone()
         return dict(row) if row is not None else None
 
-    def _query_objects_by_category(self, category: str) -> tuple[str | None, list[dict[str, Any]]]:
+    def _query_objects_by_category(
+        self, category: str, inspection_id: int | None = None
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         """Return (matched_name, rows). category may be exact name,
-        case-insensitive name, or slug. rows ordered by id."""
+        case-insensitive name, or slug. rows ordered by id. When
+        ``inspection_id`` is given, only objects seen in that inspection
+        (via detections -> images) are returned."""
         cats = self._categories()
         wanted = category.strip()
         wanted_slug = category_slug(wanted)
@@ -415,12 +419,23 @@ class InspectionMarker:
                 break
         if match is None:
             return None, []
-        cur = self.conn.execute(
-            "SELECT o.id, c.name AS category FROM objects o "
-            "JOIN categories c ON o.category_id = c.id WHERE c.name = ? "
-            "ORDER BY o.id",
-            (match,),
-        )
+        if inspection_id is not None:
+            cur = self.conn.execute(
+                "SELECT DISTINCT o.id, c.name AS category FROM objects o "
+                "JOIN categories c ON o.category_id = c.id "
+                "JOIN detections d ON d.object_id = o.id "
+                "JOIN images i ON i.id = d.image_id "
+                "WHERE c.name = ? AND i.inspection_id = ? "
+                "ORDER BY o.id",
+                (match, int(inspection_id)),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT o.id, c.name AS category FROM objects o "
+                "JOIN categories c ON o.category_id = c.id WHERE c.name = ? "
+                "ORDER BY o.id",
+                (match,),
+            )
         return match, [dict(r) for r in cur.fetchall()]
 
     def _load_object_cloud(self, object_id: int) -> np.ndarray | None:
@@ -464,9 +479,13 @@ class InspectionMarker:
         for object_id in object_ids:
             self.mark_by_id(object_id)
 
-    def mark_by_category(self, category: str) -> None:
-        """Mark every object's segmented cloud of a category on the map."""
-        match, rows = self._query_objects_by_category(category)
+    def mark_by_category(self, category: str, inspection_id: int | None = None) -> None:
+        """Mark every object's segmented cloud of a category on the map.
+
+        When ``inspection_id`` is given, only that inspection's objects are
+        marked, under a per-inspection entity path so scoped and unscoped
+        marks can coexist."""
+        match, rows = self._query_objects_by_category(category, inspection_id=inspection_id)
         if match is None:
             print(
                 f"[mark_by_category] unknown category '{category}'. "
@@ -481,15 +500,20 @@ class InspectionMarker:
                 chunks.append(pts)
                 ids.append(int(r["id"]))
         if not chunks:
-            print(f"[mark_by_category] '{match}': no segmented clouds found")
+            scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+            print(f"[mark_by_category] '{match}'{scope}: no segmented clouds found")
             return
         pts = np.concatenate(chunks)
+        ent = f"{self.marks_root}/cat_{category_slug(match)}"
+        if inspection_id is not None:
+            ent += f"/insp_{int(inspection_id)}"
         rr.log(
-            f"{self.marks_root}/cat_{category_slug(match)}",
+            ent,
             rr.Points3D(pts, colors=np.tile(color, (pts.shape[0], 1))),
         )
+        scope = f" inspection {inspection_id}," if inspection_id is not None else ""
         print(
-            f"[mark_by_category] '{match}': {len(ids)} objects, "
+            f"[mark_by_category] '{match}':{scope} {len(ids)} objects, "
             f"{pts.shape[0]} pts (ids {ids[0]}..{ids[-1]})"
         )
 

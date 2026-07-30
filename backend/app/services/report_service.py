@@ -77,15 +77,27 @@ class InspectionReportClient:
         return self._context
 
     def get_image_urls(self) -> list[str]:
-        """Return relative URLs for extracted anomaly images."""
+        """Return relative URLs for anomaly images from the reports directory.
+
+        Combines legacy ``extracted_images/`` with the annotated per-frame
+        result images at the reports root. ``<N>_result.jpg`` is the annotated
+        counterpart (anomaly bboxes drawn) of the database's ground-truth image
+        with id N — the same frame the report calls "Frame N"."""
+        urls: list[str] = []
         images_dir = self.reports_dir / "extracted_images"
-        if not images_dir.exists():
-            return []
-        names = sorted(
-            p.name for p in images_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        )
-        return [f"/reports/extracted_images/{name}" for name in names]
+        if images_dir.exists():
+            names = sorted(
+                p.name for p in images_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            )
+            urls.extend(f"/reports/extracted_images/{name}" for name in names)
+        if self.reports_dir.exists():
+            names = sorted(
+                p.name for p in self.reports_dir.iterdir()
+                if p.is_file() and p.name.endswith("_result.jpg")
+            )
+            urls.extend(f"/reports/reference/{name}" for name in names)
+        return urls
 
     def lookup(self, query: str | None = None) -> str | None:
         """Return the full report context, including anomaly images if available.

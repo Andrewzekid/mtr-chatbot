@@ -1,0 +1,19 @@
+{
+  "status": "ANOMALY",
+  "summary": "A foreign object anomaly is detected: a fire extinguisher is lying on the floor in the foreground. No other clear fixed-facility anomalies are visible, and the ceiling lights appear consistent. People are present but ignored as dynamic objects.",
+  "viewpoint_change": false,
+  "anomalies": [
+    {
+      "type": "foreign_object",
+      "object": "fire extinguisher lying on the floor",
+      "location": "foreground floor, slightly left of center",
+      "bbox": [
+        270,
+        748,
+        432,
+        860
+      ],
+      "note": "New object present in current scene; not seen in reference."
+    }
+  ]
+}
