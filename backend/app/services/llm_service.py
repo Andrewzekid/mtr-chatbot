@@ -381,6 +381,12 @@ class LocalLLM:
                         "status": highlight_status,
                         "args": highlight_args,
                     }
+                highlight_history = self.db_client.highlight_history
+                if highlight_history:
+                    debug_payload["highlight_history"] = highlight_history
+                rerun_stats = self.db_client.rerun_job_stats
+                if rerun_stats:
+                    debug_payload["rerun_stats"] = rerun_stats
             if debug_payload:
                 tool_calls_callback(debug_payload)
 

@@ -68,6 +68,28 @@ class InspectionDBClient:
         """Normalized args of the last Rerun highlight push (for the debug panel)."""
         return self._last_highlight_args
 
+    @property
+    def highlight_history(self) -> list[dict[str, Any]]:
+        """All Rerun highlight commands issued during this session, oldest first."""
+        return list(self._highlight_history)
+
+    @property
+    def rerun_job_stats(self) -> dict[str, Any] | None:
+        """Background Rerun worker counters (for debugging viewer staleness)."""
+        if self.rerun_visualizer is None:
+            return None
+        return self.rerun_visualizer.job_stats()
+
+    def _record_highlight(self, args: dict[str, Any], status: str | None) -> None:
+        """Append a highlight call to the session history for debugging."""
+        self._highlight_history.append(
+            {
+                "args": dict(args),
+                "status": status,
+                "query": self._last_query,
+            }
+        )
+
     def _record_tool_calls(self, tool_calls: list[tuple[str, dict[str, Any]]]) -> None:
         self._last_tool_calls = [
             {"name": name, "args": args} for name, args in tool_calls
@@ -128,6 +150,9 @@ class InspectionDBClient:
         # Normalized args of the last Rerun highlight (decider, explicit tool, or
         # merged fallback) so the debug panel can show what was pushed to the viewer.
         self._last_highlight_args: dict[str, Any] | None = None
+        # Session history of every Rerun highlight command, for debugging why the
+        # viewer did or did not update.
+        self._highlight_history: list[dict[str, Any]] = []
         # Cache for the full anomaly trio (report + locations + details) so generic
         # anomaly follow-ups reuse the previous turn instead of re-querying.
         self._last_anomaly_trio_context: str | None = None
@@ -588,6 +613,95 @@ class InspectionDBClient:
                     "centroid_x": tx,
                     "centroid_y": ty,
                     "centroid_z": tz,
+                    "nearby": nearby[:nearby_limit] if nearby_limit is not None else nearby,
+                }
+            )
+        return results
+
+    def get_objects_proximity_with_images(
+        self,
+        object_ids: list[int],
+        target_category: str,
+        radius_m: float = 2.0,
+        limit: int | str | None = None,
+        nearby_limit: int | str | None = None,
+        inspection_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """For each object in *object_ids*, return nearby objects of *target_category*.
+
+        This is the object-id counterpart of ``get_category_proximity_with_images``:
+        the caller supplies specific source object IDs (e.g. objects 9 and 11) and
+        a target category (e.g. Lights), and the method returns the Lights that are
+        within *radius_m* of each source object, with distances, coordinates, and
+        sample frames.
+        """
+        limit = self._resolve_limit(limit)
+        nearby_limit = self._resolve_limit(nearby_limit)
+        if not object_ids:
+            return []
+        placeholders = ",".join("?" for _ in object_ids)
+        conn = self._connect()
+        sources = conn.execute(
+            f"""
+            SELECT o.id, c.name AS category,
+                   o.centroid_x, o.centroid_y, o.centroid_z
+            FROM objects o JOIN categories c ON c.id=o.category_id
+            WHERE o.id IN ({placeholders})
+            ORDER BY o.id
+            """,
+            tuple(object_ids),
+        ).fetchall()
+        sources = [dict(row) for row in sources]
+        if not sources:
+            return []
+        if limit is not None:
+            sources = sources[:limit]
+
+        targets = self._object_rows(
+            "c.name = ?", (target_category,), inspection_id=inspection_id
+        )
+        if not targets:
+            return []
+
+        results: list[dict[str, Any]] = []
+        for source in sources:
+            sx, sy, sz = source["centroid_x"], source["centroid_y"], source["centroid_z"]
+            if sx is None or sy is None or sz is None:
+                continue
+            nearby: list[dict[str, Any]] = []
+            for row in targets:
+                if row["id"] == source["id"]:
+                    continue
+                tx, ty, tz = row["centroid_x"], row["centroid_y"], row["centroid_z"]
+                if tx is None or ty is None or tz is None:
+                    continue
+                dx, dy, dz = tx - sx, ty - sy, tz - sz
+                dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+                if dist <= radius_m:
+                    sample = conn.execute(
+                        "SELECT i.filename FROM detections d JOIN images i ON i.id=d.image_id "
+                        "WHERE d.object_id=? AND i.filename IS NOT NULL ORDER BY i.timestamp_ns LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    nearby.append(
+                        {
+                            "object_id": row["id"],
+                            "category": row["category"],
+                            "distance_m": round(dist, 3),
+                            "centroid_x": tx,
+                            "centroid_y": ty,
+                            "centroid_z": tz,
+                            "sample_image_path": sample["filename"] if sample else None,
+                        }
+                    )
+            nearby.sort(key=lambda r: r["distance_m"])
+            results.append(
+                {
+                    "source_object_id": source["id"],
+                    "source_category": source.get("category"),
+                    "centroid_x": sx,
+                    "centroid_y": sy,
+                    "centroid_z": sz,
                     "nearby": nearby[:nearby_limit] if nearby_limit is not None else nearby,
                 }
             )
@@ -1369,7 +1483,12 @@ class InspectionDBClient:
             return f"/reports/reference/{candidate.name}"
         return None
 
-    def get_anomaly_locations(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+    def get_anomaly_locations(
+        self,
+        inspection_id: int | None = None,
+        anomaly_id: int | None = None,
+        anomaly_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         """3D location of each anomaly, derived from the camera pose of the images.
 
         Every abnormal pair links a ground-truth image (``gt_image``) and an
@@ -1385,8 +1504,18 @@ class InspectionDBClient:
         if not self._anomaly_tables_exist():
             return []
         conn = self._connect()
-        where = " WHERE ii.inspection_id=?" if inspection_id is not None else ""
-        params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if inspection_id is not None:
+            clauses.append("ii.inspection_id = ?")
+            params.append(inspection_id)
+        if anomaly_id is not None:
+            clauses.append("ab.id = ?")
+            params.append(anomaly_id)
+        if anomaly_type:
+            clauses.append("t.name = ?")
+            params.append(anomaly_type)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = conn.execute(
             f"""
             SELECT ab.id AS abnormality_id,
@@ -1403,11 +1532,16 @@ class InspectionDBClient:
             {where}
             ORDER BY ab.id
             """,
-            params,
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def anomaly_location_points(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
+    def anomaly_location_points(
+        self,
+        inspection_id: int | None = None,
+        anomaly_id: int | None = None,
+        anomaly_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Anomaly markers as Rerun coordinate dicts: {x, y, z, label, color} (orange).
 
         Because ``get_anomaly_locations`` now returns one row per abnormality,
@@ -1417,7 +1551,11 @@ class InspectionDBClient:
         # Group by pair so pairs with multiple abnormalities produce one point.
         by_pair: dict[int, dict[str, Any]] = {}
         labels_by_pair: dict[int, list[str]] = {}
-        for row in self.get_anomaly_locations(inspection_id=inspection_id):
+        for row in self.get_anomaly_locations(
+            inspection_id=inspection_id,
+            anomaly_id=anomaly_id,
+            anomaly_type=anomaly_type,
+        ):
             pair_id = int(row["pair_id"])
             if pair_id not in by_pair:
                 by_pair[pair_id] = dict(row)
@@ -1530,11 +1668,32 @@ class InspectionDBClient:
                     decision = await asyncio.to_thread(
                         self.router.decide_highlights, query, db_context, chat_history
                     )
+                    logger.info("Cached-path final-pass highlight decision: %s", decision)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Final-pass highlight decision failed: %s", exc)
+                    logger.warning("Cached-path final-pass highlight decision failed: %s", exc)
                     decision = None
-                if decision:
+                if decision and self._decision_matches_tool_results(decision, all_tool_calls):
                     self._last_highlight_status = self._apply_highlight_decision(decision)
+                    logger.info("Cached-path final-pass highlight status: %s", self._last_highlight_status)
+                else:
+                    if decision:
+                        logger.info(
+                            "Cached-path final-pass decision mismatched anomaly query; using fallback"
+                        )
+                    # Fallback: generic anomaly follow-ups should still mark anomaly
+                    # locations in the viewer, scoped to whatever the cached turn asked.
+                    coords = self._scoped_anomaly_coordinates(all_tool_calls, query)
+                    logger.info(
+                        "Cached-path fallback: highlighting %d scoped anomaly location(s)",
+                        len(coords),
+                    )
+                    self._last_highlight_status = self._highlight_in_rerun(
+                        {
+                            "coordinates": coords,
+                            "label": "anomaly locations",
+                            "keep_existing": False,
+                        }
+                    )
             return db_context
 
         max_rounds = getattr(self.settings, "tool_router_max_rounds", 1) if self.settings else 1
@@ -1667,11 +1826,17 @@ class InspectionDBClient:
                     decision = await asyncio.to_thread(
                         self.router.decide_highlights, query, db_context, chat_history
                     )
+                    logger.info("Final-pass highlight decision: %s", decision)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Final-pass highlight decision failed: %s", exc)
                     decision = None
-                if decision:
+                if decision and self._decision_matches_tool_results(decision, all_tool_calls):
                     self._last_highlight_status = self._apply_highlight_decision(decision)
+                    logger.info("Final-pass highlight status: %s", self._last_highlight_status)
+                elif decision:
+                    logger.info(
+                        "Final-pass highlight decision mismatched tool results; using deterministic fallback"
+                    )
 
                 # Fallback: if the user asked about objects of a category and the LLM
                 # decider still did not highlight anything, ensure the relevant category
@@ -1702,13 +1867,58 @@ class InspectionDBClient:
                                 if canon not in merged_categories:
                                     merged_categories.append(canon)
                         elif name in {"get_category_proximity", "get_category_proximity_with_images"}:
+                            # Proximity questions: highlight the SPECIFIC object pairs that are
+                            # within the radius, not the whole categories.  Use the image variant
+                            # so we get the actual nearby object ids (the count-only variant only
+                            # returns category counts).
                             target = args.get("target_category")
                             others = args.get("other_categories") or []
-                            for c in [target] + list(others):
-                                if c:
-                                    canon = self._canonical_category(c)
-                                    if canon not in merged_categories:
-                                        merged_categories.append(canon)
+                            radius = float(args.get("radius_m", 2.0))
+                            inspection_id = args.get("inspection_id")
+                            if target and others:
+                                prox = self.get_category_proximity_with_images(
+                                    self._canonical_category(target),
+                                    [self._canonical_category(c) for c in others],
+                                    radius_m=radius,
+                                    limit="all",
+                                    nearby_limit="all",
+                                    inspection_id=inspection_id,
+                                )
+                                for r in prox:
+                                    oid = int(r["object_id"])
+                                    if oid not in merged_object_ids:
+                                        merged_object_ids.append(oid)
+                                    for n in r.get("nearby", []):
+                                        nid = int(n["object_id"])
+                                        if nid not in merged_object_ids:
+                                            merged_object_ids.append(nid)
+                        elif name == "get_objects_proximity_with_images":
+                            # Object-ID proximity: highlight both the source objects and the
+                            # nearby target-category objects that were returned.
+                            raw_ids = args.get("object_ids", args.get("object_id", []))
+                            if isinstance(raw_ids, (int, float)):
+                                raw_ids = [int(raw_ids)]
+                            object_ids = [int(i) for i in raw_ids if i is not None]
+                            target = self._canonical_category(args.get("target_category"))
+                            radius = float(args.get("radius_m", 2.0))
+                            inspection_id = args.get("inspection_id")
+                            for oid in object_ids:
+                                if oid not in merged_object_ids:
+                                    merged_object_ids.append(oid)
+                            if object_ids and target:
+                                prox = self.get_objects_proximity_with_images(
+                                    object_ids,
+                                    target,
+                                    radius_m=radius,
+                                    limit="all",
+                                    nearby_limit="all",
+                                    inspection_id=inspection_id,
+                                )
+                                for r in prox:
+                                    for n in r.get("nearby", []):
+                                        nid = int(n["object_id"])
+                                        if nid not in merged_object_ids:
+                                            merged_object_ids.append(nid)
                         elif name == "get_category_windows":
                             for c in args.get("categories") or []:
                                 if c:
@@ -1725,16 +1935,8 @@ class InspectionDBClient:
                             # Added once per query even when several anomaly tools ran.
                             if not anomaly_coords_added:
                                 anomaly_coords_added = True
-                                ins_ids = {
-                                    int(a["inspection_id"])
-                                    for n, a in all_tool_calls
-                                    if n in {"get_anomalies", "get_anomaly_summary", "get_anomaly_locations"}
-                                    and a.get("inspection_id") is not None
-                                }
                                 merged_coordinates.extend(
-                                    self.anomaly_location_points(
-                                        inspection_id=ins_ids.pop() if len(ins_ids) == 1 else None
-                                    )
+                                    self._scoped_anomaly_coordinates(all_tool_calls, query)
                                 )
                         elif name in {"get_summary", "get_categories"}:
                             # Broad "tell me about all the objects" queries: every
@@ -1751,6 +1953,10 @@ class InspectionDBClient:
                         if merged_coordinates:
                             highlight_args["coordinates"] = merged_coordinates
                             highlight_args["label"] = "anomaly locations"
+                        logger.info(
+                            "Fallback highlight triggered with categories=%s object_ids=%s coordinates=%d",
+                            merged_categories, merged_object_ids, len(merged_coordinates)
+                        )
                         # If every contributing tool call was scoped to the same
                         # inspection, scope the highlight too so the viewer marks only
                         # that inspection's objects of the category. When multiple
@@ -1973,6 +2179,7 @@ class InspectionDBClient:
                     status = self.rerun_visualizer.clear()
                 self._last_highlight_status = status
                 self._last_highlight_args = {"clear": True}
+                self._record_highlight({"clear": True}, status)
                 return status
             if tool_name == "get_summary":
                 return self._format_summary(inspection_id=_inspection_id())
@@ -2033,6 +2240,23 @@ class InspectionDBClient:
                 return self._format_category_proximity_with_images(
                     target,
                     [self._canonical_category(c) for c in others],
+                    radius,
+                    limit=limit,
+                    nearby_limit=nearby_limit,
+                    inspection_id=_inspection_id(),
+                )
+            if tool_name == "get_objects_proximity_with_images":
+                raw_ids = args.get("object_ids", args.get("object_id", []))
+                if isinstance(raw_ids, (int, float)):
+                    raw_ids = [int(raw_ids)]
+                object_ids = [int(i) for i in raw_ids if i is not None]
+                target = self._canonical_category(args["target_category"])
+                radius = float(args.get("radius_m", 2.0))
+                limit = self._resolve_limit(args.get("limit"), default=None)
+                nearby_limit = self._resolve_limit(args.get("nearby_limit"), default=None)
+                return self._format_objects_proximity_with_images(
+                    object_ids,
+                    target,
                     radius,
                     limit=limit,
                     nearby_limit=nearby_limit,
@@ -2141,21 +2365,12 @@ class InspectionDBClient:
             logger.warning("Tool execution failed for %s with args %s: %s", tool_name, args, exc)
         return None
 
-    # Labels the LLM sometimes emits for anomaly coordinates.
-    _GENERIC_ANOMALY_LABELS = {
-        "anomaly location",
-        "anomaly",
-        "anomalies",
-        "abnormal",
-        "abnormality",
-        "",
-    }
-
     def _enrich_coordinate_labels(self, coords: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace generic anomaly coordinate labels with rich labels from the DB.
+        """Rewrite labels at known anomaly camera positions to rich labels.
 
-        Matches coordinates against known anomaly camera positions; when a generic
-        label is found near a known anomaly, the label is rewritten to
+        Matches coordinates against the camera positions returned by
+        ``anomaly_location_points``; when a coordinate falls on an anomaly
+        viewpoint, its label is replaced with the canonical form
         'Anomaly {abnormality_id}: {type}, {object}' (multiple abnormalities in
         the same pair are joined with '; ').
         """
@@ -2176,21 +2391,37 @@ class InspectionDBClient:
                 out.append(c)
                 continue
             enriched = dict(c)
-            current_label = str(enriched.get("label") or "").strip().lower()
-            if current_label in self._GENERIC_ANOMALY_LABELS:
-                try:
-                    key = (
-                        round(float(c["x"]) * 100),
-                        round(float(c["y"]) * 100),
-                        round(float(c["z"]) * 100),
-                    )
-                    rich = label_map.get(key)
-                    if rich:
-                        enriched["label"] = rich
-                except (KeyError, TypeError, ValueError):
-                    pass
+            try:
+                key = (
+                    round(float(c["x"]) * 100),
+                    round(float(c["y"]) * 100),
+                    round(float(c["z"]) * 100),
+                )
+                rich = label_map.get(key)
+                if rich:
+                    enriched["label"] = rich
+            except (KeyError, TypeError, ValueError):
+                pass
             out.append(enriched)
         return out
+
+    def _scoped_anomaly_coordinates(
+        self,
+        tool_calls: list[tuple[str, dict[str, Any]]],
+        query: str,
+    ) -> list[dict[str, Any]]:
+        """Anomaly coordinates filtered to the scope the user asked for.
+
+        Uses explicit anomaly tool arguments when available, then falls back to
+        parsing the query.  This prevents a single-anomaly question from lighting
+        up every anomaly location in the viewer.
+        """
+        scope = self._resolve_anomaly_scope(tool_calls, query)
+        return self.anomaly_location_points(
+            inspection_id=scope.get("inspection_id"),
+            anomaly_id=scope.get("anomaly_id"),
+            anomaly_type=scope.get("anomaly_type"),
+        )
 
     def _highlight_in_rerun(self, args: dict[str, Any]) -> str:
         object_ids = args.get("object_ids") or []
@@ -2218,10 +2449,12 @@ class InspectionDBClient:
             status = "Rerun visualization is not configured on this backend."
             self._last_highlight_args = normalized
             self._last_highlight_status = status
+            self._record_highlight(normalized, status)
             return status
         status = self.rerun_visualizer.highlight(**normalized)
         self._last_highlight_args = normalized
         self._last_highlight_status = status
+        self._record_highlight(normalized, status)
         return status
 
     # ------------------------------------------------------------------
@@ -2289,10 +2522,46 @@ class InspectionDBClient:
         try:
             status = self.rerun_visualizer.highlight(**normalized)
             self._last_highlight_args = normalized
+            self._last_highlight_status = status
+            self._record_highlight(normalized, status)
             return status
         except Exception as exc:  # noqa: BLE001
             logger.warning("Final-pass Rerun highlight failed: %s", exc)
             return None
+
+    def _decision_matches_tool_results(
+        self,
+        decision: dict[str, Any],
+        tool_calls: list[tuple[str, dict[str, Any]]],
+    ) -> bool:
+        """Return False when the LLM chose a broad category highlight for a query
+        that specifically returned proximity or anomaly results.
+
+        Proximity and anomaly questions need precise marks (object ids or anomaly
+        camera positions).  A category-level highlight would light up every object
+        in those categories, so we reject it and let the deterministic fallback run.
+        """
+        names = {name for name, _ in tool_calls}
+        had_proximity = bool(
+            names & {"get_category_proximity", "get_category_proximity_with_images", "get_objects_proximity_with_images"}
+        )
+        had_anomaly = bool(
+            names & {"get_anomalies", "get_anomaly_locations", "get_anomaly_summary"}
+        )
+        if not (had_proximity or had_anomaly):
+            return True
+
+        has_object_ids = bool(decision.get("object_ids"))
+        has_coordinates = bool(decision.get("coordinates"))
+        has_categories = bool(decision.get("category") or decision.get("categories"))
+
+        if had_proximity:
+            # Proximity results list specific nearby object ids; categories are wrong.
+            return has_object_ids or has_coordinates
+        # Anomaly results are about anomaly camera locations; only coordinate highlights
+        # make sense here.  Object ids from the LLM are usually misinterpretations of
+        # the abnormality id, and category highlighting is far too broad.
+        return has_coordinates
 
     # ------------------------------------------------------------------
     # Image annotation
@@ -2741,6 +3010,57 @@ class InspectionDBClient:
                     lines.append(f"    ![nearby frame]({sample_url})")
         if total_nearby == 0:
             lines.append(f"No {', '.join(other_categories)} objects were found within {radius_m} m of any '{target_category}' object.")
+        return "\n".join(lines)
+
+    def _format_objects_proximity_with_images(
+        self,
+        object_ids: list[int],
+        target_category: str,
+        radius_m: float = 2.0,
+        limit: int | None = None,
+        nearby_limit: int | None = None,
+        inspection_id: int | None = None,
+    ) -> str:
+        results = self.get_objects_proximity_with_images(
+            object_ids,
+            target_category,
+            radius_m,
+            limit=limit,
+            nearby_limit=nearby_limit,
+            inspection_id=inspection_id,
+        )
+        if not results:
+            return f"No '{target_category}' objects found near objects {object_ids} within {radius_m} m."
+
+        scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
+        lines = [
+            f"'{target_category}' objects within {radius_m} m of objects {object_ids}{scope}, "
+            f"with object IDs, distances, coordinates, and sample images:"
+        ]
+        total_nearby = 0
+        for r in results:
+            nearby = r["nearby"]
+            if not nearby:
+                continue
+            total_nearby += len(nearby)
+            lines.append(
+                f"- Near Object {r['source_object_id']} "
+                f"({r.get('source_category', 'unknown')}) at "
+                f"{self._format_xyz(r['centroid_x'], r['centroid_y'], r['centroid_z'])}:"
+            )
+            for n in nearby:
+                lines.append(
+                    f"  - Object {n['object_id']} ({n['category']}): "
+                    f"{n['distance_m']:.2f} m away at "
+                    f"{self._format_xyz(n['centroid_x'], n['centroid_y'], n['centroid_z'])}"
+                )
+                sample_url = self._image_url(n.get("sample_image_path"))
+                if sample_url:
+                    lines.append(f"    ![nearby frame]({sample_url})")
+        if total_nearby == 0:
+            lines.append(
+                f"No '{target_category}' objects were found within {radius_m} m of the specified objects."
+            )
         return "\n".join(lines)
 
     def _format_object_timeline(self, object_id: int) -> str:
@@ -3239,7 +3559,7 @@ class InspectionDBClient:
                 if r["min_x"] is not None else "no bbox"
             )
             lines.append(
-                f"- Abnormality {r['id']} (pair {r['pair_id']}, inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
+                f"- Anomaly {r['id']} (inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
             )
             if r.get("object"):
                 lines.append(f"  object: {r['object']}")

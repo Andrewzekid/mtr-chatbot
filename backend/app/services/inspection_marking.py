@@ -321,7 +321,12 @@ class InspectionMarker:
             rr.spawn(connect=False)
             sinks.append(rr.GrpcSink())
         elif connect_url is not None:
-            sinks.append(rr.GrpcSink(connect_url) if connect_url else rr.GrpcSink())
+            # Rerun 0.34+ expects the viewer proxy URL to carry the /proxy path
+            # and a rerun(+http(s)) scheme.  Plain "host:port" strings are rejected.
+            url = str(connect_url).strip()
+            if url and not url.startswith(("rerun://", "rerun+http://", "rerun+https://")):
+                url = f"rerun+http://{url}/proxy"
+            sinks.append(rr.GrpcSink(url) if url else rr.GrpcSink())
         if rrd_path:
             rrd_path = str(Path(rrd_path).expanduser())
             Path(rrd_path).parent.mkdir(parents=True, exist_ok=True)

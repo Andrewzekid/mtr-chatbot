@@ -173,6 +173,20 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "get_objects_proximity_with_images",
+        "description": "Objects of a target category within radius_m of specific source object IDs, including object IDs, distances, coordinates, and sample images. Use this when the user asks about objects near specific object IDs, e.g. 'what are the lights near objects 9 and 11?' or 'show me advertisement boards around object 15'.",
+        "parameters": _params(
+            {
+                "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Source object IDs to use as reference points, e.g. [9, 11]."},
+                "target_category": {"type": "string", "description": "Category of objects to find near the source object IDs, e.g. Lights."},
+                "radius_m": {"type": "number", "description": "Search radius in meters around each source object centroid.", "default": 2.0},
+                "limit": {"type": ["integer", "string"], "description": "Optional cap on source objects; use 'all' or omit to process every source object ID."},
+                "nearby_limit": {"type": ["integer", "string"], "description": "Optional cap on nearby results per source; use 'all' or omit to return every matching result."},
+            },
+            required=["object_ids", "target_category"],
+        ),
+    },
+    {
         "name": "get_inspection_timeline",
         "description": "Full chronological log of every object detected during the inspection (or one inspection when inspection_id is given).",
         "parameters": _params({}),
@@ -522,6 +536,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 13. get_category_objects_with_images(category, limit, inspection_id) — object ids, coordinates, and a sample image each (default limit 5).
 14. get_category_proximity(target_category, other_categories[], radius_m, inspection_id) — counts of other-category objects near each target object (numbers only, no images).
 14a. get_category_proximity_with_images(target_category, other_categories[], radius_m, limit, nearby_limit, inspection_id) — nearby objects with object IDs, distances, coordinates, and sample images. Use for 'show me X near Y'.
+14b. get_objects_proximity_with_images(object_ids[], target_category, radius_m, limit, nearby_limit, inspection_id) — objects of target_category near specific object IDs, with IDs, distances, coordinates, and sample images. Use for 'what are the lights near objects 9 and 11?'.
 15. get_inspection_timeline(inspection_id) — chronological object log.
 16. get_temporal_clusters(window_ms, top_n, inspection_id) — busiest moments grouped by time window.
 17. get_detection_counts_by_category(inspection_id) — per-frame detection counts per category.
@@ -644,8 +659,9 @@ Plan:
 - DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, proximity, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
 - When the user asks about anomalies, findings, issues, problems, defects, or state changes, ALWAYS call the relevant anomaly DB tools together: get_anomaly_summary (counts by type), get_anomaly_locations (3D coordinates), and get_anomalies (details with images) — no matter how narrow the wording is ('where', 'how many', 'what'). The backend tops up whichever of these you skip. Do not call coordinate tools for pure anomaly questions. Whenever anomaly tools run, the anomaly locations (camera positions of the abnormal image pairs) are automatically marked in the Rerun viewer — no highlight_in_rerun call needed.
 - IMPORTANT id distinction: get_anomaly_locations and get_anomalies use the user-facing abnormality id (`abnormalities.id`), e.g. 'Anomaly 9'. The internal image-pair id (`abnormal_detections.id`) is NEVER shown to the user and must NOT be used when the user says 'anomaly N'. When highlighting an anomaly in Rerun, use the exact label from get_anomaly_locations such as 'Anomaly 9: missing_object, ceiling/wall cover panel'.
-- CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images. 'Show me' requests ALWAYS produce BOTH outputs: 2D images in the chat AND a 3D highlight of the relevant objects/categories in the Rerun viewer — the final pass handles the 3D highlight automatically, so you just need to call the right image tool(s).
+- CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, get_objects_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images. 'Show me' requests ALWAYS produce BOTH outputs: 2D images in the chat AND a 3D highlight of the relevant objects/categories in the Rerun viewer — the final pass handles the 3D highlight automatically, so you just need to call the right image tool(s).
 - For 'show me X near Y within R meters' queries, use get_category_proximity_with_images so the nearby objects include sample frames.
+- For queries about objects near specific object IDs like 'what are the lights near objects 9 and 11?' or 'show me advertisement boards around object 15', use get_objects_proximity_with_images(object_ids=[9, 11], target_category='Lights').
 - For 'show me X at time T' queries, use get_images_in_time_range (optionally with category) to return actual frames.
 - Image limit rule: for image-returning tools, OMIT the limit so the default of 5 (a representative subset) applies. Only pass limit='all' (or a larger number) when the user explicitly says 'all', 'every', or asks for more images. Non-image listing tools (get_objects_by_category, get_category_objects_coordinates) return every matching object by default — do not cap them unless the user asks for a subset.
 - Do not output explanatory text; only emit tool calls.
@@ -897,6 +913,7 @@ Plan:
             "get_object_image_paths",
             "get_images_in_time_range",
             "get_category_proximity_with_images",
+            "get_objects_proximity_with_images",
             "get_anomalies",
         }
         image_keywords = (
@@ -1046,16 +1063,19 @@ Plan:
             "explicitly asked not to.\n\n"
             "Rules:\n"
             "1. If the user's question is about a category in any way — count, list, summary, images, "
-            "coordinates, or proximity — highlight that category. If the question names MULTIPLE categories, "
+            "coordinates — highlight that category. If the question names MULTIPLE categories, "
             "highlight ALL of them via categories=[...], never just one.\n"
-            "2. If the user asks about objects near / within / around another category (e.g. 'what are "
-            "advertisement boards within 2m of lights?', 'show me lights near ticket gates'), highlight "
-            "BOTH categories involved by passing categories=['CategoryA', 'CategoryB'], or include all "
-            "relevant object_ids from the tool results.\n"
-            "3. Use object_ids ONLY when the user asked about specific, individually-named objects "
-            "(e.g. 'object 16', 'objects 16 and 19'). For category-level questions, highlight the WHOLE "
-            "category via category/categories even when the tool results list individual object ids — "
-            "'show me all lights' means every light, not just the few ids in a truncated tool result.\n"
+            "2. If the user asks about objects NEAR / WITHIN / AROUND another category (e.g. 'what are "
+            "advertisement boards within 2m of lights?', 'show me lights near ticket gates'), do NOT "
+            "highlight the whole categories — that would light up every object, not just the nearby ones. "
+            "Instead, extract the SPECIFIC object_ids returned by the proximity tool (e.g. get_category_proximity, "
+            "get_category_proximity_with_images) and pass those object_ids. The proximity results already list "
+            "which object pairs are within the radius; highlight exactly those ids so the viewer shows only the "
+            "relevant lights and ad boards.\n"
+            "3. Use object_ids when the user asked about specific, individually-named objects "
+            "(e.g. 'object 16', 'objects 16 and 19') OR when a proximity tool returned specific nearby object ids. "
+            "For broad category-level questions ('show me all lights'), highlight the WHOLE category via "
+            "category/categories — 'show me all lights' means every light, not just a few ids.\n"
             "4. If the user asked to SEE objects of a category (e.g. 'show me all advertisement boards', "
             "'display the ticket gates', 'show me some lights'), the image tools return 2D sample frames. "
             "You should ALSO highlight that category in the 3D viewer so the user sees the segmented "
@@ -1084,7 +1104,8 @@ Plan:
             "- User: 'show me all lights and advertisement boards' -> "
             "set_rerun_highlight(categories=['Lights', 'Advertisement Board']).\n"
             "- User: 'what are advertisement boards within 2m of lights?' -> "
-            "set_rerun_highlight(categories=['Advertisement Board', 'Lights']).\n"
+            "set_rerun_highlight(object_ids=[<ad_board_id_1>, <light_id_1>, <ad_board_id_2>, <light_id_2>, ...]) "
+            "using the exact object ids returned by the proximity tool.\n"
             "- User: 'show me object 12 in the viewer' -> set_rerun_highlight(object_ids=[12]).\n"
             "- User: 'annotate the previous image' -> NO tool (image annotation, not 3D highlight)."
         )

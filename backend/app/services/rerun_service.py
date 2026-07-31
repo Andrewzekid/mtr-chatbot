@@ -57,6 +57,16 @@ class RerunVisualizer:
         self._queue: queue.SimpleQueue | None = None
         self._worker_started = False
         self._coord_seq = 0
+        # Diagnostic counters for tracking viewer staleness.
+        self._jobs_run = 0
+        self._jobs_ok = 0
+        self._jobs_failed = 0
+        self._last_job_at: float | None = None
+        self._last_ok_at: float | None = None
+        # Force a fresh InspectionMarker after this many jobs to avoid a stale
+        # gRPC sink that still passes the TCP probe.  Chosen conservatively: it
+        # costs ~one reconnection every few minutes in an active chat session.
+        self._marker_ttl_jobs = 20
 
     # ------------------------------------------------------------------
     # Public API
@@ -140,6 +150,18 @@ class RerunVisualizer:
         self._enqueue({"clear": True})
         return "Cleared all markings from the Rerun viewer."
 
+    def job_stats(self) -> dict[str, Any]:
+        """Diagnostic counters for the background highlight worker."""
+        with self._lock:
+            return {
+                "jobs_run": self._jobs_run,
+                "jobs_ok": self._jobs_ok,
+                "jobs_failed": self._jobs_failed,
+                "last_job_at": self._last_job_at,
+                "last_ok_at": self._last_ok_at,
+                "marker_ttl_jobs": self._marker_ttl_jobs,
+            }
+
     # ------------------------------------------------------------------
     # Background worker (all Rerun I/O happens here, off the chat turn)
     # ------------------------------------------------------------------
@@ -161,8 +183,14 @@ class RerunVisualizer:
                 logger.warning("Rerun worker job failed: %s", exc)
 
     def _run_job(self, job: dict[str, Any]) -> None:
+        with self._lock:
+            self._jobs_run += 1
+            self._last_job_at = time.time()
+            run_idx = self._jobs_run
+
         logger.info(
-            "Rerun highlight job started: keep_existing=%s coords=%d objects=%d categories=%s",
+            "Rerun highlight job #%d started: keep_existing=%s coords=%d objects=%d categories=%s",
+            run_idx,
             job.get("keep_existing", False),
             len(job.get("coordinates") or []),
             len(job.get("object_ids") or []),
@@ -170,18 +198,23 @@ class RerunVisualizer:
         )
         marker = self._get_marker(job.get("needs_spawn", False))
         if marker is None:
-            logger.info("InspectionMarker unavailable; skipping highlight job")
+            logger.info("InspectionMarker unavailable; skipping highlight job #%d", run_idx)
+            with self._lock:
+                self._jobs_failed += 1
             return
 
         try:
             if job.get("clear"):
                 marker.clean_markings()
-                logger.info("Rerun highlight job: cleared all markings")
+                with self._lock:
+                    self._jobs_ok += 1
+                    self._last_ok_at = time.time()
+                logger.info("Rerun highlight job #%d: cleared all markings", run_idx)
                 return
 
             if not job.get("keep_existing", False):
                 marker.clean_markings()
-                logger.info("Rerun highlight job: cleared previous markings")
+                logger.info("Rerun highlight job #%d: cleared previous markings", run_idx)
 
             for cat in job.get("categories") or []:
                 marker.mark_by_category(cat, inspection_id=job.get("inspection_id"))
@@ -199,23 +232,48 @@ class RerunVisualizer:
                 suffix = f"{base}_{seq}_{int(time.time() * 1000) % 1000000}"
                 self._log_coordinates(marker, coordinates, entity_suffix=suffix)
                 logger.info(
-                    "Rerun highlight job: logged %d coordinate(s) under %s/coordinates/%s",
-                    len(coordinates), marker.marks_root, suffix,
+                    "Rerun highlight job #%d: logged %d coordinate(s) under %s/coordinates/%s",
+                    run_idx, len(coordinates), marker.marks_root, suffix,
                 )
+
+            with self._lock:
+                self._jobs_ok += 1
+                self._last_ok_at = time.time()
+            logger.info(
+                "Rerun highlight job #%d finished OK (ok=%d failed=%d)",
+                run_idx, self._jobs_ok, self._jobs_failed,
+            )
         except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._jobs_failed += 1
             self._marker = None  # recreate on next job after failure
-            logger.warning("Rerun highlight job failed: %s", exc)
+            logger.warning("Rerun highlight job #%d failed: %s", run_idx, exc)
 
     def _get_marker(self, needs_spawn: bool) -> InspectionMarker | None:
         # If we already have a marker, verify the viewer is still reachable.
         # Rerun gRPC connections can drop (e.g. the viewer process was closed or
         # the machine went to sleep).  Re-using a dead marker silently loses
         # subsequent highlights, so recreate when the viewer is gone.
+        #
+        # We also periodically force recreation based on job count: a stale gRPC
+        # sink can still pass the TCP probe while the viewer stops processing new
+        # logs.  Recreating the marker rebuilds the SDK recording + sink, which
+        # reliably refreshes the connection.
+        force_recreate = False
+        with self._lock:
+            if self._jobs_run > 0 and self._jobs_run % self._marker_ttl_jobs == 0:
+                force_recreate = True
+                logger.info(
+                    "Forcing InspectionMarker recreation after %d jobs",
+                    self._jobs_run,
+                )
+
         if self._marker is not None:
-            if self._viewer_listening():
+            if not force_recreate and self._viewer_listening():
                 logger.debug("Reusing existing InspectionMarker (viewer still listening)")
                 return self._marker
-            logger.info("Existing InspectionMarker's viewer is not listening; recreating marker")
+            reason = "viewer not listening" if not self._viewer_listening() else "periodic TTL"
+            logger.info("Existing InspectionMarker's %s; recreating marker", reason)
             try:
                 self._marker.close()
             except Exception as exc:  # noqa: BLE001
