@@ -263,7 +263,7 @@ Each maps to an `InspectionDBClient` method; the router's system prompt describe
 | `get_inspection_poses` | `limit?`, `inspection_id?` | "What poses did the camera have?" (reads `images.tf_*`) |
 | `get_anomaly_types` | — | "What kinds of anomalies exist?" |
 | `get_anomaly_summary` | `inspection_id?` | "How many anomalies were found?" (counts by type / inspection) |
-| `get_anomalies` | `anomaly_type?`, `inspection_id?`, `limit?` | "Show me the anomalies" (typed abnormalities + image-pair links) |
+| `get_anomalies` | `anomaly_id?`, `anomaly_type?`, `inspection_id?`, `limit?` | "Show me the anomalies" (typed abnormalities + image-pair links) |
 | `get_report_summary` | — | "What anomalies did you find?" (loads prose report context) |
 | `highlight_in_rerun` | `object_ids[]?`, `coordinates[]?`, `category?`, `inspection_id?`, `label?` | "Highlight objects 16 and 19 in the 3D viewer" (explicit push; coordinate-bearing answers auto-highlight without this tool) |
 | `run_sql_query` / `query_database` | `query` (SELECT), `limit` | Escape hatch for ad-hoc/aggregation SQL |

@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import math
 import queue
+import re
 import socket
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -54,6 +56,7 @@ class RerunVisualizer:
         self._lock = threading.Lock()
         self._queue: queue.SimpleQueue | None = None
         self._worker_started = False
+        self._coord_seq = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -158,6 +161,13 @@ class RerunVisualizer:
                 logger.warning("Rerun worker job failed: %s", exc)
 
     def _run_job(self, job: dict[str, Any]) -> None:
+        logger.info(
+            "Rerun highlight job started: keep_existing=%s coords=%d objects=%d categories=%s",
+            job.get("keep_existing", False),
+            len(job.get("coordinates") or []),
+            len(job.get("object_ids") or []),
+            job.get("categories") or [],
+        )
         marker = self._get_marker(job.get("needs_spawn", False))
         if marker is None:
             logger.info("InspectionMarker unavailable; skipping highlight job")
@@ -166,10 +176,12 @@ class RerunVisualizer:
         try:
             if job.get("clear"):
                 marker.clean_markings()
+                logger.info("Rerun highlight job: cleared all markings")
                 return
 
             if not job.get("keep_existing", False):
                 marker.clean_markings()
+                logger.info("Rerun highlight job: cleared previous markings")
 
             for cat in job.get("categories") or []:
                 marker.mark_by_category(cat, inspection_id=job.get("inspection_id"))
@@ -180,22 +192,48 @@ class RerunVisualizer:
 
             coordinates = job.get("coordinates") or []
             if coordinates:
-                self._log_coordinates(marker, coordinates)
+                with self._lock:
+                    self._coord_seq += 1
+                    seq = self._coord_seq
+                base = re.sub(r"[^a-zA-Z0-9_]+", "_", str(job.get("label") or "highlight")).strip("_")[:32]
+                suffix = f"{base}_{seq}_{int(time.time() * 1000) % 1000000}"
+                self._log_coordinates(marker, coordinates, entity_suffix=suffix)
+                logger.info(
+                    "Rerun highlight job: logged %d coordinate(s) under %s/coordinates/%s",
+                    len(coordinates), marker.marks_root, suffix,
+                )
         except Exception as exc:  # noqa: BLE001
             self._marker = None  # recreate on next job after failure
             logger.warning("Rerun highlight job failed: %s", exc)
 
     def _get_marker(self, needs_spawn: bool) -> InspectionMarker | None:
+        # If we already have a marker, verify the viewer is still reachable.
+        # Rerun gRPC connections can drop (e.g. the viewer process was closed or
+        # the machine went to sleep).  Re-using a dead marker silently loses
+        # subsequent highlights, so recreate when the viewer is gone.
         if self._marker is not None:
-            return self._marker
+            if self._viewer_listening():
+                logger.debug("Reusing existing InspectionMarker (viewer still listening)")
+                return self._marker
+            logger.info("Existing InspectionMarker's viewer is not listening; recreating marker")
+            try:
+                self._marker.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to close stale InspectionMarker: %s", exc)
+            self._marker = None
+
         try:
+            # If the caller asked us to spawn, or the viewer isn't listening and
+            # auto-spawn is enabled, spawn a fresh viewer. Otherwise try to connect
+            # to the configured address.
+            spawn = needs_spawn or (self.settings.rerun_auto_spawn and not self._viewer_listening())
             self._marker = InspectionMarker(
                 db_path=self.settings.inspection_db_path,
                 map_path=self.settings.rerun_map_pcd_path,
                 objects_dir=self.settings.inspection_objects_dir,
                 voxel=0.1,
-                spawn_viewer=needs_spawn,
-                connect_url=None if needs_spawn else self.settings.rerun_viewer_addr,
+                spawn_viewer=spawn,
+                connect_url=None if spawn else self.settings.rerun_viewer_addr,
                 load_map=True,
                 leveling_rpy_deg=_parse_leveling(self.settings.rerun_leveling_rpy_deg),
                 app_id=self.settings.rerun_app_id,
@@ -203,7 +241,7 @@ class RerunVisualizer:
             logger.info(
                 "InspectionMarker ready (app=%s, spawn=%s)",
                 self.settings.rerun_app_id,
-                needs_spawn,
+                spawn,
             )
             return self._marker
         except Exception as exc:  # noqa: BLE001
@@ -215,7 +253,11 @@ class RerunVisualizer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _log_coordinates(marker: InspectionMarker, coordinates: list[dict[str, float]]) -> None:
+    def _log_coordinates(
+        marker: InspectionMarker,
+        coordinates: list[dict[str, float]],
+        entity_suffix: str | None = None,
+    ) -> None:
         pts: list[list[float]] = []
         labels: list[str] = []
         colors: list[list[int]] = []
@@ -241,11 +283,13 @@ class RerunVisualizer:
             return
         pts_arr = np.asarray(pts, dtype=np.float32)
         kwargs: dict[str, Any] = {"labels": labels, "show_labels": True} if any(labels) else {}
-        # Log under marks_root: coordinates are camera_init-frame points, and this
-        # keeps them inside clean_markings()'s recursive clear so stale points from
-        # previous queries do not linger when keep_existing is false.
+        # Log each highlight under a unique sub-path so a Clear on marks_root
+        # followed by a new Points3D cannot collide at the same entity path.
+        # A unique suffix also makes consecutive highlights robust when the
+        # viewer has stale state from a previous connection.
+        suffix = re.sub(r"[^a-zA-Z0-9_]+", "_", str(entity_suffix or f"highlight_{int(time.time() * 1000) % 1000000}")).strip("_")[:48]
         rr.log(
-            f"{marker.marks_root}/coordinates",
+            f"{marker.marks_root}/coordinates/{suffix}",
             rr.Points3D(
                 pts_arr,
                 colors=np.asarray(colors, dtype=np.uint8),

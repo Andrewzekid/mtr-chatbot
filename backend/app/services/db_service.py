@@ -1299,7 +1299,11 @@ class InspectionDBClient:
         }
 
     def get_anomalies(
-        self, anomaly_type: str | None = None, inspection_id: int | None = None, limit: int | str | None = None
+        self,
+        anomaly_id: int | None = None,
+        anomaly_type: str | None = None,
+        inspection_id: int | None = None,
+        limit: int | str | None = None,
     ) -> list[dict[str, Any]]:
         limit = self._resolve_limit(limit)
         if not self._anomaly_tables_exist():
@@ -1307,6 +1311,9 @@ class InspectionDBClient:
         conn = self._connect()
         clauses = []
         params: list[Any] = []
+        if anomaly_id is not None:
+            clauses.append("ab.id = ?")
+            params.append(anomaly_id)
         if anomaly_type:
             clauses.append("t.name = ?")
             params.append(anomaly_type)
@@ -1370,7 +1377,10 @@ class InspectionDBClient:
         the camera pose (``tf_translation_x/y/z``) where that frame was taken. The
         inspection frame's position is where the robot observed the anomaly; the
         ground-truth frame's position is the reference viewpoint of the same spot.
-        One row per abnormal pair, with the pair's abnormality types aggregated.
+        Returns one row per individual abnormality (``abnormalities.id``), so the
+        user/LLM can address anomalies by their abnormality id rather than the
+        internal pair id.  Multiple abnormalities that share the same image pair
+        appear as separate rows with the same camera position.
         """
         if not self._anomaly_tables_exist():
             return []
@@ -1379,49 +1389,46 @@ class InspectionDBClient:
         params: tuple[Any, ...] = (inspection_id,) if inspection_id is not None else ()
         rows = conn.execute(
             f"""
-            SELECT ad.id AS pair_id, ii.inspection_id,
+            SELECT ab.id AS abnormality_id,
+                   ad.id AS pair_id,
+                   ii.inspection_id,
                    ii.tf_translation_x AS cam_x, ii.tf_translation_y AS cam_y, ii.tf_translation_z AS cam_z,
                    gi.tf_translation_x AS gt_x, gi.tf_translation_y AS gt_y, gi.tf_translation_z AS gt_z,
-                   GROUP_CONCAT(DISTINCT t.name) AS types,
-                   GROUP_CONCAT(DISTINCT ab.object) AS objects,
-                   GROUP_CONCAT(DISTINCT NULLIF(ab.note, '')) AS notes
-            FROM abnormal_detections ad
-            JOIN abnormalities ab ON ab.pair = ad.id
+                   t.name AS type, ab.object, ab.note
+            FROM abnormalities ab
+            JOIN abnormal_detections ad ON ad.id = ab.pair
             JOIN anomaly_types t ON t.id = ab.type
             JOIN images ii ON ii.id = ad.inspection_image
             JOIN images gi ON gi.id = ad.gt_image
             {where}
-            GROUP BY ad.id
-            ORDER BY ad.id
+            ORDER BY ab.id
             """,
             params,
         ).fetchall()
         return [dict(row) for row in rows]
 
-    @staticmethod
-    def _format_anomaly_label(
-        pair_id: Any,
-        types: str | None,
-        objects: str | None,
-        notes: str | None,
-    ) -> str:
-        """Build a concise label for an anomaly pair.
-
-        Format: "Anomaly {id} {type} {object}" (notes intentionally omitted to
-        keep the 3D viewer label readable).
-        """
-        parts: list[str] = []
-        if types:
-            parts.append(types)
-        if objects:
-            parts.append(objects)
-        detail = " ".join(parts) if parts else "anomaly"
-        return f"Anomaly {pair_id} {detail}"
-
     def anomaly_location_points(self, inspection_id: int | None = None) -> list[dict[str, Any]]:
-        """Anomaly markers as Rerun coordinate dicts: {x, y, z, label, color} (orange)."""
-        points: list[dict[str, Any]] = []
+        """Anomaly markers as Rerun coordinate dicts: {x, y, z, label, color} (orange).
+
+        Because ``get_anomaly_locations`` now returns one row per abnormality,
+        we group rows by their image pair so each camera position gets a single
+        Rerun point with a combined label listing every abnormality in that pair.
+        """
+        # Group by pair so pairs with multiple abnormalities produce one point.
+        by_pair: dict[int, dict[str, Any]] = {}
+        labels_by_pair: dict[int, list[str]] = {}
         for row in self.get_anomaly_locations(inspection_id=inspection_id):
+            pair_id = int(row["pair_id"])
+            if pair_id not in by_pair:
+                by_pair[pair_id] = dict(row)
+                labels_by_pair[pair_id] = []
+            obj = row.get("object") or "unknown"
+            labels_by_pair[pair_id].append(
+                f"Anomaly {row['abnormality_id']}: {row.get('type') or 'unknown'}, {obj}"
+            )
+
+        points: list[dict[str, Any]] = []
+        for pair_id, row in sorted(by_pair.items()):
             x, y, z = row.get("cam_x"), row.get("cam_y"), row.get("cam_z")
             if x is None or y is None or z is None:
                 # Fall back to the ground-truth frame's position if the
@@ -1429,12 +1436,7 @@ class InspectionDBClient:
                 x, y, z = row.get("gt_x"), row.get("gt_y"), row.get("gt_z")
             if x is None or y is None or z is None:
                 continue
-            label = self._format_anomaly_label(
-                row.get("pair_id"),
-                row.get("types"),
-                row.get("objects"),
-                row.get("notes"),
-            )
+            label = "; ".join(labels_by_pair[pair_id])
             points.append(
                 {
                     "x": x,
@@ -1603,16 +1605,18 @@ class InspectionDBClient:
             # needs the structured anomaly pair — the 3D anomaly coordinates
             # (get_anomaly_locations) and the anomaly details with images
             # (get_anomalies). The router often calls only a subset (e.g. just locations
-            # for a 'where' question); top up whichever ones it did not call.
+            # for a 'where' question); top up whichever ones it did not call, preserving
+            # any anomaly_id / anomaly_type / inspection_id scope the user asked for.
             if self._anomaly_tables_exist() and self._ANOMALY_QUERY_RE.search(query):
                 called_names = {name for name, _ in all_tool_calls}
+                anomaly_scope = self._resolve_anomaly_scope(all_tool_calls, query)
                 top_up = [
-                    (name, {})
+                    (name, dict(anomaly_scope))
                     for name in ("get_anomaly_locations", "get_anomalies")
                     if name not in called_names
                 ]
                 if top_up:
-                    logger.info("Anomaly query top-up: running %s for query: %r", top_up, query)
+                    logger.info("Anomaly query top-up: running %s with %s for query: %r", top_up, anomaly_scope, query)
                     for name, args in top_up:
                         result = await self._execute_tool(name, args, chat_history=chat_history)
                         all_tool_results.append({"name": name, "args": args, "output": result})
@@ -1839,6 +1843,51 @@ class InspectionDBClient:
         ):
             return True
         return False
+
+    @classmethod
+    def _resolve_anomaly_scope(
+        cls,
+        tool_calls: list[tuple[str, dict[str, Any]]],
+        query: str,
+    ) -> dict[str, Any]:
+        """Extract anomaly scope (anomaly_id/type/inspection_id) from tool calls or query.
+
+        Prefers explicit arguments already chosen by the router, then falls back
+        to parsing the user's query so top-up tools stay scoped to the same
+        anomaly/anomaly-type/inspection.
+        """
+        scope: dict[str, Any] = {}
+        # Inherit explicit scope from any anomaly tool the router already called.
+        for name, args in tool_calls:
+            if name in {"get_anomalies", "get_anomaly_locations", "get_anomaly_summary"}:
+                for key in ("anomaly_id", "anomaly_type", "inspection_id"):
+                    if args.get(key) is not None and key not in scope:
+                        scope[key] = args[key]
+
+        # Parse the query for scope the router may not have passed through.
+        if "anomaly_id" not in scope:
+            m = re.search(r"\banomaly\s*(?:id|#)?\s*(\d+)\b", query, re.IGNORECASE)
+            if m:
+                scope["anomaly_id"] = int(m.group(1))
+        if "anomaly_type" not in scope:
+            for atype in (
+                "foreign_object",
+                "missing_object",
+                "state_change",
+                "relocation",
+                "content_change",
+                "crack and structure damage",
+                "stain/graffiti",
+            ):
+                if re.search(rf"\b{re.escape(atype)}\b", query, re.IGNORECASE):
+                    scope["anomaly_type"] = atype
+                    break
+        if "inspection_id" not in scope:
+            m = re.search(r"\binspection\s*(?:id)?\s*(\d+)\b", query, re.IGNORECASE)
+            if m:
+                scope["inspection_id"] = int(m.group(1))
+
+        return scope
 
     def _mentioned_categories(self, query: str, max_categories: int = 3) -> list[str]:
         """Canonical DB categories explicitly named in the query (longest alias first)."""
@@ -2079,7 +2128,9 @@ class InspectionDBClient:
             if tool_name == "get_anomaly_summary":
                 return self._format_anomaly_summary(inspection_id=_inspection_id())
             if tool_name == "get_anomalies":
+                raw_anomaly_id = args.get("anomaly_id")
                 return self._format_anomalies(
+                    anomaly_id=int(raw_anomaly_id) if raw_anomaly_id is not None else None,
                     anomaly_type=args.get("anomaly_type"),
                     inspection_id=_inspection_id(),
                     limit=self._resolve_limit(args.get("limit"), default=None),
@@ -2105,7 +2156,8 @@ class InspectionDBClient:
 
         Matches coordinates against known anomaly camera positions; when a generic
         label is found near a known anomaly, the label is rewritten to
-        'Anomaly {pair_id}: {type}, {object}, {note}'.
+        'Anomaly {abnormality_id}: {type}, {object}' (multiple abnormalities in
+        the same pair are joined with '; ').
         """
         if not coords or not self._anomaly_tables_exist():
             return list(coords)
@@ -3169,11 +3221,15 @@ class InspectionDBClient:
         return "\n".join(lines)
 
     def _format_anomalies(
-        self, anomaly_type: str | None = None, inspection_id: int | None = None, limit: int | None = None
+        self,
+        anomaly_id: int | None = None,
+        anomaly_type: str | None = None,
+        inspection_id: int | None = None,
+        limit: int | None = None,
     ) -> str:
         if not self._anomaly_tables_exist():
             return "Anomaly tables (anomaly_types, abnormal_detections, abnormalities) are not yet populated in this database."
-        rows = self.get_anomalies(anomaly_type=anomaly_type, inspection_id=inspection_id, limit=limit)
+        rows = self.get_anomalies(anomaly_id=anomaly_id, anomaly_type=anomaly_type, inspection_id=inspection_id, limit=limit)
         if not rows:
             return "No abnormalities found matching the filter."
         lines = [f"{len(rows)} abnormalit(ies):"]
@@ -3183,7 +3239,7 @@ class InspectionDBClient:
                 if r["min_x"] is not None else "no bbox"
             )
             lines.append(
-                f"- Abnormality {r['id']} (inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
+                f"- Abnormality {r['id']} (pair {r['pair_id']}, inspection {r['inspection_id']}): type='{r['type']}', {bbox}"
             )
             if r.get("object"):
                 lines.append(f"  object: {r['object']}")
@@ -3218,20 +3274,17 @@ class InspectionDBClient:
         scope = f" (inspection {inspection_id})" if inspection_id is not None else ""
         lines = [
             f"{len(rows)} anomaly location(s){scope} — camera positions where the abnormal frames were taken "
-            f"(these coordinates are marked in the Rerun viewer):"
+            f"(these coordinates are marked in the Rerun viewer). "
+            f"Each line is numbered by the individual abnormality id (not the internal image-pair id):"
         ]
         for r in rows:
             pos = self._format_xyz(r["cam_x"], r["cam_y"], r["cam_z"])
             if r["cam_x"] is None:
                 pos = f"{self._format_xyz(r['gt_x'], r['gt_y'], r['gt_z'])} (ground-truth viewpoint)"
-            label = self._format_anomaly_label(
-                r.get("pair_id"),
-                r.get("types"),
-                r.get("objects"),
-                r.get("notes"),
-            )
+            obj = r.get("object") or "unknown"
             lines.append(
-                f"- Pair {r['pair_id']} [inspection {r['inspection_id']}]: {label} at {pos}"
+                f"- Anomaly {r['abnormality_id']} [inspection {r['inspection_id']}]: "
+                f"{r.get('type') or 'unknown'} {obj} at {pos}"
             )
         return "\n".join(lines)
 

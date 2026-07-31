@@ -365,9 +365,10 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_anomalies",
-        "description": "List individual abnormalities: type, 2D pixel bounding box, note, the ground-truth and inspection image links, and the inspection id. Optional filters: anomaly_type, inspection_id, limit. Use for 'show me the anomalies' or 'what defects were found on the ticket gates'.",
+        "description": "List individual abnormalities: type, 2D pixel bounding box, note, the ground-truth and inspection image links, and the inspection id. Optional filters: anomaly_id, anomaly_type, inspection_id, limit. Use for 'show me the anomalies', 'what defects were found on the ticket gates', or 'tell me about anomaly 12'.",
         "parameters": _params(
             {
+                "anomaly_id": {"type": ["integer", "string"], "description": "Optional: filter to a single abnormality id."},
                 "anomaly_type": {"type": "string", "description": "Optional: filter to one anomaly type name."},
                 "limit": {"type": ["integer", "string"], "description": "Optional cap; use 'all' or omit to return every matching result."},
             }
@@ -375,12 +376,12 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_anomaly_locations",
-        "description": "3D locations of the anomalies: the camera position where each abnormal image pair was taken (from the images table pose), with the anomaly types and affected objects per location. These coordinates are automatically marked in the Rerun viewer. Use when the user asks WHERE the anomalies are or to show/mark anomaly locations in 3D.",
+        "description": "3D locations of each individual abnormality, numbered by the abnormality id (NOT the internal image-pair id). Each abnormal image pair has one camera position; if a pair contains multiple abnormalities they are listed as separate rows with the same position. These coordinates are automatically marked in the Rerun viewer. Use when the user asks WHERE the anomalies are or to show/mark anomaly locations in 3D.",
         "parameters": _params({}),
     },
     {
         "name": "highlight_in_rerun",
-        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights. When you include coordinates, give each point a descriptive label: objects as 'Object <id>: <category>' and anomaly locations using the rich label from get_anomaly_locations (e.g. 'Anomaly 4 foreign_object: overhead monitor/screen, ...').",
+        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights. When you include coordinates, give each point a descriptive label: objects as 'Object <id>: <category>' and anomaly locations using the exact rich label from get_anomaly_locations (e.g. 'Anomaly 4: state_change, overhead monitor/screen').",
         "parameters": _params(
             {
                 "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
@@ -487,9 +488,9 @@ Do not answer the user directly. Do not output any text other than the tool call
 - `objects` table: `id` (the object id — there is NO track_id), `category_id` (→ categories.name), `centroid_x/y/z`, `min_x/y/z`, `max_x/y/z`, `is_gt`, `created_at`. An object has ONE centroid and 3D bbox; it does NOT have stored first_seen/last_seen or observation_count columns.
 - `detections` table: `id`, `image_id` (→ images), `object_id` (→ objects), `centroid_x/y/z`, `min/max_x/y/z`. One row per per-frame detection. An object's detection count and first/last-seen timestamps are DERIVED by joining detections → images.
 - `anomaly_types` table: `id`, `name`.
-- `abnormal_detections` table: `id`, `gt_image` (→ images.id), `inspection_image` (→ images.id), `status`, `summary` (prose summary of the pair), `viewpoint_change`. An abnormal image PAIR (ground truth vs inspection).
-- `abnormalities` table: `id`, `pair` (→ abnormal_detections.id), `type` (→ anomaly_types.id), `object` (what the anomaly is on, e.g. 'metal service door'), `location` (where in the scene), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`.
-  The anomaly tables ARE populated: 7 anomaly types (missing_object, foreign_object, relocation, state_change, crack and structure damage, stain/graffiti, content_change). Use the anomaly tools for any anomaly/finding/defect question.
+- `abnormal_detections` table: `id` (internal image-pair id), `gt_image` (→ images.id), `inspection_image` (→ images.id), `status`, `summary` (prose summary of the pair), `viewpoint_change`. An abnormal image PAIR (ground truth vs inspection). NEVER expose this id to the user as an 'anomaly number'.
+- `abnormalities` table: `id` (the user-facing abnormality/anomaly id), `pair` (→ abnormal_detections.id), `type` (→ anomaly_types.id), `object` (what the anomaly is on, e.g. 'metal service door'), `location` (where in the scene), `min_x`, `min_y`, `max_x`, `max_y` (2D pixel bbox), `note`. When the user says 'anomaly 9' they mean `abnormalities.id = 9`.
+  The anomaly tables ARE populated: 7 anomaly types (missing_object, foreign_object, relocation, state_change, crack and structure damage, stain/graffiti, content_change). Use the anomaly tools for any anomaly/finding/defect question. ALWAYS distinguish the user-facing abnormality id (`abnormalities.id`) from the internal pair id (`abnormal_detections.id`).
 
 All timestamps are nanoseconds since epoch. Time tools accept ISO datetimes, clock times such as "16:51:45" or "4:51 PM", or raw nanosecond integers.
 
@@ -541,7 +542,7 @@ Lights, Advertisement Board, Ticket Gate, Map, TV, Exit Sign.
 32. get_objects_in_temporal_cluster(center_time, window_ms, limit, inspection_id) — objects/detections around a time.
 33. get_anomaly_types — anomaly type names.
 34. get_anomaly_summary(inspection_id) — abnormality counts by type and by inspection.
-35. get_anomalies(anomaly_type, inspection_id, limit) — individual abnormalities with type, affected object, scene location, 2D bbox, note, pair summary, and gt/inspection image links.
+35. get_anomalies(anomaly_id, anomaly_type, inspection_id, limit) — individual abnormalities with type, affected object, scene location, 2D bbox, note, pair summary, and gt/inspection image links.
 36. get_anomaly_locations(inspection_id) — 3D camera positions where each abnormal image pair was taken (the anomalies' locations). These are automatically marked in the Rerun viewer. Use for 'where are the anomalies'.
 37. highlight_in_rerun(object_ids[], coordinates[], category, inspection_id, label) — push 3D highlights to the Rerun viewer (only for explicit visual requests; coordinates from other tools auto-highlight).
 38. run_sql_query(query, limit) — read-only SELECT escape hatch. Use ONLY when no other tool fits.
@@ -642,6 +643,7 @@ Plan:
 - Use the exact category names listed above.
 - DO NOT use run_sql_query for ordinary object, category, count, coordinate, temporal, proximity, or image questions. run_sql_query is ONLY for questions that genuinely cannot be answered by the tools above. Prefer structured tools; they return correctly formatted results.
 - When the user asks about anomalies, findings, issues, problems, defects, or state changes, ALWAYS call the relevant anomaly DB tools together: get_anomaly_summary (counts by type), get_anomaly_locations (3D coordinates), and get_anomalies (details with images) — no matter how narrow the wording is ('where', 'how many', 'what'). The backend tops up whichever of these you skip. Do not call coordinate tools for pure anomaly questions. Whenever anomaly tools run, the anomaly locations (camera positions of the abnormal image pairs) are automatically marked in the Rerun viewer — no highlight_in_rerun call needed.
+- IMPORTANT id distinction: get_anomaly_locations and get_anomalies use the user-facing abnormality id (`abnormalities.id`), e.g. 'Anomaly 9'. The internal image-pair id (`abnormal_detections.id`) is NEVER shown to the user and must NOT be used when the user says 'anomaly N'. When highlighting an anomaly in Rerun, use the exact label from get_anomaly_locations such as 'Anomaly 9: missing_object, ceiling/wall cover panel'.
 - CRITICAL image rule: if the user says 'show me', 'display', 'see', 'with images', 'pictures', 'frames', or asks for visual examples of objects, ALWAYS call an image-returning tool. The image-returning tools are: get_category_sample_images, get_category_objects_with_images, get_object_image_paths, get_images_in_time_range, get_category_proximity_with_images, annotate_image, and get_anomalies. NOTE: annotate_image draws boxes ON an image - use it ONLY for explicit image-annotation requests (annotate / draw on / circle on / mark on the image); for generic 'show me'/'display' use the non-annotating image tools. Generic 'highlight'/'visualize'/'where is' is a 3D Rerun viewer request, not image annotation. Do NOT answer with counts or coordinates only when the user asked to see images. 'Show me' requests ALWAYS produce BOTH outputs: 2D images in the chat AND a 3D highlight of the relevant objects/categories in the Rerun viewer — the final pass handles the 3D highlight automatically, so you just need to call the right image tool(s).
 - For 'show me X near Y within R meters' queries, use get_category_proximity_with_images so the nearby objects include sample frames.
 - For 'show me X at time T' queries, use get_images_in_time_range (optionally with category) to return actual frames.
@@ -914,7 +916,13 @@ Plan:
             if mentioned_category:
                 # Return sample frames for the category (not annotation).
                 fallback = {"category": mentioned_category, "limit": 5}
-            elif prior_urls and wants_image_annotation:
+            else:
+                # Anomaly-specific "show me" fallback: "show me anomaly 10" should
+                # return the abnormality's inspection/ground-truth image pair.
+                anomaly_match = re.search(r"\banomaly\s*(?:id|#)?\s*(\d+)\b", q)
+                if anomaly_match:
+                    fallback = {"anomaly_id": int(anomaly_match.group(1))}
+            if not fallback and prior_urls and wants_image_annotation:
                 # Explicit image-annotation request referencing a prior image; only then
                 # do we fall back to annotate_image. A plain "show me the previous image"
                 # (no annotation intent) is left for the router to handle rather than
@@ -925,6 +933,11 @@ Plan:
                 if "image_url" in fallback:
                     logger.info("annotate_image safety-net fallback for image query: %r", query)
                     results.append(("annotate_image", fallback))
+                elif "anomaly_id" in fallback:
+                    logger.info(
+                        "get_anomalies safety-net fallback for anomaly image query: %r", query
+                    )
+                    results.append(("get_anomalies", fallback))
                 else:
                     logger.info(
                         "get_category_objects_with_images safety-net fallback for image query: %r",
@@ -1056,7 +1069,8 @@ Plan:
             "previous'). Otherwise leave it false so previous highlights are cleared first.\n"
             "8. Labels matter: when you include coordinates, each point's label must be descriptive. "
             "For objects use 'Object <id>: <category>'. For anomaly locations use the exact rich label "
-            "from the get_anomaly_locations result (e.g. 'Anomaly 4 foreign_object: overhead monitor/screen, ...'). "
+            "from the get_anomaly_locations result (e.g. 'Anomaly 4: state_change, overhead monitor/screen'). "
+            "The abnormality id is the number after 'Anomaly'; the internal pair id is NOT an anomaly number. "
             "Never use generic labels like 'Anomaly Location'.\n"
             "9. Do NOT set inspection_id unless the user explicitly names one inspection (e.g. 'inspection 2'). "
             "When the user asks about multiple categories or says 'all', leave inspection_id unset so the viewer "

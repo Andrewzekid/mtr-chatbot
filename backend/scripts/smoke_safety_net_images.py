@@ -183,7 +183,7 @@ async def main() -> None:
         ctx = await client.lookup("where are the anomalies located?")
         names = [c["name"] for c in client.last_tool_calls]
         assert names == ["get_anomaly_locations", "get_anomalies"], names
-        assert "missing object" in ctx and "Pair 1" in ctx, ctx
+        assert "missing object" in ctx and "Anomaly 1" in ctx, ctx
         coords = rerun.calls[0]["coordinates"] if rerun.calls else []
         assert len(coords) == 1, f"anomaly coordinates duplicated: {len(coords)}"
         print("PASS g: locations-only router -> top-up adds anomaly details")
