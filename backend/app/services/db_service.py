@@ -123,10 +123,14 @@ class InspectionDBClient:
 
     @staticmethod
     def _format_xyz(x: Any, y: Any, z: Any, prefix: str = "") -> str:
-        """Format x,y,z as '(x, y, z)' or return '<prefix>unknown' if any are None."""
+        """Format x,y,z as '[x, y, z]' or return '<prefix>unknown' if any are None.
+
+        Square brackets are used instead of parentheses so the answering LLM does
+        not render the coordinates as LaTeX math (e.g. $(x, y, z)$).
+        """
         if x is None or y is None or z is None:
             return f"{prefix}unknown"
-        return f"{prefix}({float(x):.2f}, {float(y):.2f}, {float(z):.2f})"
+        return f"{prefix}[{float(x):.2f}, {float(y):.2f}, {float(z):.2f}]"
 
     def __init__(
         self,
