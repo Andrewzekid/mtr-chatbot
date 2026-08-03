@@ -58,6 +58,7 @@ class LocalLLM:
             "- For questions about objects, categories, counts, tracks, detections, timestamps, timelines, coordinates, or proximity, use the database context.\n"
             "- For questions about anomalies, findings, issues, problems, or state changes, use the structured anomaly data from the database context.\n"
             "- Do not reveal coordinates, positions, locations, or spatial extents unless the user explicitly asks for them. "
+            "When the user asks to compare the different inspections or asks for a summary of the inspection, always mention ANOMALY DATA."
             "Coordinate/location questions use words such as 'where', 'coordinates', 'position', 'location', 'spatial', 'extent', or 'area'.\n"
             "- If the provided context does not contain the requested information, say so directly and concisely. "
             "Do not infer, assume, or invent data that is not in the context. "
