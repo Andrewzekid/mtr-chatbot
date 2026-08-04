@@ -53,20 +53,18 @@ Every turn is **three LLM calls** plus streaming TTS — not an agentic loop. Th
    - **Anomaly completeness.** For any anomaly-related query (`_ANOMALY_QUERY_RE`: anomaly / abnormal / findings / issues / problems / defects / report), the backend tops up whichever of `get_anomaly_locations` and `get_anomalies` the router skipped, preserving any `anomaly_id` / `anomaly_type` / `inspection_id` scope parsed from the query or the router's own args. The pair is also cached (`_last_anomaly_trio_context`) so generic anomaly follow-ups ("tell me more about them") reuse the cached context instead of re-querying the DB.
 6. **Final pass — LLM call #2 (Rerun highlight decision).** After the tool loop ends (and no explicit `highlight_in_rerun` ran), `ToolRouter.decide_highlights` sends the user's question + the merged `db_context` back to the router model with a single `set_rerun_highlight` tool. The model decides what to light up in the 3D viewer — by `category`, `categories`, `object_ids`, or raw `coordinates` — with descriptive labels (objects as `'Object <id>: <category>'`, anomaly locations using the exact rich label from `get_anomaly_locations`, e.g. `'Anomaly 4: state_change, overhead monitor/screen'`). The backend validates the decision against the tools that ran (`_decision_matches_tool_results`): a category-level highlight is rejected for proximity / anomaly queries and a deterministic fallback runs instead. The status string is stored in `last_highlight_status` and surfaced to the answerer.
    > **Anomalies are ALWAYS highlighted.** When any anomaly tool ran (`get_anomalies` / `get_anomaly_summary` / `get_anomaly_locations`), the final pass pushes the anomaly camera positions to the Rerun viewer — scoped to the `anomaly_id` / `anomaly_type` / `inspection_id` the user asked about via `_scoped_anomaly_coordinates`. So if the user asks **about anomalies, for an inspection summary, or to compare inspections**, the abnormality locations are lit up in the 3D viewer alongside the spoken answer, with no `highlight_in_rerun` call required. This also covers generic anomaly follow-ups that reuse the cached anomaly trio (the cached path still runs the final-pass highlight decision so follow-ups like "highlight anomaly 4" can refine the viewer). If the LLM decider returns nothing, the deterministic fallback marks the scoped anomaly locations anyway.
-7. **Report (conditional)** — If the router selected `get_report_summary` (prose report), `report_context` is loaded so the prose report coexists with the structured anomaly-table output. The report is lazy-loaded only on report intent — the router's decision, not a keyword gate. (The structured anomaly data — counts, 3D locations, individual abnormalities + image pairs — always comes from the `anomaly_types` / `abnormal_detections` / `abnormalities` tables via the anomaly tools, never from the prose report.)
-8. **Debug + image-link handling** — The selected tool calls (and the router's raw response) are sent to the frontend as a `tool_calls` message (debug panel, includes `highlight.status` / `highlight.args` / `highlight_history` / `rerun_stats`). If `annotate_image` ran, its markdown image links are pulled *out* of `db_context` (so the model can't duplicate them) and the backend re-emits them as the first tokens of the reply to guarantee display.
-9. **Answerer — LLM call #3 (synthesis, streamed)** — `_build_messages` assembles:
+7. **Debug + image-link handling** — The selected tool calls (and the router's raw response) are sent to the frontend as a `tool_calls` message (debug panel, includes `highlight.status` / `highlight.args` / `highlight_history` / `rerun_stats`). If `annotate_image` ran, its markdown image links are pulled *out* of `db_context` (so the model can't duplicate them) and the backend re-emits them as the first tokens of the reply to guarantee display.
+8. **Answerer — LLM call #3 (synthesis, streamed)** — `_build_messages` assembles:
    - `system`: the assistant persona + style/coordinate/image-link rules + live DB facts (real categories + multi-inspection listing)
    - `system`: prior tool-call history (image links stripped)
    - `system`: `db_context` (the merged tool outputs, with annotate_image guidance prepended when annotation ran)
-   - `system`: `report_context` (only when fetched)
    - the last few chat turns (within `llm_history_char_budget`, image links stripped)
    - `user`: the transcript
 
-   When the final pass highlighted something, a note is prepended to `db_context` telling the answerer the highlights are shown in the Rerun viewer. When `get_anomaly_locations` ran for an explicit "where" question, a note forces the answerer to quote several exact `(x, y, z)` anomaly coordinates. The answering LLM streams tokens. `<think>` thinking tags are stripped in-flight so only the visible answer streams out.
-10. **Streaming TTS** — As tokens accumulate, `handle_audio` splits the text at sentence boundaries, cleans markdown/URLs/punctuation via `_clean_for_tts`, and feeds each sentence to Piper, which yields WAV chunks streamed back to the client as `tts_audio_chunk` messages. Speech therefore begins before the LLM finishes generating.
-11. **Playback** — The frontend plays chunks in order via the Web Audio API, renders the full text as a chat card, and inlines any `![...](/...images/...)` links as clickable thumbnails (lightbox). Cantonese with no matching Piper voice falls back to `window.speechSynthesis`.
-12. **History** — After the turn completes, the `(transcript, reply)` pair is appended to `conversation_history` (capped 12) and the tool-call payload to `tool_call_history` (capped 6) — both fed back into the next turn so the router can detect changed parameters and reference prior images.
+   When the final pass highlighted something, a note is prepended to `db_context` telling the answerer the highlights are shown in the Rerun viewer. When `get_anomaly_locations` ran for an explicit "where" question, a note forces the answerer to quote several exact `(x, y, z)` anomaly coordinates. The answering LLM streams tokens. ` authDomain` thinking tags are stripped in-flight so only the visible answer streams out.
+9. **Streaming TTS** — As tokens accumulate, `handle_audio` splits the text at sentence boundaries, cleans markdown/URLs/punctuation via `_clean_for_tts`, and feeds each sentence to Piper, which yields WAV chunks streamed back to the client as `tts_audio_chunk` messages. Speech therefore begins before the LLM finishes generating.
+10. **Playback** — The frontend plays chunks in order via the Web Audio API, renders the full text as a chat card, and inlines any `![...](/...images/...)` links as clickable thumbnails (lightbox). Cantonese with no matching Piper voice falls back to `window.speechSynthesis`.
+11. **History** — After the turn completes, the `(transcript, reply)` pair is appended to `conversation_history` (capped 12) and the tool-call payload to `tool_call_history` (capped 6) — both fed back into the next turn so the router can detect changed parameters and reference prior images.
 
 > **Key design point:** tool results reach the answerer as plain-text **system messages**, never as OpenAI-style `tool`/`function` messages. The backend pre-fetches and formats everything; the answerer just reads context and writes the answer.
 
@@ -137,7 +135,7 @@ Per-target breakdown:
 ```
 Answerer (call #3) reads that single context block and synthesizes one coherent spoken answer covering totals, ticket-gate positions, and what's near them. (In between, the final-pass LLM call #2 sees a `Ticket Gate` category question + a proximity query and pushes the specific nearby object ids to the Rerun viewer — the answerer cites the viewer status.)
 
-### Worked example B — anomalies (structured DB + prose report)
+### Worked example B — anomalies (structured DB)
 
 > **User:** "What anomalies did you find, and were any near the ticket gates?"
 
@@ -145,13 +143,12 @@ Router (round 1) returns:
 ```
 get_anomaly_summary {}                                  # anomaly overview
 get_anomalies {}                                        # individual abnormalities + image links
-get_report_summary {}                                   # prose report + recommendations
 get_category_proximity {target_category: "Ticket Gate",
                          other_categories: ["Lights","Advertisement Board", ...]}   # "near ticket gates" part
 ```
 After the router stops, the anomaly completeness top-up notices `get_anomaly_locations` was skipped and runs it (so the answerer has the 3D camera positions of every abnormal pair). The final-pass LLM then decides what to highlight: because an anomaly tool ran, it pushes the **anomaly camera positions** to the Rerun viewer (scoped to the user's `anomaly_id` / `anomaly_type` / `inspection_id` if any were named) — the abnormality locations are lit up automatically alongside the spoken answer. If the user instead asked for an **inspection summary** or to **compare inspections**, the anomaly tools still run (the answerer's system prompt explicitly tells it to "always mention ANOMALY DATA" for those intents) and the final pass still marks the anomaly locations in the viewer.
 
-`get_anomaly_summary` / `get_anomalies` / `get_anomaly_locations` read the `anomaly_types` / `abnormal_detections` / `abnormalities` tables. `get_anomalies` returns typed abnormalities with 2D pixel bboxes, notes, affected object/location, camera position, and the ground-truth vs inspection image links for each pair — plus the annotated result image (`/reports/reference/<gt_image_id>_result.jpg`, the same frame with anomaly boxes drawn) when present. `get_anomaly_locations` returns one row per abnormality (numbered by the user-facing `abnormalities.id`, not the internal pair id) with its 3D camera position and a rich label like `Anomaly 4: state_change, overhead monitor/screen`. `get_report_summary` returns the live structured anomaly data (summary + 3D locations) as its tool result; the prose report text is fetched by `llm_service` into `report_context`. So the answerer receives **two** system messages — `db_context` (structured abnormalities + 3D locations + proximity) and `report_context` (prose + annotated result image links) — and weaves them together, trusting the database when the prose is stale: "the report found cracks near gate 3; the abnormalities table lists 2 scratches on the ticket-gate panels; around that area there are 8 lights and 3 ad boards within 2 m." The report's "Frame N" references map to `/reports/reference/<N>_result.jpg`.
+`get_anomaly_summary` / `get_anomalies` / `get_anomaly_locations` read the `anomaly_types` / `abnormal_detections` / `abnormalities` tables. `get_anomalies` returns typed abnormalities with 2D pixel bboxes, notes, affected object/location, camera position, and the ground-truth vs inspection image links for each pair. `get_anomaly_locations` returns one row per abnormality (numbered by the user-facing `abnormalities.id`, not the internal pair id) with its 3D camera position and a rich label like `Anomaly 4: state_change, overhead monitor/screen`. So the answerer receives a single `db_context` system message with the structured abnormalities + 3D locations + proximity, and walks through them anomaly by anomaly (per the answering prompt's anomaly rule), e.g. "the abnormalities table lists 2 scratches on the ticket-gate panels; around that area there are 8 lights and 3 ad boards within 2 m."
 
 ### Worked example C — images + live annotation (vision tool)
 
@@ -213,21 +210,20 @@ If the user says "annotate the previous image" / "the second one" / "the one wit
 
 | File | Role |
 |------|------|
-| `app/main.py` | FastAPI app, WebSocket `/ws` lifecycle, static image mounts, keeps `conversation_history` (≤12) + `tool_call_history` (≤6), per-turn task cancel/interrupt. REST: `/health`, `/status`, `/voices`, `/reports/image-list`, `/annotate-image`. |
+| `app/main.py` | FastAPI app, WebSocket `/ws` lifecycle, static image mounts, keeps `conversation_history` (≤12) + `tool_call_history` (≤6), per-turn task cancel/interrupt. REST: `/health`, `/status`, `/voices`, `/annotate-image`. |
 | `app/config.py` | `Settings` (pydantic) from env/`.env`; resolves relative paths against `backend/`. |
 | `app/models.py` | Pydantic client/server message models. |
 | `app/services/pipeline.py` | `VoicePipeline.handle_audio` — STT → stream LLM → sentence-chunk → TTS → yield `transcript`/`llm_token`/`tts_audio_chunk`/`llm_done`. |
 | `app/services/stt_service.py` | `build_stt` → `SenseVoiceSTT` (default, emotion+lang tags) or `WhisperSTT`. Returns `STTResult`. |
 | `app/services/tool_router.py` | `ToolRouter.select_tool` — Ollama native tool-calling (call #1, multi-round). `TOOLS`/`_ollama_tools`. Prior-image + prior-tool context. Annotation safety-net fallback. `decide_highlights` — final-pass `set_rerun_highlight` decision (call #2) that reads the merged tool results and picks what to highlight in the Rerun viewer. |
 | `app/services/db_service.py` | `InspectionDBClient.lookup` → router → `_execute_tool` per tool → join. All SQL query methods + `_format_*` formatters. `_parse_time_string` for clock/ns/ISO times. `annotate_image` orchestration. No-tool safety net (`_safety_net_calls`). Anomaly completeness top-up (`_resolve_anomaly_scope` + `get_anomaly_locations`/`get_anomalies` top-up) + cached anomaly trio short-circuit for follow-ups. Final-pass highlight application (`_apply_highlight_decision`, `_decision_matches_tool_results`, `_scoped_anomaly_coordinates`) with deterministic fallback. |
-| `app/services/report_service.py` | `InspectionReportClient` — reads `.txt`/`.pdf` (via `pdftotext`) reports, lists `extracted_images/` and the annotated `<N>_result.jpg` reference images (served at `/reports/reference/`). Loaded only when `get_report_summary` was selected. |
 | `app/services/vision_service.py` | `VisionAnnotator.annotate` — sends image to the **base LLM** (multimodal), strict-JSON parsing with retries, normalizes coords, draws annotations with OpenCV. |
 | `app/services/rerun_service.py` | `RerunVisualizer.highlight` — pushes 3D object centroids/bboxes + raw coordinates to a Rerun viewer, sharing the grounding scene's app id + leveling frame. Logs the station map (`world/leveled/camera_init/colored_map`) from the pre-extracted colored `.pcd` so highlights land on the map. All Rerun I/O on a background daemon thread (never blocks the chat); auto-launches a viewer when `RERUN_AUTO_SPAWN=true`. Called by the `highlight_in_rerun` tool, the `clear_rerun_markings` tool, AND by the final-pass highlight decision (`_apply_highlight_decision` / deterministic fallback). |
-| `app/services/llm_service.py` | `LocalLLM.stream_reply` (call #3): gather context, `_build_messages` (system prompt + live DB facts + tool history + db_context + report_context), stream via Ollama/vLLM, strip `thinking`. Annotated-image links are stripped from `db_context` and re-emitted as the first reply tokens. Highlight / anomaly-where notes prepended to `db_context` from `last_highlight_status` + `get_anomaly_locations`. `preload_model`, `runtime_status`. |
+| `app/services/llm_service.py` | `LocalLLM.stream_reply` (call #3): gather context, `_build_messages` (system prompt + live DB facts + tool history + db_context), stream via Ollama/vLLM, strip `thinking`. Annotated-image links are stripped from `db_context` and re-emitted as the first reply tokens. Highlight / anomaly-where notes prepended to `db_context` from `last_highlight_status` + `get_anomaly_locations`. `preload_model`, `runtime_status`. |
 | `app/services/tts_service.py` | `PiperTTS` — voice selection per language, streaming WAV chunks, Python API + CLI fallback. |
 | `app/services/runtime_status.py` | `nvidia-smi` VRAM snapshot. |
 
-**Frontend:** `App.jsx` (state, WebSocket, push-to-talk, playback), `useWebSocket`/`useRecorder`/`useAudioPlayback` hooks, `TranscriptCards`/`ChatHistory`/`MarkdownImageText`/`StatusPanel`/`DebugPanel`/`ImageAnnotator`/`ReportImageGallery` components.
+**Frontend:** `App.jsx` (state, WebSocket, push-to-talk, playback), `useWebSocket`/`useRecorder`/`useAudioPlayback` hooks, `TranscriptCards`/`ChatHistory`/`MarkdownImageText`/`StatusPanel`/`DebugPanel`/`ImageAnnotator` components.
 
 ---
 
@@ -282,7 +278,6 @@ Each maps to an `InspectionDBClient` method; the router's system prompt describe
 | `get_anomaly_summary` | `inspection_id?` | "How many anomalies were found?" (counts by type / inspection) |
 | `get_anomalies` | `anomaly_id?`, `anomaly_type?`, `inspection_id?`, `limit?` | "Show me the anomalies" (typed abnormalities + image-pair links) |
 | `get_anomaly_locations` | `inspection_id?` | "Where are the anomalies?" — 3D camera positions per abnormality, numbered by user-facing `abnormalities.id`. Always runs alongside the other anomaly tools; the final pass pushes these coordinates to the Rerun viewer with rich labels like `Anomaly 4: state_change, overhead monitor/screen` |
-| `get_report_summary` | — | "What anomalies did you find?" (loads prose report context) |
 | `highlight_in_rerun` | `object_ids[]?`, `coordinates[]?`, `category?`, `keep_existing?`, `label?` | "Highlight objects 16 and 19 in the 3D viewer" (explicit push; the final pass handles ordinary coordinate/category highlights without this tool) |
 | `clear_rerun_markings` | — | "Clear the 3D map markings" — wipes the Rerun viewer (use only when the user explicitly asks to clear/reset) |
 | `run_sql_query` / `query_database` | `query` (SELECT), `limit` | Escape hatch for ad-hoc/aggregation SQL |
@@ -359,7 +354,7 @@ Key env vars (see `backend/.env.example` for the full list):
 | `RERUN_APP_ID` / `RERUN_LEVELING_RPY_DEG` | `inspection_grounding_rerun` / `0.0,20.0,0.0` | Match the grounding scene's app id + leveling rotation so highlights overlay the grounding map |
 | `RERUN_AUTO_SPAWN` | `true` | If no viewer is reachable, launch one on first highlight (else require a manually-started `rerun`) |
 | `RERUN_MAP_ENABLED` / `RERUN_MAP_PCD_PATH` | `true` / `../MTR Inspection Database/outputs/colored_map.pcd` | Overlay the photo-colored global map PCD in the chatbot's own recording so highlights land on the map |
-| `REPORTS_DIR` / `ANNOTATED_IMAGE_CACHE_DIR` | `../reports` / `./annotated_images` | Reports + annotated-image cache |
+| `ANNOTATED_IMAGE_CACHE_DIR` | `./data/annotated_images` | Annotated-image cache (writes from the `annotate_image` tool) |
 | `PIPER_*` | — | Piper voice/model paths |
 
 ---

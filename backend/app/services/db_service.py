@@ -224,10 +224,9 @@ class InspectionDBClient:
         return ", ".join(parts)
 
     _IMAGE_URL_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
-    # Match canonical image URL prefixes. /reports/extracted_images is the
-    # anomaly-image route; /reports/images is accepted as a legacy alias.
+    # Match canonical image URL prefixes served by the backend.
     _PLAIN_IMAGE_RE = re.compile(
-        r"((?:/(?:inspection|annotated)/images/|/reports/(?:extracted_)?images/)[^\s\)\"]+)"
+        r"((?:/(?:inspection|annotated)/images/)[^\s\)\"]+)"
     )
 
     @staticmethod
@@ -1465,27 +1464,8 @@ class InspectionDBClient:
             d = dict(row)
             d["gt_image_url"] = self._image_url(row["gt_filename"])
             d["inspection_image_url"] = self._image_url(row["inspection_filename"])
-            # The reports dir holds an annotated counterpart of the ground-truth
-            # frame (<gt_image_id>_result.jpg, anomaly bboxes drawn) — same frame,
-            # same viewpoint. Link it when present.
-            d["annotated_result_url"] = self._annotated_result_url(row["gt_image"])
             out.append(d)
         return out
-
-    def _annotated_result_url(self, gt_image_id: Any) -> str | None:
-        """URL of the annotated result image for a ground-truth image id, if on disk."""
-        if not self.settings or gt_image_id is None:
-            return None
-        reports_dir = getattr(self.settings, "reports_dir", None)
-        if not reports_dir:
-            return None
-        try:
-            candidate = Path(reports_dir) / f"{int(gt_image_id)}_result.jpg"
-        except (TypeError, ValueError):
-            return None
-        if candidate.exists():
-            return f"/reports/reference/{candidate.name}"
-        return None
 
     def get_anomaly_locations(
         self,
@@ -1670,7 +1650,11 @@ class InspectionDBClient:
             if self.rerun_visualizer is not None:
                 try:
                     decision = await asyncio.to_thread(
-                        self.router.decide_highlights, query, db_context, chat_history
+                        self.router.decide_highlights,
+                        query,
+                        db_context,
+                        chat_history,
+                        tool_history=tool_history,
                     )
                     logger.info("Cached-path final-pass highlight decision: %s", decision)
                 except Exception as exc:  # noqa: BLE001
@@ -1754,15 +1738,34 @@ class InspectionDBClient:
             # "how many lights"), or is a broad object question ("tell me about all the
             # objects"), fetch the real data deterministically.
             if not all_tool_calls:
-                net_calls = self._safety_net_calls(query)
-                if net_calls:
-                    logger.info("Router called no tools; running safety-net calls %s for query: %r", net_calls, query)
-                    for name, args in net_calls:
+                # First try a changed-parameter re-call: a follow-up like
+                # "how about within 5m", "show me 10", or a new category should
+                # re-run the most recent matching tool with the updated argument,
+                # even when the router returned no tools. This catches the common
+                # failure where the router thinks the question was already
+                # answered.
+                recall_calls = self._changed_param_recall(query, tool_history)
+                if recall_calls:
+                    logger.info(
+                        "Router called no tools; running changed-radius re-call %s for query: %r",
+                        recall_calls, query,
+                    )
+                    for name, args in recall_calls:
                         result = await self._execute_tool(name, args, chat_history=chat_history)
                         all_tool_results.append({"name": name, "args": args, "output": result})
                         all_tool_calls.append((name, args))
                         if result:
                             prior_results.append(result)
+                else:
+                    net_calls = self._safety_net_calls(query)
+                    if net_calls:
+                        logger.info("Router called no tools; running safety-net calls %s for query: %r", net_calls, query)
+                        for name, args in net_calls:
+                            result = await self._execute_tool(name, args, chat_history=chat_history)
+                            all_tool_results.append({"name": name, "args": args, "output": result})
+                            all_tool_calls.append((name, args))
+                            if result:
+                                prior_results.append(result)
 
             # Anomaly completeness: for ANY anomaly-related question the answerer always
             # needs the structured anomaly pair — the 3D anomaly coordinates
@@ -1828,7 +1831,11 @@ class InspectionDBClient:
             ):
                 try:
                     decision = await asyncio.to_thread(
-                        self.router.decide_highlights, query, db_context, chat_history
+                        self.router.decide_highlights,
+                        query,
+                        db_context,
+                        chat_history,
+                        tool_history=tool_history,
                     )
                     logger.info("Final-pass highlight decision: %s", decision)
                 except Exception as exc:  # noqa: BLE001
@@ -1923,6 +1930,36 @@ class InspectionDBClient:
                                         nid = int(n["object_id"])
                                         if nid not in merged_object_ids:
                                             merged_object_ids.append(nid)
+                        elif name == "get_objects_near_position":
+                            # Position queries ("objects within 5m of (x, y, z)"):
+                            # highlight the SPECIFIC objects inside the radius, not
+                            # just the reference point.
+                            x = float(args.get("x", 0.0))
+                            y = float(args.get("y", 0.0))
+                            z = float(args.get("z", 0.0))
+                            radius = float(args.get("radius_m", 2.0))
+                            category = args.get("category")
+                            if category:
+                                category = self._canonical_category(category)
+                            inspection_id = args.get("inspection_id")
+                            for obj in self.get_objects_near_position(
+                                x, y, z, radius, category=category, inspection_id=inspection_id
+                            ):
+                                oid = int(obj["id"])
+                                if oid not in merged_object_ids:
+                                    merged_object_ids.append(oid)
+                        elif name == "get_nearest_objects_to_object":
+                            # Object-proximity query: highlight the other objects
+                            # that were returned as near the given object.
+                            oid_src = int(args.get("object_id"))
+                            radius = float(args.get("radius_m", 2.0))
+                            inspection_id = args.get("inspection_id")
+                            for obj in self.get_nearest_objects_to_object(
+                                oid_src, radius, inspection_id=inspection_id
+                            ):
+                                nid = int(obj["id"])
+                                if nid not in merged_object_ids:
+                                    merged_object_ids.append(nid)
                         elif name == "get_category_windows":
                             for c in args.get("categories") or []:
                                 if c:
@@ -1985,6 +2022,8 @@ class InspectionDBClient:
                                     "get_category_proximity",
                                     "get_category_proximity_with_images",
                                     "get_category_windows",
+                                    "get_objects_near_position",
+                                    "get_nearest_objects_to_object",
                                 }
                             }
                             if len(scoped) == 1:
@@ -2011,6 +2050,62 @@ class InspectionDBClient:
         r"\b(show|see|display|images?|pictures?|photos?|frames?|look)\b",
         re.IGNORECASE,
     )
+
+    # Flexible radius parser. Matches a number followed by a meter unit,
+    # optionally preceded by a cue word ("within", "radius", "try", "expand to",
+    # "how about", "extend to", "around", "about"). The cue word is optional so
+    # a bare "5m" or "5 meters" also matches. Captures the number.
+    _RADIUS_RE = re.compile(
+        r"(?:\b(?:within|radius|try|expand(?:\s+to)?|how\s+about|extend(?:\s+to)?|around|about)\s+)?"
+        r"(\d+(?:\.\d+)?)\s*(?:m\b|meters?\b|metres?\b)",
+        re.IGNORECASE,
+    )
+
+    # Limit/count cue: "show me 10", "limit 20", "top 15", "first 5",
+    # "up to 8". Captures the number.
+    _LIMIT_RE = re.compile(
+        r"\b(?:limit|top|first|up\s+to|show(?:\s+me)?|display|give\s+me|just)\s+"
+        r"(\d+)\b",
+        re.IGNORECASE,
+    )
+
+    # "more" / "all" as a limit hint (no number captured — handled specially).
+    _MORE_RE = re.compile(r"\b(more|all|every|each)\b", re.IGNORECASE)
+
+    # Coordinate tuple in the query: "(x, y, z)" or "x, y, z" with decimals.
+    _COORD_RE = re.compile(
+        r"\(?\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)?"
+    )
+
+    # Explicit viewer/highlight action words: the user wants the 3D visualization
+    # acted on, so a repeat request with UNCHANGED parameters still deserves a
+    # fresh tool call (the action must be re-applied with current data).
+    _ACTION_INTENT_RE = re.compile(
+        r"\b(highlight|highlighting|rerun|viewer|visuali[sz](?:e|ation)|"
+        r"3d(?:\s+viewer)?|show (?:it|them) in|display (?:it|them) in|mark)\b",
+        re.IGNORECASE,
+    )
+
+    # Tools whose results feed the final-pass highlight. When the user explicitly
+    # asks for a viewer/highlight action and the router returned no tools, re-issue
+    # the most recent of these even when no argument changed, so the highlight pass
+    # sees fresh data (e.g. "highlight all objects within 5m of the crack" repeating
+    # the previous 5m query).
+    _ACTION_RECALL_TOOLS = frozenset({
+        "get_objects_near_position",
+        "get_nearest_objects_to_object",
+        "get_category_proximity",
+        "get_category_proximity_with_images",
+        "get_objects_proximity_with_images",
+        "get_objects_by_category",
+        "get_category_objects_with_images",
+        "get_object_by_id",
+        "get_anomaly_locations",
+        "get_anomalies",
+        "get_anomaly_summary",
+        "get_summary",
+        "get_categories",
+    })
 
     # Anomaly/report questions: fetch the structured anomaly data, not object counts.
     _ANOMALY_QUERY_RE = re.compile(
@@ -2137,6 +2232,234 @@ class InspectionDBClient:
             return [("get_objects_by_category", {"category": c}) for c in categories]
         if self._query_is_about_objects(query):
             return [("get_summary", {}), ("get_categories", {})]
+        return []
+
+    def _changed_param_recall(
+        self,
+        query: str,
+        tool_history: Sequence[dict[str, object]] | None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Deterministic re-call when a follow-up changes a tool argument.
+
+        Catches a common router failure: the user asks a follow-up that changes
+        a parameter (a new radius, a new limit, a new category, new coordinates)
+        and the router returns no tool calls because it thinks the question was
+        already answered. This method parses the follow-up query for changed
+        values, scans the cross-turn ``tool_history`` for the most recent call
+        whose arguments overlap with the parsed changes, and re-issues that call
+        with the updated arguments (all other arguments preserved).
+
+        Supported parameter changes:
+          - radius_m  : "within 5m", "try 5 meters", "5m", "expand to 5m"
+          - limit / n / top_n / nearby_limit : "show me 10", "limit 20", "top 15"
+          - "more" / "all" : widens a capped limit (doubles it, or sets to 'all')
+          - category / target_category : a category name in the query
+          - x, y, z : a "(x, y, z)" coordinate tuple in the query
+
+        Viewer/highlight action requests ("highlight ... in rerun") additionally
+        trigger a re-application pass: when the user explicitly asks for a viewer
+        action but the router returned no tools, the most recent highlight-feeding
+        tool is re-issued even when no argument changed (repeated requests like
+        "highlight all objects within 5m of the crack" must still re-run the query
+        so the viewer gets current data).
+
+        Returns an empty list when no parameter change is detectable (and no action
+        intent), or when no prior matching tool call exists. Only re-calls the MOST
+        RECENT matching call (walking tool_history in reverse) so it never floods
+        the turn.
+        """
+        if not tool_history:
+            return []
+
+        action_intent = bool(self._ACTION_INTENT_RE.search(query))
+
+        # --- Parse changed values out of the follow-up query ----------------
+        changes: dict[str, Any] = {}
+
+        # Radius: any number + meter unit, optionally cued by "within"/"try"/...
+        m = self._RADIUS_RE.search(query)
+        if m:
+            try:
+                changes["radius_m"] = float(m.group(1))
+            except (TypeError, ValueError):
+                pass
+
+        # Limit / n / top_n: a cued integer in the query.
+        m = self._LIMIT_RE.search(query)
+        if m:
+            try:
+                n_val = int(m.group(1))
+            except (TypeError, ValueError):
+                n_val = None
+            if n_val is not None:
+                # Apply to whichever of these args the prior call used.
+                for key in ("limit", "n", "top_n", "nearby_limit"):
+                    changes.setdefault(key, n_val)
+
+        # "more" / "all" widen a capped limit. We don't know the new value yet
+        # (it depends on the prior call's limit), so record a sentinel and
+        # resolve it against the prior call below.
+        if self._MORE_RE.search(query):
+            changes["__widen_limit__"] = True
+
+        # Coordinates: a (x, y, z) tuple in the query overrides x/y/z.
+        m = self._COORD_RE.search(query)
+        if m:
+            try:
+                changes["x"] = float(m.group(1))
+                changes["y"] = float(m.group(2))
+                changes["z"] = float(m.group(3))
+            except (TypeError, ValueError):
+                pass
+
+        # Category: a canonical category name in the query. Applies to whichever
+        # of category / target_category the prior call used.
+        mentioned = self._mentioned_categories(query)
+        if mentioned:
+            for key in ("category", "target_category"):
+                changes.setdefault(key, mentioned[0])
+
+        if not changes and not action_intent:
+            return []
+
+        # --- Find the most recent prior call whose args overlap the changes ---
+        # Map each change key to the set of tool names that actually accept it,
+        # so we only re-call a tool that can meaningfully use the new value.
+        arg_to_tools: dict[str, set[str]] = {
+            "radius_m": {
+                "get_objects_near_position",
+                "get_category_proximity",
+                "get_category_proximity_with_images",
+                "get_objects_proximity_with_images",
+                "get_nearest_objects_to_object",
+            },
+            "limit": {
+                "get_objects_by_category", "get_top_objects", "get_recent_objects",
+                "get_object_image_paths", "get_category_objects_with_images",
+                "get_category_sample_images", "get_images_in_time_range",
+                "get_objects_in_time_range", "get_detections_in_time_range",
+                "get_objects_by_category_in_time_range",
+                "get_objects_in_temporal_cluster", "get_anomalies",
+                "get_category_proximity_with_images",
+                "get_objects_proximity_with_images", "run_sql_query",
+                "query_database", "annotate_image",
+            },
+            "n": {"get_top_objects"},
+            "top_n": {"get_temporal_clusters", "get_category_cooccurrence"},
+            "nearby_limit": {
+                "get_category_proximity_with_images",
+                "get_objects_proximity_with_images",
+            },
+            "category": {
+                "get_objects_by_category", "get_category_timeline",
+                "get_category_objects_coordinates", "get_category_objects_with_images",
+                "get_category_sample_images", "get_category_detection_timeline",
+                "get_objects_by_category_in_time_range",
+                "get_category_proximity", "get_category_proximity_with_images",
+                "get_objects_near_position", "get_category_bounding_box",
+                "annotate_image",
+            },
+            "target_category": {
+                "get_category_proximity", "get_category_proximity_with_images",
+                "get_objects_proximity_with_images",
+            },
+            "x": {"get_objects_near_position"},
+            "y": {"get_objects_near_position"},
+            "z": {"get_objects_near_position"},
+        }
+
+        # Build the set of tools that could accept AT LEAST ONE parsed change.
+        candidate_tools: set[str] = set()
+        for key in changes:
+            if key == "__widen_limit__":
+                continue  # sentinel, handled per-call below
+            candidate_tools |= arg_to_tools.get(key, set())
+
+        # Only treat "more"/"all" as a real change if a number cue wasn't found;
+        # otherwise the explicit limit already covers it.
+        widen_only = (len(changes) == 1 and "__widen_limit__" in changes)
+        if widen_only:
+            candidate_tools |= arg_to_tools["limit"] | arg_to_tools["nearby_limit"]
+
+        if not candidate_tools:
+            return []
+
+        for entry in reversed(list(tool_history)):
+            for call in entry.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                if name not in candidate_tools:
+                    continue
+                args = call.get("args") or {}
+                if not isinstance(args, dict):
+                    continue
+
+                new_args = dict(args)
+                changed_any = False
+
+                # Apply every parsed change that this tool actually accepts.
+                for key, new_val in changes.items():
+                    if key == "__widen_limit__":
+                        continue
+                    if name not in arg_to_tools.get(key, set()):
+                        continue
+                    old_val = args.get(key)
+                    # Skip when the value is unchanged.
+                    try:
+                        if old_val is not None and float(old_val) == float(new_val):
+                            continue
+                    except (TypeError, ValueError):
+                        if old_val == new_val:
+                            continue
+                    # For category-like args, only override when the prior call
+                    # used a different category (otherwise the user is just
+                    # referring back to the same one).
+                    if key in ("category", "target_category") and old_val == new_val:
+                        continue
+                    new_args[key] = new_val
+                    changed_any = True
+
+                # "more"/"all": widen whichever limit-like arg the call used.
+                if "__widen_limit__" in changes:
+                    for key in ("limit", "nearby_limit", "n", "top_n"):
+                        if key not in args:
+                            continue
+                        old_val = args.get(key)
+                        if old_val in (None, "all"):
+                            continue
+                        try:
+                            old_int = int(old_val)
+                        except (TypeError, ValueError):
+                            continue
+                        # "all" -> set to 'all'; "more" -> double the cap.
+                        if re.search(r"\b(all|every|each)\b", query, re.IGNORECASE):
+                            new_args[key] = "all"
+                        else:
+                            new_args[key] = old_int * 2
+                        changed_any = True
+
+                if not changed_any:
+                    continue
+                return [(name, new_args)]
+
+        # Pass 2 (action re-application): the user explicitly asked to highlight /
+        # visualize in the viewer, and the router still returned no tools. Re-issue
+        # the most recent highlight-feeding tool with its previous arguments so the
+        # final-pass highlight can mark the actual objects — even when the request
+        # merely repeats a previous query's parameters.
+        if action_intent:
+            for entry in reversed(list(tool_history)):
+                for call in entry.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    name = call.get("name")
+                    if name not in self._ACTION_RECALL_TOOLS:
+                        continue
+                    args = call.get("args") or {}
+                    if not isinstance(args, dict):
+                        continue
+                    return [(name, dict(args))]
         return []
 
     @staticmethod
@@ -2668,14 +2991,6 @@ class InspectionDBClient:
             if not self.settings:
                 return None
             return Path(self.settings.inspection_image_dir) / Path(image_url).name
-        if image_url.startswith("/reports/reference/"):
-            if not self.settings:
-                return None
-            return Path(self.settings.reports_dir) / Path(image_url).name
-        if image_url.startswith("/reports/extracted_images/") or image_url.startswith("/reports/images/"):
-            if not self.settings:
-                return None
-            return Path(self.settings.reports_dir) / "extracted_images" / Path(image_url).name
         if image_url.startswith("/annotated/images/"):
             if not self.settings:
                 return None
@@ -2688,8 +3003,6 @@ class InspectionDBClient:
         if self.settings:
             candidates = [
                 Path(self.settings.inspection_image_dir) / raw,
-                Path(self.settings.reports_dir) / "extracted_images" / raw,
-                Path(self.settings.reports_dir) / raw,
             ]
             for candidate in candidates:
                 if candidate.exists():
@@ -2699,8 +3012,6 @@ class InspectionDBClient:
     def _annotated_image_cache_dir(self) -> Path:
         if self.settings and getattr(self.settings, "annotated_image_cache_dir", None):
             return Path(self.settings.annotated_image_cache_dir)
-        if self.settings:
-            return Path(self.settings.reports_dir) / "annotated_images"
         return Path("./annotated_images").resolve()
 
     def _format_annotate_image(self, result: dict[str, Any] | None) -> str:
@@ -3582,11 +3893,6 @@ class InspectionDBClient:
                 lines.append(f"  inspection frame: ![inspection frame]({r['inspection_image_url']})")
             if r.get("gt_image_url"):
                 lines.append(f"  ground-truth frame: ![gt frame]({r['gt_image_url']})")
-            if r.get("annotated_result_url"):
-                lines.append(
-                    f"  annotated result (same frame with anomaly boxes drawn): "
-                    f"![annotated result]({r['annotated_result_url']})"
-                )
         return "\n".join(lines)
 
     def _format_anomaly_locations(self, inspection_id: int | None = None) -> str:

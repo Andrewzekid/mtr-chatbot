@@ -5,7 +5,6 @@ import { useRecorder } from "./hooks/useRecorder";
 import StatusPanel from "./components/StatusPanel";
 import ChatHistory from "./components/ChatHistory";
 import TranscriptCards from "./components/TranscriptCards";
-import ReportImageGallery from "./components/ReportImageGallery";
 import DebugPanel from "./components/DebugPanel";
 import ImageAnnotator from "./components/ImageAnnotator";
 
@@ -451,7 +450,6 @@ export default function App() {
         <ChatHistory chatHistory={chatHistory} />
         <ImageAnnotator disabled={socketState !== "connected"} />
         <DebugPanel toolCalls={toolCalls} toolRouterRaw={toolRouterRaw} highlight={highlightInfo} />
-        <ReportImageGallery />
       </main>
 
       <footer className="footer">WebSocket: {socketState}</footer>

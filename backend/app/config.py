@@ -76,9 +76,6 @@ class Settings(BaseSettings):
     # Relative paths resolve against the backend/ root (see model_post_init).
     inspection_db_path: str = "../MTR Inspection Database/inspection_v2_mtr_new.db"
 
-    # Inspection anomaly reports (text + PDF summaries)
-    reports_dir: str = "../reports"
-
     # Source camera images referenced by images.filename (served at /inspection/images).
     inspection_image_dir: str = "../MTR Inspection Database/outputs/images"
 
@@ -145,7 +142,6 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         self.sensevoice_model_dir = self._resolve_backend_path(self.sensevoice_model_dir)
         self.whisper_download_root = self._resolve_backend_path(self.whisper_download_root)
-        self.reports_dir = self._resolve_backend_path(self.reports_dir)
         self.inspection_db_path = self._resolve_backend_path(self.inspection_db_path)
         self.inspection_image_dir = self._resolve_backend_path(self.inspection_image_dir)
         self.inspection_objects_dir = self._resolve_backend_path(self.inspection_objects_dir)

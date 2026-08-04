@@ -9,6 +9,10 @@ import httpx
 
 from app.config import Settings
 
+# Markdown image links, stripped from past tool outputs before they reach the
+# highlight decider (the decider never re-emits images).
+_IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
 logger = logging.getLogger(__name__)
 
 # Simple alias map used by the annotation safety-net fallback to detect category mentions.
@@ -395,7 +399,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "highlight_in_rerun",
-        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights. When you include coordinates, give each point a descriptive label: objects as 'Object <id>: <category>' and anomaly locations using the exact rich label from get_anomaly_locations (e.g. 'Anomaly 4: state_change, overhead monitor/screen').",
+        "description": "Highlight specific 3D coordinates or objects in the Rerun viewer so the user can see where they are in the station. A final pass automatically highlights objects/coordinates from tool results when the user wants 3D visualization, so you usually do NOT need this tool for ordinary coordinate questions. Call it ONLY for explicit, specific 3D-highlight requests that name particular objects/coordinates, e.g. 'highlight objects 16 and 19 in the 3D viewer'. Provide object_ids, coordinates, or a category (any combination). IMPORTANT: this tool CANNOT compute distances or radii — it only marks the exact object_ids / coordinates you pass. For 'highlight objects within X m of Y', you MUST first call get_objects_near_position (or get_nearest_objects_to_object / get_category_proximity) around Y, then highlight the object_ids from its result. Passing only the center coordinate (x, y, z) of Y marks ONLY that center point, NOT the objects around it. The viewer is auto-launched if not running. By default this clears highlights from previous queries; set keep_existing=true only if the user explicitly asks to keep or add to the previous highlights. When you include coordinates, give each point a descriptive label: objects as 'Object <id>: <category>' and anomaly locations using the exact rich label from get_anomaly_locations (e.g. 'Anomaly 4: state_change, overhead monitor/screen').",
         "parameters": _params(
             {
                 "object_ids": {"type": "array", "items": {"type": "integer"}, "description": "Object ids to highlight (centroids + 3D bboxes)."},
@@ -433,7 +437,7 @@ TOOLS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "image_url": {"type": "string", "description": "URL or path to a single image, e.g. /inspection/images/14.jpg or /reports/extracted_images/img-021.jpg."},
+                "image_url": {"type": "string", "description": "URL or path to a single image, e.g. /inspection/images/14.jpg."},
                 "object_id": {"type": "integer", "description": "Numeric object id (also called track_id). All frames this object was detected in (up to `limit`) will be annotated."},
                 "category": {"type": "string", "description": "Category name. Up to `limit` sample images of this category will be annotated."},
                 "question": {"type": "string", "description": "What to look for or how to annotate. Defaults to the user's original question."},
@@ -580,6 +584,13 @@ Plan:
 2. get_category_proximity(target_category="Exit Sign", other_categories=["Lights", "Advertisement Board", "Map", "TV", "Ticket Gate"], radius_m=1.0)
 Note: even if a previous turn already called get_category_proximity for Exit Sign with radius_m=3.0, the user now asks for 1 m, so you MUST call it again with radius_m=1.0.
 
+Example A3 (follow-up that changes a parameter — the tool MUST be re-called even if the prior result was empty):
+Previous turn: User asked "what's within 2 meters of (0.02, 1.46, 1.12)?" -> you called get_objects_near_position(x=0.02, y=1.46, z=1.12, radius_m=2.0) and it returned no objects.
+Current turn: User says "how about within 5m" (or "within 5 meters", "expand to 5m", "try 5 meters").
+Plan:
+1. get_objects_near_position(x=0.02, y=1.46, z=1.12, radius_m=5.0)
+The ONLY thing that changed is radius_m (2.0 -> 5.0). The previous answer is NOT a substitute for a fresh call: the prior call used a 2 m radius and returned nothing, so you have NO data for a 5 m radius. You MUST call get_objects_near_position again with radius_m=5.0. This applies to ANY radius-bearing tool (get_objects_near_position, get_category_proximity, get_category_proximity_with_images, get_objects_proximity_with_images, get_nearest_objects_to_object) and ANY parameter change (radius_m, x/y/z, category, object_id, target_category, other_categories, inspection_id, time window, limit).
+
 Example B:
 User: "How many times were advertisement boards seen, and what is near coordinate (-18, 32, -6)?"
 Plan:
@@ -617,6 +628,13 @@ User: "Highlight objects 16 and 19 in the 3D viewer."
 Plan:
 1. highlight_in_rerun(object_ids=[16, 19], label="objects 16 and 19")
 
+Example E3 (highlight OBJECTS within a radius of a location — do NOT shortcut with center coordinates):
+User: "Highlight all objects detected within 5m of a crack in rerun."
+Plan:
+1. get_anomaly_locations()  (find each 'crack'/anomaly location to use as a reference point)
+2. get_objects_near_position(x=<crack_x>, y=<crack_y>, z=<crack_z>, radius_m=5.0)  -- ONE call PER crack location
+Note: highlight_in_rerun CANNOT compute 'within 5m'. If you call highlight_in_rerun(coordinates=[the crack coordinates]) you only mark the crack centers, NOT the objects around them. Instead, call get_objects_near_position (or get_nearest_objects_to_object / get_category_proximity) around each reference point; the final pass then highlights the SPECIFIC object ids from those results. Never hand highlight_in_rerun just the center/reference coordinates when the user asked for objects around them.
+
 Example F (category summary):
 User: "Give me a summary of all the lights and advertisement boards found."
 Plan:
@@ -648,8 +666,9 @@ Plan:
 - This is a multi-round router: after the backend executes your tool calls, it will show you the results and give you another chance to call more tools if you still need information. Up to {max_rounds} rounds are allowed. If the results from the current round are enough, stop — return no tool calls. Only call additional tools when you genuinely need their output.
 - NEVER call a tool that is already listed in "Tools already called this turn" with the SAME arguments. The results of those calls are shown below; calling them again just wastes a round. The only valid reason to re-call a tool within the same turn is if the user asked for DIFFERENT parameters (a different radius, time window, category, limit, object id, inspection_id, etc.), and that changed argument must be visible in the new call.
 - A final pass runs AFTER your tools finish and decides which objects/coordinates to show in the Rerun viewer based on the results and the user's question. You do NOT need to call highlight_in_rerun for ordinary coordinate questions - the final pass highlights them. Only call highlight_in_rerun for explicit, specific 3D-highlight requests that name particular objects (e.g. 'highlight objects 16 and 19 in the 3D viewer').
-- A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool.
-- Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value.
+- CRITICAL rule for radius-based highlight requests (the model gets this wrong often): "highlight all objects within X m of Y" (or "near Y", "around the crack", "within 5m of the ticket gates") REQUIRES a fresh proximity/position query. highlight_in_rerun cannot compute a radius — it only marks the exact points or ids you give it. So you MUST first call get_objects_near_position (one call per reference point), get_nearest_objects_to_object, or a get_category_proximity tool around Y, collect the object_ids from the results, and let the final pass highlight those specific ids. NEVER call highlight_in_rerun with only the reference/center coordinates — that highlights just the center point, not the objects the user asked about. This applies whether the reference is an anomaly location ("crack"), a coordinate, or an object.
+- CRITICAL re-call rule (the model gets this wrong often): A previously answered question does NOT substitute for a fresh tool call when the parameters differ. The user's previous question and your previous answer are NOT a source of truth — only fresh tool calls are. If the user repeats or refines a question with DIFFERENT parameters (a different radius_m, time window, category, object id, coordinates, limit, target_category, other_categories, n, inspection_id, etc.), you MUST call the relevant tool again with the new parameters. When in doubt whether the parameters match, call the tool. This is true EVEN IF the prior call returned no results / an empty list — an empty result for radius_m=2.0 tells you NOTHING about radius_m=5.0, so you still must re-call.
+- Use the "Previously called tools" list (when provided) to compare the user's new parameters against the arguments used before. If any required argument changed, re-call the tool with the new value. A follow-up like "how about within 5m" or "try 5 meters" after a 2m query means the radius_m argument changed from 2.0 to 5.0 — re-call the SAME tool with radius_m=5.0, reusing the previous x/y/z, category, object_id, etc.
 - Only call get_category_objects_coordinates for categories explicitly named by the user or for the reference category in a proximity question. Never call it for all categories at once.
 - For proximity questions, pass all other known categories as other_categories unless the user names a specific subset.
 - For questions about how many objects are in a specific category (e.g. "how many exit signs were found", "how many lights were detected"), use get_objects_by_category(category). It returns distinct objects, not per-frame detections. Use get_detection_counts_by_category ONLY when the user explicitly asks for per-frame detection counts such as "how many times was it seen".
@@ -674,7 +693,7 @@ Plan:
         urls: list[str] = []
         for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", text):
             urls.append(match.group(1))
-        for match in re.finditer(r"((?:/(?:inspection|annotated)/images/|/reports/(?:(?:extracted_)?images|reference)/)[^\s\)\"]+)", text):
+        for match in re.finditer(r"((?:/(?:inspection|annotated)/images/)[^\s\)\"]+)", text):
             if match.group(1) not in urls:
                 urls.append(match.group(1))
         return urls
@@ -1041,6 +1060,7 @@ Plan:
         query: str,
         tool_results_text: str,
         chat_history: Sequence[tuple[str, str]] | None = None,
+        tool_history: Sequence[dict[str, object]] | None = None,
     ) -> dict[str, Any] | None:
         """Final-pass highlight decision, run after the tool-calling loop ends.
 
@@ -1049,6 +1069,11 @@ Plan:
         in the Rerun viewer. Returns the ``set_rerun_highlight`` tool-call arguments
         dict, or ``None`` when the model calls no tool / on any failure. Never
         raises (best-effort: a failed decision just means no auto-highlight).
+
+        ``tool_history`` (earlier turns' tool calls and outputs) is included in the
+        prompt when provided, so follow-up requests like "highlight the objects
+        within 5m of the crack again" can be resolved from the object ids the
+        earlier tools already returned.
         """
         if not query.strip() or not tool_results_text.strip():
             return None
@@ -1096,7 +1121,12 @@ Plan:
             "9. Do NOT set inspection_id unless the user explicitly names one inspection (e.g. 'inspection 2'). "
             "When the user asks about multiple categories or says 'all', leave inspection_id unset so the viewer "
             "shows matching objects from every inspection and groups them per inspection automatically.\n"
-            "10. At most one tool call. Output nothing but the tool call.\n\n"
+            "10. At most one tool call. Output nothing but the tool call.\n"
+            "11. Earlier turns' tool calls and results are listed under '=== Past tool calls and results from "
+            "earlier turns ===' (when present). The user may repeat or refine an earlier request (e.g. 'highlight "
+            "the objects within 5m of the crack again'). When the current question refers to those earlier results, "
+            "highlight exactly the object_ids / coordinates listed there — the ids are still valid even though the "
+            "tools ran in a previous turn.\n\n"
             "Examples:\n"
             "- User: 'how many lights were detected?' -> set_rerun_highlight(category='Lights').\n"
             "- User: 'how many ad boards were seen?' -> set_rerun_highlight(category='Advertisement Board').\n"
@@ -1120,10 +1150,31 @@ Plan:
                 lines.append(f"Assistant: {assistant_text[:300]}")
             history_block = "\n\nRecent conversation:\n" + "\n".join(lines)
 
+        past_tool_block = ""
+        if tool_history:
+            lines = []
+            for entry in tool_history:
+                for call in entry.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    name = call.get("name", "unknown")
+                    args = call.get("args", {})
+                    output = _IMAGE_LINK_RE.sub("", str(call.get("output", "")))
+                    output = re.sub(r"[ \t]{2,}", " ", output).strip()
+                    lines.append(f"- {name}({args}): {output[:400]}")
+            if lines:
+                recent = lines[-8:]
+                past_tool_block = (
+                    "\n\n=== Past tool calls and results from earlier turns "
+                    "(may contain the object_ids the user is referring to) ===\n"
+                    + "\n".join(recent)
+                )
+
         user_content = (
             f"User question: {query}"
             f"{history_block}\n\n"
             f"=== Tool results ===\n{tool_results_text}"
+            f"{past_tool_block}"
         )
 
         payload = {
