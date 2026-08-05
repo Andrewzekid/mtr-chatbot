@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
+from app.api import build_api_router
 from app.models import ClientAudioMessage, ClientInterruptMessage, ClientTextMessage, ImageAnnotationResponse, ServerMessage
 from app.services.pipeline import VoicePipeline
 from app.services.runtime_status import get_vram_status
@@ -57,7 +58,7 @@ settings = get_settings()
 app = FastAPI(title="MTR-Insight Inspection Voice Assistant")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.cors_origin],
+    allow_origins=[o.strip() for o in settings.cors_origin.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,6 +79,9 @@ vision_annotator = VisionAnnotator(settings)
 _models_loaded = False
 _models_loading = False
 _preload_lock = asyncio.Lock()
+
+# Button-driven staff console API (reads the same DB tools; no LLM in the loop).
+app.include_router(build_api_router(pipeline.db_client, pipeline.rerun_visualizer))
 
 
 async def _preload_models() -> dict[str, bool]:

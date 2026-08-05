@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from collections.abc import Sequence
@@ -146,6 +147,12 @@ class InspectionDBClient:
         self.vision_annotator = vision_annotator
         self.rerun_visualizer = rerun_visualizer
         self._conn: sqlite3.Connection | None = None
+        # Per-thread connections: FastAPI sync endpoints and the LLM router run
+        # on threadpool threads, and a single sqlite connection must never be
+        # shared across threads. Each thread gets its own connection so the
+        # console API and chat path are safe.
+        self._thread_local = threading.local()
+        self._db_mtime_cache: float | None = self._stat_db_mtime()
         self._last_tool_calls: list[dict[str, Any]] = []
         self._last_tool_results: list[dict[str, Any]] = []
         self._last_query: str = ""
@@ -300,15 +307,53 @@ class InspectionDBClient:
         return None
 
     def _connect(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path))
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        self.refresh()
+        conn: sqlite3.Connection | None = getattr(self._thread_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            self._thread_local.conn = conn
+        return conn
 
     def close(self) -> None:
+        conn: sqlite3.Connection | None = getattr(self._thread_local, "conn", None)
+        if conn:
+            conn.close()
+            self._thread_local.conn = None
         if self._conn:
-            self._conn.close()
+            # Backward-compat: close any legacy single-connection handle too.
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
             self._conn = None
+
+    # ------------------------------------------------------------------
+    # Live DB refresh (the inspection writer may update the database
+    # while the console is running)
+    # ------------------------------------------------------------------
+
+    def _stat_db_mtime(self) -> float | None:
+        try:
+            return self.db_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def db_mtime(self) -> float | None:
+        """Current file mtime (used by /api/info for the live-refresh badge)."""
+        return self._stat_db_mtime()
+
+    def refresh(self) -> None:
+        """Reopen the SQLite connection if the DB file changed on disk.
+
+        The inspection writer updates the database externally; without this the
+        console would keep reading a stale connection. Called lazily at the top
+        of every ``_connect``.
+        """
+        mtime = self._stat_db_mtime()
+        if mtime is not None and mtime != self._db_mtime_cache:
+            self._db_mtime_cache = mtime
+            self.close()
 
     # ------------------------------------------------------------------
     # Reusable query helpers
@@ -733,17 +778,19 @@ class InspectionDBClient:
         if row is None:
             return None
         obj = dict(row)
-        obj["detections"] = conn.execute(
-            """
-            SELECT d.id, i.timestamp_ns, i.filename, i.inspection_id,
-                   d.centroid_x, d.centroid_y, d.centroid_z,
-                   d.min_x, d.min_y, d.min_z, d.max_x, d.max_y, d.max_z
-            FROM detections d JOIN images i ON i.id=d.image_id
-            WHERE d.object_id = ?
-            ORDER BY i.timestamp_ns
-            """,
-            (object_id,),
-        ).fetchall()
+        obj["detections"] = [
+            dict(r) for r in conn.execute(
+                """
+                SELECT d.id, i.timestamp_ns, i.filename, i.inspection_id,
+                       d.centroid_x, d.centroid_y, d.centroid_z,
+                       d.min_x, d.min_y, d.min_z, d.max_x, d.max_y, d.max_z
+                FROM detections d JOIN images i ON i.id=d.image_id
+                WHERE d.object_id = ?
+                ORDER BY i.timestamp_ns
+                """,
+                (object_id,),
+            ).fetchall()
+        ]
         return obj
 
     def get_top_objects(self, n: int | str | None = 5, inspection_id: int | None = None) -> list[dict[str, Any]]:
@@ -2783,6 +2830,19 @@ class InspectionDBClient:
         self._last_highlight_status = status
         self._record_highlight(normalized, status)
         return status
+
+    def push_highlight(self, args: dict[str, Any]) -> str:
+        """Public entry for the console API: normalize and push a highlight.
+
+        Shares the exact same normalization and Rerun call as the LLM tool path
+        (``_highlight_in_rerun``) so the console and the chatbot always agree on
+        what gets shown in the viewer. Never raises.
+        """
+        try:
+            return self._highlight_in_rerun(args)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("push_highlight failed: %s", exc)
+            return f"Highlight failed: {exc}"
 
     # ------------------------------------------------------------------
     # Final-pass Rerun highlighting (decided by the router after tools run)

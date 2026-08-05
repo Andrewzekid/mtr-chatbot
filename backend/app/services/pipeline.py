@@ -48,6 +48,8 @@ class VoicePipeline:
 
         self.llm = LocalLLM(settings, db_client=db_client)
         self.tts = PiperTTS(settings)
+        self.db_client = db_client
+        self.rerun_visualizer = rerun_visualizer
 
     async def _stream_tts_segments(
         self,

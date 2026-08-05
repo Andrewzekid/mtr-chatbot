@@ -150,6 +150,39 @@ class RerunVisualizer:
         self._enqueue({"clear": True})
         return "Cleared all markings from the Rerun viewer."
 
+    def plot_path(
+        self,
+        waypoints: list[dict[str, float]],
+        label: str | None = None,
+    ) -> str:
+        """Plot a series of waypoints as spheres connected by line segments.
+
+        Each waypoint dict should have x, y, z, and optionally label and color.
+        """
+        if not self.settings.rerun_enabled:
+            return "Rerun visualization is disabled (RERUN_ENABLED=false)."
+        if not waypoints:
+            return "No waypoints to plot."
+
+        listening = self._viewer_listening()
+        needs_spawn = self.settings.rerun_auto_spawn and not listening
+
+        self._enqueue(
+            {
+                "plot_path": True,
+                "waypoints": waypoints,
+                "label": label,
+                "needs_spawn": needs_spawn,
+            }
+        )
+
+        where = (
+            "a Rerun viewer (launching now)"
+            if needs_spawn
+            else "the Rerun viewer"
+        )
+        return f"Plotted {len(waypoints)} waypoint(s) with connecting path in {where}."
+
     def job_stats(self) -> dict[str, Any]:
         """Diagnostic counters for the background highlight worker."""
         with self._lock:
@@ -161,6 +194,22 @@ class RerunVisualizer:
                 "last_ok_at": self._last_ok_at,
                 "marker_ttl_jobs": self._marker_ttl_jobs,
             }
+
+    def status(self) -> dict[str, Any]:
+        """Console-facing viewer health snapshot (drives the UI connection chip).
+
+        ``listening`` is a cheap TCP probe on the configured address; ``enabled``
+        reflects the RERUN_ENABLED flag. Never blocks for long (0.5 s probe).
+        """
+        job_stats = self.job_stats()
+        return {
+            "enabled": bool(self.settings.rerun_enabled),
+            "listening": self._viewer_listening(),
+            "viewer_addr": self.settings.rerun_viewer_addr,
+            "auto_spawn": bool(self.settings.rerun_auto_spawn),
+            "app_id": self.settings.rerun_app_id,
+            "job_stats": job_stats,
+        }
 
     # ------------------------------------------------------------------
     # Background worker (all Rerun I/O happens here, off the chat turn)
@@ -210,6 +259,46 @@ class RerunVisualizer:
                     self._jobs_ok += 1
                     self._last_ok_at = time.time()
                 logger.info("Rerun highlight job #%d: cleared all markings", run_idx)
+                return
+
+            if job.get("plot_path"):
+                waypoints = job.get("waypoints") or []
+                if waypoints:
+                    import rerun as rr
+                    with self._lock:
+                        self._coord_seq += 1
+                        seq = self._coord_seq
+                    suffix = f"path_{seq}_{int(time.time() * 1000) % 1000000}"
+                    # Plot waypoints as spheres
+                    coords = [
+                        {
+                            "x": float(w["x"]),
+                            "y": float(w.get("y", 0)),
+                            "z": float(w.get("z", 0)),
+                            "label": w.get("label", f"WP{i+1}"),
+                            "radius": 0.3,
+                            "color": [227, 0, 44],
+                        }
+                        for i, w in enumerate(waypoints)
+                    ]
+                    self._log_coordinates(marker, coords, entity_suffix=suffix)
+                    # Plot connecting line segments
+                    pts = [[float(w["x"]), float(w.get("y", 0)), float(w.get("z", 0))] for w in waypoints]
+                    if len(pts) >= 2:
+                        line_strips = [pts]  # single strip with all points
+                        rr.log(
+                            f"{marker.marks_root}/path_lines/{suffix}",
+                            rr.LineStrips3D(line_strips),
+                            colors=[[227, 0, 44, 255]],
+                            radii=[0.15],
+                        )
+                    logger.info(
+                        "Rerun plot_path job #%d: plotted %d waypoints with lines under %s",
+                        run_idx, len(waypoints), suffix,
+                    )
+                with self._lock:
+                    self._jobs_ok += 1
+                    self._last_ok_at = time.time()
                 return
 
             if not job.get("keep_existing", False):
